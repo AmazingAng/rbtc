@@ -967,13 +967,44 @@ impl Node {
     async fn request_headers(&self, peer_id: u64) {
         let chain = self.chain.read().await;
         let height = chain.height();
-        let locator = build_locator(height, |h| chain.get_ancestor_hash(h));
+        let mut locator = build_locator(height, |h| chain.get_ancestor_hash(h));
+
+        // During IBD the active_chain is empty until blocks are connected, but
+        // we may already have thousands of headers in block_index.  Use the
+        // highest known header so we resume instead of re-downloading from
+        // genesis after a peer disconnect.
+        if locator.is_empty() || (locator.len() == 1 && height == 0) {
+            let best_header = chain
+                .block_index
+                .values()
+                .max_by_key(|bi| bi.height)
+                .map(|bi| bi.hash);
+            if let Some(bh) = best_header {
+                if !locator.contains(&bh) {
+                    locator.insert(0, bh);
+                }
+            }
+            // Always include the genesis hash as the last entry.
+            if let Ok(gh) = rbtc_primitives::hash::Hash256::from_hex(chain.network.genesis_hash()) {
+                if !locator.contains(&gh) {
+                    locator.push(gh);
+                }
+            }
+        }
+
+        let best_header_height = chain
+            .block_index
+            .values()
+            .map(|bi| bi.height)
+            .max()
+            .unwrap_or(0);
+
         drop(chain);
         self.peer_manager.send_to(
             peer_id,
             NetworkMessage::GetHeaders(rbtc_net::message::GetBlocksMessage::new(locator)),
         );
-        info!("requested headers from peer {peer_id}, our height={height}");
+        info!("requested headers from peer {peer_id}, our height={height}, best_header={best_header_height}");
     }
 
     async fn check_ibd_progress(&mut self) {

@@ -105,6 +105,7 @@ async fn run_peer_inner(
     let our_nonce: u64 = rand_nonce();
     let version_msg = VersionMessage::new(best_height, our_nonce);
     let msg_bytes = Message::new(magic, NetworkMessage::Version(version_msg)).encode_to_bytes();
+    debug!("peer {id}: sending version ({} bytes), magic={:02x?}", msg_bytes.len(), &msg_bytes[..4]);
     write_half.write_all(&msg_bytes).await?;
 
     // Handshake
@@ -117,7 +118,13 @@ async fn run_peer_inner(
 
     timeout(HANDSHAKE_TIMEOUT, async {
         while !got_version || !got_verack {
-            let msg = Message::read_from(&mut reader, &magic).await?;
+            let msg = match Message::read_from(&mut reader, &magic).await {
+                Ok(m) => m,
+                Err(e) => {
+                    debug!("peer {id}: handshake read error: {e}");
+                    return Err(e);
+                }
+            };
             match msg.payload {
                 NetworkMessage::Version(v) => {
                     peer_version = v.version;
