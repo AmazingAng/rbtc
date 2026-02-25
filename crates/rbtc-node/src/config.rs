@@ -74,6 +74,14 @@ pub struct Args {
     /// When the limit is exceeded, the lowest-fee-rate transactions are evicted.
     #[arg(long, value_name = "MB", default_value = "300")]
     pub mempool_size: u64,
+
+    /// UTXO hot-cache size in megabytes.
+    /// 0 (default) = unlimited: all UTXOs are loaded into memory at startup,
+    /// matching the pre-Phase-8 behaviour.
+    /// When set to a positive value, only recently-used UTXOs are kept in memory;
+    /// older entries are evicted and re-fetched from RocksDB on demand.
+    #[arg(long, value_name = "MB", default_value = "0")]
+    pub utxo_cache: u64,
 }
 
 impl Args {

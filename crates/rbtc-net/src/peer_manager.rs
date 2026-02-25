@@ -395,6 +395,16 @@ impl PeerManager {
             .map(|(&id, _)| id)
     }
 
+    /// Return all peer IDs whose reported best_height is >= `min_height`.
+    /// Suitable for distributing IBD block-download segments.
+    pub fn peers_for_ibd(&self, min_height: u32) -> Vec<u64> {
+        self.peers
+            .iter()
+            .filter(|(_, p)| p.best_height >= min_height as i32)
+            .map(|(&id, _)| id)
+            .collect()
+    }
+
     /// Update our current best height (e.g. after connecting a block)
     pub fn set_best_height(&mut self, height: i32) {
         self.best_height = height;

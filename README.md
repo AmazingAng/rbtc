@@ -97,6 +97,21 @@ rbtc/
 - **Peer Address Persistence**: new `rbtc-storage/src/peer_store.rs` with `CF_PEER_ADDRS` column family (key = 18-byte IP:port, value = `last_seen u64` + `services u64`); `PeerStore::save_addrs()` / `load_addrs()` for bulk persistence; at startup, `load_addrs()` seeds `PeerManager::candidate_addrs`; every 5 minutes `persist_peer_addrs()` flushes the current candidate list to RocksDB
 - **Connection Manager**: `PeerManager` tracks `outbound_count`, `connecting_addrs` (dedup guard), and `connected_addrs`; every 30 s the reconnect loop fills outbound slots from `candidate_addrs` up to `max_outbound`; banned IPs and already-connected/connecting addresses are skipped; inbound and outbound counts are decremented correctly on disconnect
 
+### Phase 8 — IBD Parallelism & UTXO Cache
+
+#### IBD Multi-peer Parallel Download
+- **Per-peer inflight tracking**: `IbdState` now tracks each peer's in-flight block requests independently via `peer_downloads: HashMap<u64, PeerDownload>`, replacing the single `sync_peer`; `PeerDownload.requested_at` enables per-peer stall detection
+- **Per-peer stall detection**: `IbdState::stalled_peers(timeout)` returns all peers whose in-flight batch has not made progress within `STALL_TIMEOUT`; `check_ibd_progress` disconnects stalled peers and returns their ranges to the work queue via `release_peer()`
+- **Height-range work queue**: when entering the Blocks phase, `partition_ranges(start, tip, SEGMENT_SIZE)` cuts the remaining header range into 512-block segments and fills `pending_ranges: VecDeque<(u32,u32)>`; `assigned_ranges` tracks which peer holds each segment
+- **Multi-peer dispatch**: `assign_blocks_to_peers()` pops segments from `pending_ranges` and sends `getdata` to all idle peers simultaneously; called on `PeerConnected`, batch completion in `handle_block`, and every IBD timer tick; `PeerDisconnected` and `NotFound` call `release_peer()` to re-queue the affected segment
+- **New peer-manager helper**: `peers_for_ibd(min_height) -> Vec<u64>` returns all connected peers whose reported best height meets the IBD target, enabling true multi-peer parallelism
+
+#### UTXO Cache
+- **`UtxoLookup` trait** (`rbtc-consensus`): `verify_block` and `verify_transaction` now accept `&impl UtxoLookup` instead of `&UtxoSet`, decoupling consensus validation from the concrete storage back-end; `UtxoSet` implements the trait for backward compatibility
+- **`CachedUtxoSet`** (new `crates/rbtc-node/src/utxo_cache.rs`): write-back cache with three layers — `dirty` (uncommitted block changes), `hot` (size-limited clean entries), and RocksDB fallback; `connect_block()` stages UTXO changes in `dirty`; `flush_dirty(batch)` writes dirty to the existing `WriteBatch` and promotes entries to `hot`, replacing the separate `utxo_store.connect_block_into_batch()` call; `evict_cold()` removes least-recently-promoted entries from `hot` when the cache exceeds `max_bytes`
+- **`--utxo-cache <MB>` CLI flag** (default `0` = unlimited): when `0`, all UTXOs are pre-loaded into the hot cache at startup (previous behaviour); when `>0`, the hot cache starts empty and falls back to RocksDB on misses, capping memory usage
+- **Unified write path**: every `handle_block` now routes UTXO writes through `utxo_cache.flush_dirty(batch)` so the cache and the database are always consistent
+
 ## Dependencies
 
 | Crate | Purpose |
@@ -184,6 +199,7 @@ curl -s -d '{"method":"submitblock","params":["<hex>"]}' http://127.0.0.1:8332/
 | `--create-wallet` | — | Generate a fresh wallet, print the mnemonic, then run |
 | `--prune` | `0` | Target disk budget for block data in MiB (`0` = keep all; min 550 when enabled) |
 | `--mempool-size` | `300` | Maximum mempool size in MB; cheapest transactions are evicted when exceeded |
+| `--utxo-cache` | `0` | UTXO hot-cache size in MB (`0` = unlimited, all UTXOs pre-loaded; >0 = lazy mode with RocksDB fallback) |
 
 ### Environment Variables
 
@@ -396,7 +412,7 @@ When a competing chain with more cumulative work is detected, `reorganize_to(new
 cargo test --workspace
 ```
 
-274 tests across all crates — all pass.
+288 tests across all crates — all pass.
 
 | Crate | Tests |
 |-------|-------|
@@ -410,6 +426,7 @@ cargo test --workspace
 | `rbtc-psbt` | 6 |
 | `rbtc-wallet` | 35 |
 | `rbtc-miner` | 14 |
+| `rbtc-node` | 9 |
 
 ### Integration Tests Against Bitcoin Core
 

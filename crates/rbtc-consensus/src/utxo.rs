@@ -5,6 +5,16 @@ use rbtc_primitives::{
     transaction::{OutPoint, Transaction, TxOut},
 };
 
+/// Trait for looking up UTXOs by `OutPoint`.
+///
+/// Implementations may be pure in-memory (`UtxoSet`) or cache-backed
+/// (`CachedUtxoSet` in `rbtc-node`).  The `Sync` bound is required because
+/// Rayon's parallel script verifier captures a `&impl UtxoLookup` across threads.
+pub trait UtxoLookup: Sync {
+    /// Return the UTXO for `outpoint`, or `None` if it does not exist / is spent.
+    fn get_utxo(&self, outpoint: &OutPoint) -> Option<Utxo>;
+}
+
 /// A single UTXO entry
 #[derive(Debug, Clone)]
 pub struct Utxo {
@@ -19,6 +29,12 @@ pub struct Utxo {
 #[derive(Debug, Default)]
 pub struct UtxoSet {
     coins: HashMap<OutPoint, Utxo>,
+}
+
+impl UtxoLookup for UtxoSet {
+    fn get_utxo(&self, outpoint: &OutPoint) -> Option<Utxo> {
+        self.coins.get(outpoint).cloned()
+    }
 }
 
 impl UtxoSet {

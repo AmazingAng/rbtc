@@ -5,7 +5,7 @@ use rbtc_primitives::{
 };
 use rbtc_script::{ScriptContext, ScriptFlags, verify_input};
 
-use crate::{error::ConsensusError, utxo::UtxoSet};
+use crate::{error::ConsensusError, utxo::{Utxo, UtxoLookup}};
 
 /// Compute the block subsidy for a given height
 pub fn block_subsidy(height: u32) -> u64 {
@@ -23,7 +23,7 @@ const MAX_MONEY: u64 = 21_000_000 * COIN;
 /// Returns the transaction fee (satoshis) on success.
 pub fn verify_transaction(
     tx: &Transaction,
-    utxos: &UtxoSet,
+    utxos: &impl UtxoLookup,
     current_height: u32,
     flags: ScriptFlags,
 ) -> Result<u64, ConsensusError> {
@@ -53,7 +53,7 @@ pub fn verify_transaction(
     let mut prevouts = Vec::with_capacity(tx.inputs.len());
 
     for input in &tx.inputs {
-        let utxo = utxos.get(&input.previous_output).ok_or_else(|| {
+        let utxo: Utxo = utxos.get_utxo(&input.previous_output).ok_or_else(|| {
             ConsensusError::MissingUtxo(
                 input.previous_output.txid.to_hex(),
                 input.previous_output.vout,

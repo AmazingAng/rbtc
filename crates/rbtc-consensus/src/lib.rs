@@ -11,4 +11,4 @@ pub use error::ConsensusError;
 pub use script_flags::script_flags_for_block;
 pub use tx_verify::verify_transaction;
 pub use block_verify::verify_block;
-pub use utxo::{Utxo, UtxoSet};
+pub use utxo::{Utxo, UtxoLookup, UtxoSet};

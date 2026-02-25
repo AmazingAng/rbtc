@@ -36,7 +36,11 @@ pub fn verify_ecdsa(pubkey: &[u8], sig_der: &[u8], msg: &[u8; 32]) -> Result<(),
         sig_der
     };
 
-    let sig = EcdsaSig::from_der(sig_bytes).map_err(|_| CryptoError::InvalidSignature)?;
+    let mut sig = EcdsaSig::from_der(sig_bytes).map_err(|_| CryptoError::InvalidSignature)?;
+    // Normalize S to low-S: the secp256k1 C library's verify requires low-S.
+    // Pre-BIP66 Bitcoin transactions may use high-S signatures; both (r,s) and
+    // (r, n-s) are mathematically equivalent for verification purposes.
+    sig.normalize_s();
     let message = Message::from_digest(*msg);
 
     secp.verify_ecdsa(message, &sig, &pk)

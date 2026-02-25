@@ -120,7 +120,14 @@ pub fn sighash_legacy(
             }
             tx.outputs[input_index].encode(&mut buf).unwrap();
         }
-        _ => unreachable!(),
+        _ => {
+            // Unknown/non-standard sighash base type: treat as SIGHASH_ALL.
+            // Early Bitcoin nodes had this behavior for unusual hashtype bytes.
+            VarInt(tx.outputs.len() as u64).encode(&mut buf).unwrap();
+            for output in &tx.outputs {
+                output.encode(&mut buf).unwrap();
+            }
+        }
     }
 
     // locktime

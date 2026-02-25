@@ -2,7 +2,7 @@ use std::{collections::HashMap, net::IpAddr, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use tokio::sync::{mpsc, RwLock};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use rbtc_consensus::{
     block_verify::{verify_block, BlockValidationContext},
@@ -25,16 +25,13 @@ use rbtc_wallet::Wallet;
 
 use crate::{
     config::Args,
-    ibd::{self, build_locator, IbdPhase, IbdState},
+    ibd::{build_locator, IbdPhase, IbdState, SEGMENT_SIZE, STALL_TIMEOUT},
     rpc::{start_rpc_server, RpcState},
+    utxo_cache::CachedUtxoSet,
 };
 
 /// Peer ID used when a block is submitted locally (via RPC).
 const LOCAL_PEER_ID: u64 = 0;
-
-/// Maximum number of blocks requested per IBD batch.
-/// 64 blocks (~1 MB each at most) keeps the pipeline full on fast connections.
-const IBD_BATCH_SIZE: usize = 512;
 
 /// The main Bitcoin node
 pub struct Node {
@@ -50,6 +47,11 @@ pub struct Node {
     /// Canonical header chain built from block_index when entering block-download
     /// phase. Maps height → block hash. Empty until all headers are downloaded.
     canonical_header_chain: Vec<Hash256>,
+    /// Write-back UTXO cache (hot + dirty layers with RocksDB fallback).
+    /// Used by `verify_block` instead of the full in-memory `chain.utxos` when
+    /// `--utxo-cache > 0`.  Always present; used unconditionally to keep the
+    /// dirty layer in sync with each connected block.
+    utxo_cache: CachedUtxoSet,
     peer_manager: PeerManager,
     node_event_rx: mpsc::UnboundedReceiver<NodeEvent>,
     /// Sender half given to the RPC server for `submitblock` / `generatetoaddress`.
@@ -59,6 +61,10 @@ pub struct Node {
     /// BIP152: partially-reconstructed compact blocks awaiting `blocktxn` responses.
     /// Key = block_hash, Value = (compact block, list of already-filled tx slots).
     pending_compact: HashMap<rbtc_primitives::hash::Hash256, (CompactBlock, Vec<Option<rbtc_primitives::transaction::Transaction>>)>,
+    /// Out-of-order blocks received during parallel IBD, waiting for predecessors.
+    /// Key = block height, Value = (sender peer_id, block).
+    /// Only the first copy for each height is kept (subsequent duplicates are dropped).
+    pending_blocks: HashMap<u32, (u64, rbtc_primitives::block::Block)>,
     /// Timestamp of last peer address persistence flush
     last_peer_persist: std::time::Instant,
 }
@@ -121,6 +127,26 @@ impl Node {
             }
         }
 
+        // Build UTXO cache based on --utxo-cache flag.
+        // When 0 (unlimited), pre-populate from RocksDB (existing behaviour).
+        // When >0, start empty and rely on dirty-layer + RocksDB fallback.
+        let max_bytes = if args.utxo_cache == 0 {
+            None // unlimited
+        } else {
+            Some(args.utxo_cache * 1_000_000)
+        };
+        let mut utxo_cache = CachedUtxoSet::new(Arc::clone(&db), max_bytes);
+        if max_bytes.is_none() {
+            // Pre-load all UTXOs into the hot cache to match pre-Phase-8 behaviour.
+            utxo_cache.load_all();
+            info!("utxo_cache: pre-loaded {} entries", utxo_cache.hot_len());
+        } else {
+            info!(
+                "utxo_cache: lazy mode, limit={} MB",
+                args.utxo_cache
+            );
+        }
+
         Ok(Self {
             args,
             db,
@@ -129,11 +155,13 @@ impl Node {
             wallet,
             ibd: IbdState::new(),
             canonical_header_chain: Vec::new(),
+            utxo_cache,
             peer_manager,
             node_event_rx,
             submit_block_tx,
             submit_block_rx,
             pending_compact: HashMap::new(),
+            pending_blocks: HashMap::new(),
             last_peer_persist: std::time::Instant::now(),
         })
     }
@@ -174,12 +202,13 @@ impl Node {
             drop(chain);
             if bi_height > active_height {
                 // We have unconnected headers from before the restart.
-                // Rebuild canonical chain and skip straight to Blocks phase.
+                // Rebuild canonical chain and partition into download segments.
                 info!(
                     "detected {} unconnected headers (block_index tip={bi_height}, active_chain tip={active_height}); resuming Blocks phase",
                     bi_height - active_height
                 );
                 self.ibd.phase = IbdPhase::Blocks;
+                // build_canonical_header_chain also calls partition_ranges.
                 self.build_canonical_header_chain().await;
             } else if active_height > 0 {
                 info!("chain tip={active_height}; checking if fully synced");
@@ -261,11 +290,13 @@ impl Node {
             NodeEvent::PeerConnected { peer_id, addr, best_height } => {
                 info!("peer {peer_id} connected from {addr}, height={best_height}");
                 let our_height = self.chain.read().await.height() as i32;
-                if best_height > our_height && self.ibd.sync_peer.is_none() {
-                    self.ibd.sync_peer = Some(peer_id);
+                if best_height > our_height {
                     if self.ibd.phase == IbdPhase::Blocks {
-                        self.download_blocks(peer_id).await;
-                    } else {
+                        // Assign a pending block range to the newly connected peer.
+                        self.assign_blocks_to_peers().await;
+                    } else if self.ibd.sync_peer.is_none() {
+                        self.ibd.sync_peer = Some(peer_id);
+                        self.ibd.record_progress();
                         self.request_headers(peer_id).await;
                     }
                 }
@@ -273,14 +304,17 @@ impl Node {
 
             NodeEvent::PeerDisconnected { peer_id } => {
                 info!("peer {peer_id} disconnected");
-                if self.ibd.sync_peer == Some(peer_id) {
-                    self.ibd.sync_peer = None;
-                    if let Some(new_peer) = self.peer_manager.best_peer() {
-                        self.ibd.sync_peer = Some(new_peer);
-                        if self.ibd.phase == IbdPhase::Blocks {
-                            // Already have all headers; resume block download.
-                            self.download_blocks(new_peer).await;
-                        } else {
+                if self.ibd.phase == IbdPhase::Blocks {
+                    // Return the peer's unfinished range to the work queue.
+                    self.ibd.release_peer(peer_id);
+                    // Try to assign to a remaining connected peer.
+                    self.assign_blocks_to_peers().await;
+                } else {
+                    if self.ibd.sync_peer == Some(peer_id) {
+                        self.ibd.sync_peer = None;
+                        if let Some(new_peer) = self.peer_manager.best_peer() {
+                            self.ibd.sync_peer = Some(new_peer);
+                            self.ibd.record_progress();
                             self.request_headers(new_peer).await;
                         }
                     }
@@ -321,15 +355,20 @@ impl Node {
 
             NodeEvent::NotFound { peer_id, items } => {
                 warn!(
-                    "peer {peer_id}: notfound for {} item(s) – likely pruned; switching IBD peer",
+                    "peer {peer_id}: notfound for {} item(s) – likely pruned; re-assigning range",
                     items.len()
                 );
-                if self.ibd.sync_peer == Some(peer_id) {
+                if self.ibd.phase == IbdPhase::Blocks {
+                    self.ibd.release_peer(peer_id);
+                    self.peer_manager.disconnect(peer_id);
+                    self.assign_blocks_to_peers().await;
+                } else if self.ibd.sync_peer == Some(peer_id) {
                     self.ibd.sync_peer = None;
                     self.peer_manager.disconnect(peer_id);
                     if let Some(new_peer) = self.peer_manager.best_peer() {
                         self.ibd.sync_peer = Some(new_peer);
-                        self.download_blocks(new_peer).await;
+                        self.ibd.record_progress();
+                        self.request_headers(new_peer).await;
                     }
                 }
             }
@@ -393,11 +432,12 @@ impl Node {
                 self.ibd.phase = IbdPhase::Blocks;
                 info!("IBD: entering block download phase");
                 self.build_canonical_header_chain().await;
-                self.download_blocks(peer_id).await;
+                self.assign_blocks_to_peers().await;
             }
             return Ok(());
         }
 
+        self.ibd.record_progress();
         let last_header = headers.last().cloned();
         let block_store = BlockStore::new(&self.db);
         let mut chain = self.chain.write().await;
@@ -438,10 +478,10 @@ impl Node {
             );
         } else {
             self.ibd.phase = IbdPhase::Blocks;
-            // Build canonical header chain from block_index so download_blocks
-            // can enumerate which blocks to fetch in order.
+            // Build canonical header chain from block_index and partition into
+            // per-peer download segments.
             self.build_canonical_header_chain().await;
-            self.download_blocks(peer_id).await;
+            self.assign_blocks_to_peers().await;
         }
 
         Ok(())
@@ -450,6 +490,8 @@ impl Node {
     /// Walk block_index backwards from the best-chainwork tip to build a
     /// height-indexed vec of canonical hashes.  Called once when header sync
     /// is complete and we switch to the block-download phase.
+    /// Also partitions the remaining un-downloaded height range into segments
+    /// for multi-peer parallel download.
     async fn build_canonical_header_chain(&mut self) {
         let chain = self.chain.read().await;
         let best = chain
@@ -458,6 +500,7 @@ impl Node {
             .max_by_key(|bi| bi.chainwork);
         let Some(tip) = best else { return };
         let tip_height = tip.height as usize;
+        let active_height = chain.height();
         let mut canonical = vec![Hash256::ZERO; tip_height + 1];
         let mut cur = tip.hash;
         loop {
@@ -471,12 +514,19 @@ impl Node {
             }
             cur = bi.header.prev_block;
         }
+        let tip_u32 = tip.height;
         drop(chain);
         info!(
             "canonical header chain built: {} headers",
             canonical.len()
         );
         self.canonical_header_chain = canonical;
+
+        // Partition the un-downloaded height range into fixed-size segments.
+        let start = active_height + 1;
+        if start <= tip_u32 {
+            self.ibd.partition_ranges(start, tip_u32, SEGMENT_SIZE);
+        }
     }
 
     // ── BIP152 Compact Block handlers ─────────────────────────────────────────
@@ -613,50 +663,129 @@ impl Node {
         }
     }
 
-    async fn download_blocks(&mut self, peer_id: u64) {
+    /// Collect canonical hashes for a height range [start, end], skipping
+    /// blocks already in the active chain.
+    async fn hashes_for_range(&self, start: u32, end: u32) -> Vec<Hash256> {
         let chain = self.chain.read().await;
-        let mut current_height = chain.height() + 1;
         let mut hashes = Vec::new();
-
-        loop {
-            // Prefer connected active_chain; fall back to canonical_header_chain
-            // during IBD before any blocks have been validated.
+        for h in start..=end {
+            // Prefer active_chain, fall back to canonical_header_chain.
             let hash = chain
-                .get_ancestor_hash(current_height)
+                .get_ancestor_hash(h)
                 .or_else(|| {
                     self.canonical_header_chain
-                        .get(current_height as usize)
+                        .get(h as usize)
                         .copied()
                         .filter(|h| *h != Hash256::ZERO)
                 });
+            // Stop at the first missing height so we never request disjoint tails
+            // without their predecessors (which would stall frontier connection).
             let Some(hash) = hash else { break };
-
+            // Skip blocks already connected.
             if chain
                 .block_index
                 .get(&hash)
                 .map(|bi| bi.status == BlockStatus::InChain)
                 .unwrap_or(false)
             {
-                current_height += 1;
                 continue;
             }
             hashes.push(hash);
-            if hashes.len() >= IBD_BATCH_SIZE {
-                break;
-            }
-            current_height += 1;
         }
-        drop(chain);
+        hashes
+    }
 
-        if !hashes.is_empty() {
+    /// Maximum number of segments that may be in-flight ahead of the connected
+    /// frontier.  Prevents peer assignments from racing arbitrarily far ahead
+    /// while the frontier is stalled, which would fill pending_blocks with
+    /// blocks that can never be validated (wrong expected_bits etc.).
+    // Conservative mode: only assign the frontier segment (height+1 bucket).
+    // This avoids long stalls caused by receiving far-ahead segments before
+    // predecessors, at the cost of less parallelism.
+    const MAX_AHEAD_SEGMENTS: u32 = 0;
+
+    /// Assign pending height-range segments to idle peers.
+    /// Called whenever a new peer connects, a batch finishes, or after a stall.
+    async fn assign_blocks_to_peers(&mut self) {
+        // Collect peers that are not currently handling a batch.
+        let our_height = self.chain.read().await.height();
+        // Hard ceiling: don't assign segments whose start is more than
+        // MAX_AHEAD_SEGMENTS×SEGMENT_SIZE above the *frontier* (height+1).
+        // Note: frontier itself must always be assignable.
+        let frontier_start = our_height.saturating_add(1);
+        let max_ahead_height =
+            frontier_start.saturating_add(Self::MAX_AHEAD_SEGMENTS * SEGMENT_SIZE as u32);
+
+        let idle_peers: Vec<u64> = self
+            .peer_manager
+            .peers_for_ibd(our_height + 1)
+            .into_iter()
+            .filter(|id| !self.ibd.peer_downloads.contains_key(id))
+            .collect();
+
+        for peer_id in idle_peers {
+            // Always dispatch the smallest-start (frontier-nearest) segment first.
+            // `pending_ranges` can be perturbed by stall/release re-queue ordering,
+            // so pop_front() may accidentally prioritize farther-ahead ranges.
+            let mut best_idx: Option<usize> = None;
+            let mut best_start = u32::MAX;
+            for (idx, (start, _)) in self.ibd.pending_ranges.iter().enumerate() {
+                if *start <= max_ahead_height && *start < best_start {
+                    best_start = *start;
+                    best_idx = Some(idx);
+                }
+            }
+            let Some(best_idx) = best_idx else { break };
+            let Some(range) = self.ibd.pending_ranges.remove(best_idx) else { continue };
+            let (start, end) = range;
+
+            let hashes = self.hashes_for_range(start, end).await;
+            if hashes.is_empty() {
+                // If this segment is already behind our connected height, it's done.
+                // Otherwise we likely hit a header gap; re-queue this range and stop
+                // assigning farther ranges so the frontier is retried first.
+                let cur_height = self.chain.read().await.height();
+                if cur_height < end {
+                    self.ibd.pending_ranges.push_front(range);
+                    break;
+                }
+                continue;
+            }
             info!(
-                "IBD: requesting {} blocks starting at height {}",
+                "IBD: assigning heights {}..={} ({} blocks) to peer {}",
+                start,
+                end,
                 hashes.len(),
-                self.chain.read().await.height() + 1
+                peer_id
             );
+            self.ibd.assigned_ranges.insert(peer_id, range);
+            self.ibd.record_peer_request(peer_id, hashes.clone());
             self.peer_manager.request_blocks(peer_id, &hashes);
-        } else if self.ibd.phase == IbdPhase::Blocks {
-            self.ibd.mark_complete();
+        }
+
+        // If no pending ranges remain and no peer has inflight work, IBD is done.
+        if self.ibd.phase == IbdPhase::Blocks && self.ibd.all_ranges_complete() {
+            // Double-check by looking for un-downloaded heights.
+            let tip = {
+                let chain = self.chain.read().await;
+                chain.block_index.values().map(|bi| bi.height).max().unwrap_or(0)
+            };
+            let connected_height = self.chain.read().await.height();
+            if connected_height >= tip {
+                self.ibd.mark_complete();
+            }
+        }
+    }
+
+    /// Mark one block as connected and update IBD batch tracking.
+    /// Called only when a block is actually connected to the chain (not when cached).
+    /// Returns true when the peer's entire segment is now connected.
+    async fn ibd_mark_connected(&mut self, peer_id: u64, block_hash: &Hash256) {
+        if !self.ibd.is_complete() {
+            let batch_done = self.ibd.complete_peer_block(peer_id, block_hash);
+            if batch_done {
+                self.assign_blocks_to_peers().await;
+            }
         }
     }
 
@@ -667,7 +796,7 @@ impl Node {
     ) -> Result<()> {
         let block_hash = header_hash(&block.header);
 
-        // Already in chain?
+        // Skip if already connected.
         {
             let chain = self.chain.read().await;
             if chain
@@ -680,6 +809,7 @@ impl Node {
             }
         }
 
+        // Determine height; add header to index if not yet known.
         let height = {
             let mut chain = self.chain.write().await;
             match chain.block_index.get(&block_hash) {
@@ -694,6 +824,52 @@ impl Node {
             }
         };
 
+        let chain_height = self.chain.read().await.height();
+
+        if height > chain_height + 1 {
+            // Out-of-order block: cache it for later.
+            // Do NOT call ibd_mark_connected here — the peer stays "busy" in
+            // peer_downloads until its blocks are actually connected to the chain.
+            // This prevents the runaway where cached-but-unconnected work triggers
+            // ever-further segment assignments.
+            self.pending_blocks.entry(height).or_insert((peer_id, block));
+            return Ok(());
+        }
+
+        if height <= chain_height {
+            // Stale duplicate or fork block below our tip; nothing to do.
+            return Ok(());
+        }
+
+        // height == chain_height + 1: validate and connect immediately, then
+        // drain any consecutively-pending blocks that are now unblocked.
+        self.do_connect_block(peer_id, block_hash, block, height).await?;
+        self.ibd_mark_connected(peer_id, &block_hash).await;
+
+        loop {
+            let next_height = self.chain.read().await.height() + 1;
+            let Some((p_peer, p_block)) = self.pending_blocks.remove(&next_height) else {
+                break;
+            };
+            let p_hash = header_hash(&p_block.header);
+            self.do_connect_block(p_peer, p_hash, p_block, next_height).await?;
+            // Mark connected here — not at cache time — so peer batch tracking
+            // reflects actual chain progress, not just block delivery.
+            self.ibd_mark_connected(p_peer, &p_hash).await;
+        }
+
+        Ok(())
+    }
+
+    /// Validate and connect a single block at `height == chain.height() + 1`.
+    /// Does NOT update IBD delivery tracking — the caller is responsible.
+    async fn do_connect_block(
+        &mut self,
+        peer_id: u64,
+        block_hash: Hash256,
+        block: rbtc_primitives::block::Block,
+        height: u32,
+    ) -> Result<()> {
         let (expected_bits, mtp, network) = {
             let chain = self.chain.read().await;
             (
@@ -710,9 +886,9 @@ impl Node {
 
         let flags = script_flags_for_block(network, height, block.header.time);
 
-        // Validate block (takes read lock on utxos via chain read)
+        // Validate block using the UTXO cache (hot layer → RocksDB fallback).
+        // `utxo_cache` implements `UtxoLookup` so verify_block accepts it directly.
         let validation_result = {
-            let chain = self.chain.read().await;
             let ctx = BlockValidationContext {
                 block: &block,
                 height,
@@ -722,7 +898,7 @@ impl Node {
                 flags,
                 network,
             };
-            verify_block(&ctx, &chain.utxos)
+            verify_block(&ctx, &self.utxo_cache)
         };
 
         match validation_result {
@@ -794,8 +970,14 @@ impl Node {
                         })
                         .collect();
 
+                // Update the UTXO cache dirty layer to reflect this block's changes.
+                // flush_dirty() will write these to the RocksDB WriteBatch below,
+                // replacing the previous `utxo_store.connect_block_into_batch()` call.
+                self.utxo_cache.connect_block(&txids, &block.transactions, height);
+
                 // Persist everything to RocksDB in one atomic WriteBatch:
-                // block metadata, UTXO changes, tx_index, addr_index, chain tip.
+                // block metadata, UTXO changes (via cache flush), tx_index,
+                // addr_index, and chain tip.
                 {
                     let chainwork = self.chain.read().await.block_index[&block_hash].chainwork;
 
@@ -813,13 +995,12 @@ impl Node {
                     block_store.put_block(&block_hash, &block).ok();
                     block_store.put_undo(&block_hash, &encode_block_undo(&undo_stored)).ok();
 
-                    // Single WriteBatch for UTXO + tx_index + addr_index + chain tip
+                    // Single WriteBatch for UTXO (flushed from cache) + tx_index
+                    // + addr_index + chain tip.
                     let mut batch = self.db.new_batch();
 
-                    let utxo_store = UtxoStore::new(&self.db);
-                    utxo_store.connect_block_into_batch(
-                        &mut batch, &txids, &block.transactions, height,
-                    ).ok();
+                    // Write dirty UTXO changes and promote them to the hot cache.
+                    self.utxo_cache.flush_dirty(&mut batch);
 
                     let tx_idx = TxIndexStore::new(&self.db);
                     let addr_idx = AddrIndexStore::new(&self.db);
@@ -840,6 +1021,9 @@ impl Node {
                     chain_store.update_tip_batch(&mut batch, &block_hash, height, chainwork).ok();
 
                     self.db.write_batch(batch).ok();
+
+                    // Evict cold entries from the hot cache if over the size limit.
+                    self.utxo_cache.evict_cold();
                 }
 
                 // Remove confirmed transactions from the mempool
@@ -858,19 +1042,13 @@ impl Node {
                 // Update peer manager's best height
                 self.peer_manager.set_best_height(height as i32);
 
-                // Continue IBD
+                // Record progress for IBD stall detection (Headers phase timer)
                 if !self.ibd.is_complete() {
                     self.ibd.record_progress();
-                    self.download_blocks(peer_id).await;
                 }
 
                 // Prune old block data if requested
                 self.maybe_prune(height).await;
-
-                // ── Reorg detection ─────────────────────────────────────────
-                // If a new block arrives that doesn't extend our current best tip
-                // but has more chainwork, initiate a reorganization.
-                // (Full reorg logic: handled separately by `reorganize_to` below)
             }
             Err(e) => {
                 warn!("block {} rejected from peer {peer_id}: {e}", block_hash.to_hex());
@@ -915,7 +1093,15 @@ impl Node {
             Err(e) => {
                 // AlreadyKnown is not worth logging
                 if !matches!(e, rbtc_mempool::MempoolError::AlreadyKnown) {
-                    warn!("mempool: rejected tx {} from peer {peer_id}: {e}", txid.to_hex());
+                    // During IBD, missing-input rejections are expected because peers
+                    // announce tip mempool txs that spend outputs we have not synced yet.
+                    if self.ibd.phase != IbdPhase::Complete
+                        && matches!(e, rbtc_mempool::MempoolError::MissingInput(_, _))
+                    {
+                        debug!("mempool: rejected tx {} from peer {peer_id}: {e}", txid.to_hex());
+                    } else {
+                        warn!("mempool: rejected tx {} from peer {peer_id}: {e}", txid.to_hex());
+                    }
                 }
             }
         }
@@ -1122,22 +1308,35 @@ impl Node {
             return;
         }
 
-        // Stall detection: if sync_peer is set but no block was connected
-        // within STALL_TIMEOUT, the peer is likely pruned or unresponsive.
-        if self.ibd.is_stalled() {
-            let stale = self.ibd.sync_peer.take().unwrap();
-            warn!("IBD stall detected (no progress for {}s); disconnecting peer {stale}",
-                ibd::STALL_TIMEOUT.as_secs());
-            self.peer_manager.disconnect(stale);
-        }
+        if self.ibd.phase == IbdPhase::Blocks {
+            // Per-peer stall detection: disconnect stalled peers and re-queue their ranges.
+            let stalled = self.ibd.stalled_peers(STALL_TIMEOUT);
+            for peer_id in stalled {
+                warn!(
+                    "IBD stall: peer {} made no progress for {}s; re-assigning range",
+                    peer_id,
+                    STALL_TIMEOUT.as_secs()
+                );
+                self.ibd.release_peer(peer_id);
+                self.peer_manager.disconnect(peer_id);
+            }
+            // Fill any idle peers with pending segments.
+            self.assign_blocks_to_peers().await;
+        } else {
+            // Headers phase: single-peer stall detection.
+            if self.ibd.is_stalled() {
+                let stale = self.ibd.sync_peer.take().unwrap();
+                warn!(
+                    "IBD stall: peer {stale} made no header progress for {}s; switching",
+                    STALL_TIMEOUT.as_secs()
+                );
+                self.peer_manager.disconnect(stale);
+            }
 
-        if self.ibd.sync_peer.is_none() {
-            if let Some(peer_id) = self.peer_manager.best_peer() {
-                self.ibd.sync_peer = Some(peer_id);
-                self.ibd.record_progress();
-                if self.ibd.phase == IbdPhase::Blocks {
-                    self.download_blocks(peer_id).await;
-                } else {
+            if self.ibd.sync_peer.is_none() {
+                if let Some(peer_id) = self.peer_manager.best_peer() {
+                    self.ibd.sync_peer = Some(peer_id);
+                    self.ibd.record_progress();
                     self.request_headers(peer_id).await;
                 }
             }

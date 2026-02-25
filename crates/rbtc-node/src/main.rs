@@ -2,6 +2,7 @@ mod config;
 mod ibd;
 mod node;
 mod rpc;
+mod utxo_cache;
 
 use anyhow::Result;
 use clap::Parser;

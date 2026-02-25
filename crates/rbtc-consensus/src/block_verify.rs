@@ -1,4 +1,4 @@
-use rayon::prelude::*;
+use std::collections::HashMap;
 use rbtc_primitives::{
     block::Block,
     codec::Encodable,
@@ -12,8 +12,23 @@ use rbtc_script::ScriptFlags;
 use crate::{
     error::ConsensusError,
     tx_verify::{block_subsidy, verify_coinbase, verify_transaction},
-    utxo::UtxoSet,
+    utxo::{Utxo, UtxoLookup},
 };
+
+/// A layered UTXO view: newly-created outputs from earlier txs in the same
+/// block are visible here, falling back to the real UTXO set for older coins.
+struct BlockUtxoView<'a, U: UtxoLookup> {
+    /// Outputs produced by transactions already verified in this block.
+    in_block: HashMap<rbtc_primitives::transaction::OutPoint, Utxo>,
+    /// The persistent UTXO set (CachedUtxoSet / UtxoSet).
+    base: &'a U,
+}
+
+impl<U: UtxoLookup> UtxoLookup for BlockUtxoView<'_, U> {
+    fn get_utxo(&self, outpoint: &rbtc_primitives::transaction::OutPoint) -> Option<Utxo> {
+        self.in_block.get(outpoint).cloned().or_else(|| self.base.get_utxo(outpoint))
+    }
+}
 
 /// Context needed for full block validation
 pub struct BlockValidationContext<'a> {
@@ -37,7 +52,7 @@ pub struct BlockValidationContext<'a> {
 /// Returns total fees collected on success.
 pub fn verify_block(
     ctx: &BlockValidationContext<'_>,
-    utxos: &UtxoSet,
+    utxos: &impl UtxoLookup,
 ) -> Result<u64, ConsensusError> {
     let block = ctx.block;
     let header = &block.header;
@@ -85,30 +100,37 @@ pub fn verify_block(
     verify_coinbase(&block.transactions[0], ctx.height, u64::MAX, ctx.network)?;
     let coinbase_sigops = count_block_sigops(&block.transactions[0]) as u64;
 
-    // Parallel verification of non-coinbase transactions.
-    // `verify_transaction` only reads from `utxos` (shared &ref is Sync), so
-    // this is safe to parallelise across Rayon's thread pool.
+    // Sequential verification of non-coinbase transactions.
+    //
+    // Transactions within a block may spend outputs created by earlier
+    // transactions in the same block ("intra-block chaining").  We maintain a
+    // `BlockUtxoView` that layers newly-verified outputs on top of the
+    // persistent UTXO set so that later transactions can see them.
     let non_coinbase = &block.transactions[1..];
 
-    let tx_results: Vec<Result<u64, ConsensusError>> = non_coinbase
-        .par_iter()
-        .map(|tx| verify_transaction(tx, utxos, ctx.height, ctx.flags))
-        .collect();
-
-    // Sequential accumulation (fast: just arithmetic + early-error detection)
+    let mut block_view = BlockUtxoView { in_block: HashMap::new(), base: utxos };
     let mut total_fees: u64 = 0;
-    for result in tx_results {
-        let fee = result?;
+    let mut non_coinbase_sigops: u64 = 0;
+
+    for tx in non_coinbase {
+        let fee = verify_transaction(tx, &block_view, ctx.height, ctx.flags)?;
         total_fees = total_fees
             .checked_add(fee)
             .ok_or(ConsensusError::InputValueOverflow)?;
-    }
+        non_coinbase_sigops += count_block_sigops(tx) as u64 * WITNESS_SCALE_FACTOR;
 
-    // Parallel sigops counting, then check total
-    let non_coinbase_sigops: u64 = non_coinbase
-        .par_iter()
-        .map(|tx| count_block_sigops(tx) as u64 * WITNESS_SCALE_FACTOR)
-        .sum();
+        // Add this transaction's outputs to the in-block view so that
+        // subsequent transactions in the same block can spend them.
+        let txid = compute_txid(tx);
+        for (vout, txout) in tx.outputs.iter().enumerate() {
+            let outpoint = rbtc_primitives::transaction::OutPoint { txid, vout: vout as u32 };
+            block_view.in_block.insert(outpoint, Utxo {
+                txout: txout.clone(),
+                is_coinbase: false,
+                height: ctx.height,
+            });
+        }
+    }
 
     let total_sigops = coinbase_sigops + non_coinbase_sigops;
     if total_sigops > MAX_BLOCK_SIGOPS_COST {
