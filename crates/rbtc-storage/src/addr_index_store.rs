@@ -15,6 +15,7 @@
 //! returned in ascending (height, tx_offset) order thanks to big-endian
 //! encoding.
 
+use rocksdb::WriteBatch;
 use rbtc_primitives::hash::Hash256;
 
 use crate::{
@@ -92,6 +93,31 @@ impl<'a> AddrIndexStore<'a> {
     pub fn remove(&self, script: &[u8], height: u32, tx_offset: u32) -> Result<()> {
         let key = make_addr_key(script, height, tx_offset);
         self.db.delete_cf(CF_ADDR_INDEX, &key)
+    }
+
+    /// Accumulate a `put` into an externally-owned `WriteBatch`.
+    pub fn batch_put(
+        &self,
+        batch: &mut WriteBatch,
+        script: &[u8],
+        height: u32,
+        tx_offset: u32,
+        txid: &Hash256,
+    ) -> Result<()> {
+        let key = make_addr_key(script, height, tx_offset);
+        self.db.batch_put_cf(batch, CF_ADDR_INDEX, &key, &txid.0)
+    }
+
+    /// Accumulate a `remove` into an externally-owned `WriteBatch`.
+    pub fn batch_remove(
+        &self,
+        batch: &mut WriteBatch,
+        script: &[u8],
+        height: u32,
+        tx_offset: u32,
+    ) -> Result<()> {
+        let key = make_addr_key(script, height, tx_offset);
+        self.db.batch_delete_cf(batch, CF_ADDR_INDEX, &key)
     }
 }
 

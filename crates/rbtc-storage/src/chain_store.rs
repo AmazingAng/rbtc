@@ -1,3 +1,4 @@
+use rocksdb::WriteBatch;
 use rbtc_primitives::{codec::{Decodable, Encodable}, hash::BlockHash};
 
 use crate::{
@@ -85,13 +86,25 @@ impl<'db> ChainStore<'db> {
         self.db.put_cf(CF_CHAIN_STATE, KEY_NETWORK, magic)
     }
 
-    /// Atomically update tip + height + chainwork
+    /// Atomically update tip + height + chainwork (self-contained batch).
     pub fn update_tip(&self, hash: &BlockHash, height: u32, chainwork: u128) -> Result<()> {
         let mut batch = self.db.new_batch();
-        self.db.batch_put_cf(&mut batch, CF_CHAIN_STATE, KEY_BEST_BLOCK, &hash.0)?;
-        self.db.batch_put_cf(&mut batch, CF_CHAIN_STATE, KEY_BEST_HEIGHT, &height.encode_to_vec())?;
-        self.db.batch_put_cf(&mut batch, CF_CHAIN_STATE, KEY_CHAINWORK, &chainwork.to_le_bytes())?;
+        self.update_tip_batch(&mut batch, hash, height, chainwork)?;
         self.db.write_batch(batch)
+    }
+
+    /// Fill an externally-owned `WriteBatch` with tip/height/chainwork updates.
+    pub fn update_tip_batch(
+        &self,
+        batch: &mut WriteBatch,
+        hash: &BlockHash,
+        height: u32,
+        chainwork: u128,
+    ) -> Result<()> {
+        self.db.batch_put_cf(batch, CF_CHAIN_STATE, KEY_BEST_BLOCK, &hash.0)?;
+        self.db.batch_put_cf(batch, CF_CHAIN_STATE, KEY_BEST_HEIGHT, &height.encode_to_vec())?;
+        self.db.batch_put_cf(batch, CF_CHAIN_STATE, KEY_CHAINWORK, &chainwork.to_le_bytes())?;
+        Ok(())
     }
 }
 

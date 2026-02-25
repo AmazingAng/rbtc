@@ -132,6 +132,44 @@ impl<'db> BlockStore<'db> {
     pub fn get_undo(&self, hash: &BlockHash) -> Result<Option<Vec<u8>>> {
         self.db.get_cf(CF_UNDO, &hash.0)
     }
+
+    // ── Pruning ───────────────────────────────────────────────────────────────
+
+    /// Delete raw block data (`CF_BLOCK_DATA`) for all blocks at height ≤ `max_height`.
+    ///
+    /// The block headers (`CF_BLOCK_INDEX`) and undo data (`CF_UNDO`) are **kept**
+    /// so that the node can still serve headers and detect reorgs.  The on-disk
+    /// status of pruned blocks is updated to `BlockStatus::Pruned` (4).
+    ///
+    /// Returns the number of blocks pruned.
+    pub fn prune_blocks_below(&self, max_height: u32) -> Result<usize> {
+        let indices = self.iter_all_indices();
+        let mut count = 0usize;
+
+        for (hash, mut idx) in indices {
+            if idx.height > max_height {
+                continue;
+            }
+            // Skip already-pruned entries and blocks we don't have data for
+            if idx.status == 4 {
+                continue;
+            }
+            if self.db.get_cf(CF_BLOCK_DATA, &hash.0)?.is_none() {
+                continue;
+            }
+
+            // Delete the raw block bytes
+            self.db.delete_cf(CF_BLOCK_DATA, &hash.0)?;
+
+            // Update the on-disk status to Pruned (4)
+            idx.status = 4; // BlockStatus::Pruned
+            self.put_index(&hash, &idx)?;
+
+            count += 1;
+        }
+
+        Ok(count)
+    }
 }
 
 #[cfg(test)]

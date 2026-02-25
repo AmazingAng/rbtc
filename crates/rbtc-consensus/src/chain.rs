@@ -26,6 +26,9 @@ pub enum BlockStatus {
     InChain,
     /// Invalid block
     Invalid,
+    /// Block was pruned (CF_BLOCK_DATA deleted to save disk space).
+    /// The block header and UTXO state are still available.
+    Pruned,
 }
 
 impl BlockStatus {
@@ -35,6 +38,7 @@ impl BlockStatus {
             BlockStatus::Valid => 1,
             BlockStatus::InChain => 2,
             BlockStatus::Invalid => 3,
+            BlockStatus::Pruned => 4,
         }
     }
 
@@ -43,6 +47,7 @@ impl BlockStatus {
             1 => BlockStatus::Valid,
             2 => BlockStatus::InChain,
             3 => BlockStatus::Invalid,
+            4 => BlockStatus::Pruned,
             _ => BlockStatus::HeaderOnly,
         }
     }

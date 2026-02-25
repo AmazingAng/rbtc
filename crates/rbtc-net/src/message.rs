@@ -356,6 +356,12 @@ pub enum NetworkMessage {
     SendHeaders,
     FeeFilter(u64),
     SendCmpct(bool, u64),
+    /// BIP152: compact block announcement
+    CmpctBlock(crate::compact::CompactBlock),
+    /// BIP152: request missing transactions from a compact block
+    GetBlockTxn(crate::compact::GetBlockTxn),
+    /// BIP152: response with missing transactions
+    BlockTxn(crate::compact::BlockTxn),
     GetAddr,
     Reject { message: String, code: u8, reason: String },
     Unknown { command: String, data: Vec<u8> },
@@ -380,6 +386,9 @@ impl NetworkMessage {
             Self::SendHeaders => "sendheaders",
             Self::FeeFilter(_) => "feefilter",
             Self::SendCmpct(_, _) => "sendcmpct",
+            Self::CmpctBlock(_) => "cmpctblock",
+            Self::GetBlockTxn(_) => "getblocktxn",
+            Self::BlockTxn(_) => "blocktxn",
             Self::GetAddr => "getaddr",
             Self::Reject { .. } => "reject",
             Self::Unknown { .. } => "unknown",
@@ -419,6 +428,9 @@ impl NetworkMessage {
                 buf.extend_from_slice(&version.to_le_bytes());
                 buf
             }
+            Self::CmpctBlock(cb) => cb.encode_payload(),
+            Self::GetBlockTxn(gbt) => gbt.encode_payload(),
+            Self::BlockTxn(bt) => bt.encode_payload(),
             Self::Reject { message, code, reason } => {
                 let mut buf = Vec::new();
                 VarInt(message.len() as u64).encode(&mut buf).ok();
@@ -489,6 +501,18 @@ impl NetworkMessage {
                 let announce = data[0] != 0;
                 let version = u64::from_le_bytes(data[1..9].try_into().unwrap());
                 Self::SendCmpct(announce, version)
+            }
+            "cmpctblock" => {
+                let cb = crate::compact::CompactBlock::decode_payload(data)?;
+                Self::CmpctBlock(cb)
+            }
+            "getblocktxn" => {
+                let gbt = crate::compact::GetBlockTxn::decode_payload(data)?;
+                Self::GetBlockTxn(gbt)
+            }
+            "blocktxn" => {
+                let bt = crate::compact::BlockTxn::decode_payload(data)?;
+                Self::BlockTxn(bt)
             }
             _ => Self::Unknown { command: command.to_string(), data: data.to_vec() },
         };

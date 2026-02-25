@@ -57,6 +57,12 @@ pub enum NodeEvent {
     HeadersReceived { peer_id: u64, headers: Vec<BlockHeader> },
     TxReceived { peer_id: u64, tx: Transaction },
     InvReceived { peer_id: u64, items: Vec<Inventory> },
+    /// BIP152: compact block received
+    CmpctBlockReceived { peer_id: u64, cmpct: crate::compact::CompactBlock },
+    /// BIP152: peer is requesting missing transactions
+    GetBlockTxnReceived { peer_id: u64, req: crate::compact::GetBlockTxn },
+    /// BIP152: peer responded with missing transactions
+    BlockTxnReceived { peer_id: u64, resp: crate::compact::BlockTxn },
 }
 
 /// Connected peer metadata
@@ -290,6 +296,10 @@ impl PeerManager {
                     let resolved_addr = if let Some((stored_addr, cmd_tx)) =
                         self.pending_cmd_txs.remove(&peer_id)
                     {
+                        // BIP152: request high-bandwidth compact blocks (mode=1)
+                        let _ = cmd_tx.send(PeerCommand::Send(
+                            NetworkMessage::SendCmpct(true, 1)
+                        ));
                         self.peers.insert(
                             peer_id,
                             ConnectedPeer { addr: stored_addr, best_height, cmd_tx },
@@ -343,6 +353,15 @@ impl PeerManager {
             NetworkMessage::FeeFilter(rate) => {
                 // Store per-peer fee filter for transaction relay filtering
                 debug!("peer {peer_id}: feefilter rate={rate} sat/kvB");
+            }
+            NetworkMessage::CmpctBlock(cmpct) => {
+                let _ = self.node_event_tx.send(NodeEvent::CmpctBlockReceived { peer_id, cmpct });
+            }
+            NetworkMessage::GetBlockTxn(req) => {
+                let _ = self.node_event_tx.send(NodeEvent::GetBlockTxnReceived { peer_id, req });
+            }
+            NetworkMessage::BlockTxn(resp) => {
+                let _ = self.node_event_tx.send(NodeEvent::BlockTxnReceived { peer_id, resp });
             }
             other => {
                 debug!("peer {peer_id}: unhandled message: {}", other.command());

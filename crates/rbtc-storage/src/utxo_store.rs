@@ -1,3 +1,4 @@
+use rocksdb::WriteBatch;
 use rbtc_primitives::{
     codec::{Decodable, Encodable, VarInt},
     hash::{Hash256, TxId},
@@ -92,23 +93,48 @@ impl<'db> UtxoStore<'db> {
         to_remove: &[OutPoint],
     ) -> Result<()> {
         let mut batch = self.db.new_batch();
-
-        for outpoint in to_remove {
-            let key = StoredUtxo::encode_key(outpoint);
-            self.db.batch_delete_cf(&mut batch, CF_UTXO, &key)?;
-        }
-
-        for (outpoint, utxo) in to_add {
-            let key = StoredUtxo::encode_key(outpoint);
-            self.db.batch_put_cf(&mut batch, CF_UTXO, &key, &utxo.encode_value())?;
-        }
-
+        self.fill_batch(&mut batch, to_add, to_remove)?;
         self.db.write_batch(batch)
     }
 
-    /// Process a connected block: spend inputs, add outputs
+    /// Fill an externally-owned `WriteBatch` with UTXO deletes and puts.
+    /// Callers can then add further CF writes (e.g. tx_index, addr_index) and
+    /// commit the whole batch in one atomic RocksDB write.
+    pub fn fill_batch(
+        &self,
+        batch: &mut WriteBatch,
+        to_add: &[(OutPoint, StoredUtxo)],
+        to_remove: &[OutPoint],
+    ) -> Result<()> {
+        for outpoint in to_remove {
+            let key = StoredUtxo::encode_key(outpoint);
+            self.db.batch_delete_cf(batch, CF_UTXO, &key)?;
+        }
+        for (outpoint, utxo) in to_add {
+            let key = StoredUtxo::encode_key(outpoint);
+            self.db.batch_put_cf(batch, CF_UTXO, &key, &utxo.encode_value())?;
+        }
+        Ok(())
+    }
+
+    /// Process a connected block: spend inputs, add outputs (self-contained batch).
     pub fn connect_block(
         &self,
+        txids: &[TxId],
+        txs: &[rbtc_primitives::transaction::Transaction],
+        height: u32,
+    ) -> Result<()> {
+        let mut batch = self.db.new_batch();
+        self.connect_block_into_batch(&mut batch, txids, txs, height)?;
+        self.db.write_batch(batch)
+    }
+
+    /// Like `connect_block` but fills an externally-owned `WriteBatch` so the
+    /// caller can combine UTXO writes with tx_index / addr_index writes and
+    /// commit everything atomically.
+    pub fn connect_block_into_batch(
+        &self,
+        batch: &mut WriteBatch,
         txids: &[TxId],
         txs: &[rbtc_primitives::transaction::Transaction],
         height: u32,
@@ -136,7 +162,7 @@ impl<'db> UtxoStore<'db> {
             }
         }
 
-        self.apply_batch(&to_add, &to_remove)
+        self.fill_batch(batch, &to_add, &to_remove)
     }
 
     /// Iterate all stored UTXOs (used to reload the in-memory UTXO set on startup).

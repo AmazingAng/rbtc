@@ -6,6 +6,7 @@
 //!        + tx_offset   (4 bytes little-endian)
 //!        = 36 bytes total
 
+use rocksdb::WriteBatch;
 use rbtc_primitives::hash::Hash256;
 
 use crate::{
@@ -54,6 +55,26 @@ impl<'a> TxIndexStore<'a> {
     /// Remove the index entry for `txid` (used during chain reorganization).
     pub fn remove(&self, txid: &Hash256) -> Result<()> {
         self.db.delete_cf(CF_TX_INDEX, &txid.0)
+    }
+
+    /// Accumulate a `put` into an externally-owned `WriteBatch`.
+    pub fn batch_put(
+        &self,
+        batch: &mut WriteBatch,
+        txid: &Hash256,
+        block_hash: &Hash256,
+        tx_offset: u32,
+    ) -> Result<()> {
+        let key = txid.0;
+        let mut value = [0u8; 36];
+        value[..32].copy_from_slice(&block_hash.0);
+        value[32..].copy_from_slice(&tx_offset.to_le_bytes());
+        self.db.batch_put_cf(batch, CF_TX_INDEX, &key, &value)
+    }
+
+    /// Accumulate a `remove` into an externally-owned `WriteBatch`.
+    pub fn batch_remove(&self, batch: &mut WriteBatch, txid: &Hash256) -> Result<()> {
+        self.db.batch_delete_cf(batch, CF_TX_INDEX, &txid.0)
     }
 }
 

@@ -105,6 +105,15 @@ impl Database {
         })
     }
 
+    /// Delete all keys in `[from, to)` for the given column family.
+    /// Uses RocksDB's efficient range-deletion tombstone.
+    pub fn delete_range_cf(&self, cf_name: &str, from: &[u8], to: &[u8]) -> Result<()> {
+        let cf = self.cf(cf_name)?;
+        let mut batch = WriteBatch::default();
+        batch.delete_range_cf(cf, from, to);
+        self.db.write(batch).map_err(StorageError::Rocks)
+    }
+
     pub fn flush(&self) -> Result<()> {
         self.db.flush().map_err(StorageError::Rocks)
     }

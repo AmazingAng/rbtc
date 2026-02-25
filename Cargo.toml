@@ -9,6 +9,7 @@ members = [
     "crates/rbtc-mempool",
     "crates/rbtc-wallet",
     "crates/rbtc-miner",
+    "crates/rbtc-psbt",
     "crates/rbtc-node",
 ]
 resolver = "2"
@@ -30,6 +31,7 @@ rbtc-net        = { path = "crates/rbtc-net" }
 rbtc-mempool    = { path = "crates/rbtc-mempool" }
 rbtc-wallet     = { path = "crates/rbtc-wallet" }
 rbtc-miner      = { path = "crates/rbtc-miner" }
+rbtc-psbt       = { path = "crates/rbtc-psbt" }
 
 # Cryptography
 secp256k1 = { version = "0.31", features = ["global-context"] }
@@ -70,6 +72,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 axum       = "0.8"
 tower      = "0.5"
 tower-http = { version = "0.6", features = ["cors"] }
+
+# Parallel processing
+rayon = "1"
+
+# Compact Blocks (BIP152) SipHash-2-4
+siphasher = "1"
+
+# PSBT Base64 encoding
+base64 = "0.22"
 
 # Error handling
 thiserror = "2"

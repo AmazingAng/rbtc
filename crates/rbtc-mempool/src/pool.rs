@@ -144,6 +144,14 @@ impl Mempool {
         self.entries.keys().copied().collect()
     }
 
+    /// Iterate all (txid, tx) pairs in the mempool (used by BIP152 compact block reconstruction).
+    pub fn transactions(&self) -> HashMap<TxId, rbtc_primitives::transaction::Transaction> {
+        self.entries
+            .iter()
+            .map(|(txid, entry)| (*txid, entry.tx.clone()))
+            .collect()
+    }
+
     /// Total mempool size in virtual bytes
     pub fn total_vsize(&self) -> u64 {
         self.entries.values().map(|e| e.vsize).sum()

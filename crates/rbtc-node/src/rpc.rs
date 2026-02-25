@@ -35,6 +35,7 @@ use rbtc_primitives::{
     hash::Hash256,
     transaction::{OutPoint, Transaction},
 };
+use rbtc_psbt::Psbt;
 use rbtc_storage::{AddrIndexStore, BlockStore, Database, TxIndexStore};
 use rbtc_wallet::{AddressType, Wallet, address::address_to_script};
 
@@ -139,6 +140,13 @@ async fn handle_rpc(
         "getmininginfo"              => rpc_getmininginfo(&state).await,
         "getnetworkhashps"           => rpc_getnetworkhashps(&state, &params).await,
         "estimatesmartfee"           => rpc_estimatesmartfee(&state, &params).await,
+        // PSBT (BIP174)
+        "createpsbt"                 => rpc_createpsbt(&state, &params).await,
+        "walletprocesspsbt"          => rpc_walletprocesspsbt(&state, &params).await,
+        "finalizepsbt"               => rpc_finalizepsbt(&state, &params).await,
+        "combinepsbt"                => rpc_combinepsbt(&state, &params).await,
+        "decodepsbt"                 => rpc_decodepsbt(&state, &params).await,
+        "analyzepsbt"                => rpc_analyzepsbt(&state, &params).await,
         method => {
             warn!("rpc: unknown method {method}");
             Err((-32601, format!("Method not found: {method}")))
@@ -990,6 +998,200 @@ async fn rpc_getaddressbalance(state: &RpcState, params: &Value) -> RpcResult {
     }
 
     Ok(json!({ "balance": balance, "received": received }))
+}
+
+// ── PSBT RPC methods (BIP174) ─────────────────────────────────────────────────
+
+/// `createpsbt` — Creator role.
+///
+/// Params: [ [{txid, vout, sequence?}, ...], [{address: amount_sats}, ...], locktime? ]
+async fn rpc_createpsbt(_state: &RpcState, params: &Value) -> RpcResult {
+    let inputs_raw = params.get(0)
+        .and_then(|v| v.as_array())
+        .ok_or((-8, "params[0] must be array of inputs".to_string()))?;
+    let outputs_raw = params.get(1)
+        .and_then(|v| v.as_object())
+        .ok_or((-8, "params[1] must be object of {address: sats}".to_string()))?;
+    let locktime = params.get(2).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+
+    use rbtc_primitives::{hash::Hash256, transaction::{TxIn, TxOut}};
+    let mut inputs = Vec::new();
+    for inp in inputs_raw {
+        let txid_hex = inp.get("txid").and_then(|v| v.as_str())
+            .ok_or((-8, "input missing txid".to_string()))?;
+        let vout = inp.get("vout").and_then(|v| v.as_u64())
+            .ok_or((-8, "input missing vout".to_string()))? as u32;
+        let sequence = inp.get("sequence").and_then(|v| v.as_u64())
+            .unwrap_or(0xffffffff) as u32;
+        let txid_bytes = hex::decode(txid_hex)
+            .map_err(|_| (-8, "invalid txid hex".to_string()))?;
+        if txid_bytes.len() != 32 {
+            return Err((-8, "txid must be 32 bytes".to_string()));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&txid_bytes);
+        inputs.push(TxIn {
+            previous_output: rbtc_primitives::transaction::OutPoint { txid: Hash256(arr), vout },
+            script_sig: rbtc_primitives::script::Script::new(),
+            sequence,
+            witness: vec![],
+        });
+    }
+
+    let mut txouts = Vec::new();
+    for (addr, amount_val) in outputs_raw {
+        let amount = amount_val.as_u64()
+            .ok_or((-8, format!("amount for {addr} must be integer sats")))?;
+        let script = address_to_script(addr)
+            .map_err(|e| (-8, format!("invalid address {addr}: {e}")))?;
+        txouts.push(TxOut { value: amount, script_pubkey: script });
+    }
+
+    let tx = rbtc_primitives::transaction::Transaction {
+        version: 2, inputs, outputs: txouts, lock_time: locktime,
+    };
+    let psbt = Psbt::create(tx);
+    Ok(json!(psbt.to_base64()))
+}
+
+/// `walletprocesspsbt` — Updater + Signer using the node's built-in wallet.
+async fn rpc_walletprocesspsbt(state: &RpcState, params: &Value) -> RpcResult {
+    let b64 = params.get(0).and_then(|v| v.as_str())
+        .ok_or((-8, "params[0] must be PSBT base64 string".to_string()))?;
+    let mut psbt = Psbt::from_base64(b64)
+        .map_err(|e| (-8, format!("PSBT decode: {e}")))?;
+
+    let wallet_arc = state.wallet.as_ref()
+        .ok_or((-18, "Wallet not loaded".to_string()))?;
+    let wallet = wallet_arc.read().await;
+
+    // For each input, try to sign with a matching wallet key
+    for i in 0..psbt.inputs.len() {
+        // Determine the scriptPubKey to match
+        let spk = if let Some(txout) = psbt.inputs[i].witness_utxo.as_ref() {
+            txout.script_pubkey.as_bytes().to_vec()
+        } else if let Some(tx) = psbt.inputs[i].non_witness_utxo.as_ref() {
+            let vout = psbt.global.unsigned_tx.inputs[i].previous_output.vout as usize;
+            tx.outputs.get(vout).map(|o| o.script_pubkey.as_bytes().to_vec())
+                .unwrap_or_default()
+        } else {
+            continue;
+        };
+
+        // Check if we have a key that corresponds to this scriptPubKey
+        if let Some(sk) = wallet.key_for_script(&spk) {
+            psbt.sign_input(i, &sk)
+                .map_err(|e| (-4, format!("signing error: {e}")))?;
+        }
+    }
+
+    Ok(json!({
+        "psbt": psbt.to_base64(),
+        "complete": psbt.inputs.iter().all(|i| i.is_finalized() || !i.partial_sigs.is_empty())
+    }))
+}
+
+/// `finalizepsbt` — Finalizer + Extractor.
+async fn rpc_finalizepsbt(_state: &RpcState, params: &Value) -> RpcResult {
+    let b64 = params.get(0).and_then(|v| v.as_str())
+        .ok_or((-8, "params[0] must be PSBT base64 string".to_string()))?;
+    let mut psbt = Psbt::from_base64(b64)
+        .map_err(|e| (-8, format!("PSBT decode: {e}")))?;
+
+    psbt.finalize().map_err(|e| (-8, format!("finalize error: {e}")))?;
+
+    let complete = psbt.inputs.iter().all(|i| i.is_finalized());
+    if complete {
+        let tx = psbt.clone().extract_tx()
+            .map_err(|e| (-8, format!("extract error: {e}")))?;
+        let mut buf = Vec::new();
+        tx.encode(&mut buf).ok();
+        Ok(json!({ "hex": hex::encode(&buf), "complete": true }))
+    } else {
+        Ok(json!({ "psbt": psbt.to_base64(), "complete": false }))
+    }
+}
+
+/// `combinepsbt` — Combiner.
+async fn rpc_combinepsbt(_state: &RpcState, params: &Value) -> RpcResult {
+    let psbts_raw = params.get(0)
+        .and_then(|v| v.as_array())
+        .ok_or((-8, "params[0] must be array of PSBT base64 strings".to_string()))?;
+
+    if psbts_raw.is_empty() {
+        return Err((-8, "at least one PSBT required".to_string()));
+    }
+
+    let mut combined = Psbt::from_base64(psbts_raw[0].as_str().unwrap_or(""))
+        .map_err(|e| (-8, format!("PSBT[0] decode: {e}")))?;
+
+    for (idx, val) in psbts_raw.iter().enumerate().skip(1) {
+        let other = Psbt::from_base64(val.as_str().unwrap_or(""))
+            .map_err(|e| (-8, format!("PSBT[{idx}] decode: {e}")))?;
+        combined.combine(other)
+            .map_err(|e| (-8, format!("combine error at [{idx}]: {e}")))?;
+    }
+
+    Ok(json!(combined.to_base64()))
+}
+
+/// `decodepsbt` — human-readable PSBT inspection.
+async fn rpc_decodepsbt(_state: &RpcState, params: &Value) -> RpcResult {
+    let b64 = params.get(0).and_then(|v| v.as_str())
+        .ok_or((-8, "params[0] must be PSBT base64 string".to_string()))?;
+    let psbt = Psbt::from_base64(b64)
+        .map_err(|e| (-8, format!("PSBT decode: {e}")))?;
+
+    let inputs: Vec<Value> = psbt.inputs.iter().enumerate().map(|(i, inp)| {
+        let mut obj = json!({
+            "has_non_witness_utxo": inp.non_witness_utxo.is_some(),
+            "has_witness_utxo": inp.witness_utxo.is_some(),
+            "partial_sigs": inp.partial_sigs.len(),
+            "finalized": inp.is_finalized(),
+        });
+        if let Some(sh) = inp.sighash_type {
+            obj["sighash_type"] = json!(sh);
+        }
+        let _ = i;
+        obj
+    }).collect();
+
+    let unsigned_txid = {
+        let mut buf = Vec::new();
+        psbt.global.unsigned_tx.encode_legacy(&mut buf).ok();
+        sha256d(&buf).to_hex()
+    };
+
+    Ok(json!({
+        "tx": { "txid": unsigned_txid },
+        "inputs": inputs,
+        "output_count": psbt.outputs.len(),
+        "version": psbt.global.version,
+    }))
+}
+
+/// `analyzepsbt` — per-input signing status report.
+async fn rpc_analyzepsbt(_state: &RpcState, params: &Value) -> RpcResult {
+    let b64 = params.get(0).and_then(|v| v.as_str())
+        .ok_or((-8, "params[0] must be PSBT base64 string".to_string()))?;
+    let psbt = Psbt::from_base64(b64)
+        .map_err(|e| (-8, format!("PSBT decode: {e}")))?;
+
+    let inputs: Vec<Value> = psbt.inputs.iter().map(|inp| {
+        let status = if inp.is_finalized() {
+            "finalized"
+        } else if !inp.partial_sigs.is_empty() {
+            "partially_signed"
+        } else if inp.witness_utxo.is_some() || inp.non_witness_utxo.is_some() {
+            "ready_to_sign"
+        } else {
+            "missing_utxo"
+        };
+        json!({ "status": status, "partial_sigs": inp.partial_sigs.len() })
+    }).collect();
+
+    let all_finalized = psbt.inputs.iter().all(|i| i.is_finalized());
+    Ok(json!({ "inputs": inputs, "estimated_complete": all_finalized }))
 }
 
 // ── Server startup ────────────────────────────────────────────────────────────

@@ -1,3 +1,4 @@
+use rayon::prelude::*;
 use rbtc_primitives::{
     block::Block,
     codec::Encodable,
@@ -76,33 +77,43 @@ pub fn verify_block(
 
     // ── Transaction verification + sigops + fees ─────────────────────────
     let subsidy = block_subsidy(ctx.height);
-    let mut total_fees: u64 = 0;
-    let mut total_sigops: u64 = 0;
 
-    // Verify coinbase
-    let _max_coinbase_value = subsidy; // checked at end against actual fees
+    // Verify coinbase (sequential, must be first)
     verify_coinbase(&block.transactions[0], ctx.height, u64::MAX)?;
+    let coinbase_sigops = count_block_sigops(&block.transactions[0]) as u64;
 
-    // Count coinbase sigops
-    total_sigops += count_block_sigops(&block.transactions[0]) as u64;
+    // Parallel verification of non-coinbase transactions.
+    // `verify_transaction` only reads from `utxos` (shared &ref is Sync), so
+    // this is safe to parallelise across Rayon's thread pool.
+    let non_coinbase = &block.transactions[1..];
 
-    // Verify non-coinbase transactions
-    for tx in &block.transactions[1..] {
-        let fee = verify_transaction(tx, utxos, ctx.height, ctx.flags)
-            .map_err(|e| e)?;
+    let tx_results: Vec<Result<u64, ConsensusError>> = non_coinbase
+        .par_iter()
+        .map(|tx| verify_transaction(tx, utxos, ctx.height, ctx.flags))
+        .collect();
 
-        total_fees = total_fees.checked_add(fee)
+    // Sequential accumulation (fast: just arithmetic + early-error detection)
+    let mut total_fees: u64 = 0;
+    for result in tx_results {
+        let fee = result?;
+        total_fees = total_fees
+            .checked_add(fee)
             .ok_or(ConsensusError::InputValueOverflow)?;
+    }
 
-        total_sigops += count_block_sigops(tx) as u64 * WITNESS_SCALE_FACTOR;
-        if total_sigops > MAX_BLOCK_SIGOPS_COST {
-            return Err(ConsensusError::TooManySignatureOps(total_sigops, MAX_BLOCK_SIGOPS_COST));
-        }
+    // Parallel sigops counting, then check total
+    let non_coinbase_sigops: u64 = non_coinbase
+        .par_iter()
+        .map(|tx| count_block_sigops(tx) as u64 * WITNESS_SCALE_FACTOR)
+        .sum();
+
+    let total_sigops = coinbase_sigops + non_coinbase_sigops;
+    if total_sigops > MAX_BLOCK_SIGOPS_COST {
+        return Err(ConsensusError::TooManySignatureOps(total_sigops, MAX_BLOCK_SIGOPS_COST));
     }
 
     // Check coinbase value does not exceed subsidy + fees
-    let max_allowed = subsidy.checked_add(total_fees)
-        .unwrap_or(u64::MAX);
+    let max_allowed = subsidy.checked_add(total_fees).unwrap_or(u64::MAX);
     let coinbase_out: u64 = block.transactions[0].outputs.iter().map(|o| o.value).sum();
     if coinbase_out > max_allowed {
         return Err(ConsensusError::BadCoinbaseAmount(coinbase_out, max_allowed));

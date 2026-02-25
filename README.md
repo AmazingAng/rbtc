@@ -1,6 +1,6 @@
 # rbtc — Bitcoin Core in Rust
 
-A from-scratch implementation of Bitcoin Core's consensus, P2P networking, HD wallet, and CPU miner, written in Rust. No `bitcoin` crate — all protocol types, encoding, validation, key derivation, and block template construction are implemented independently.
+A from-scratch implementation of Bitcoin Core's consensus, P2P networking, HD wallet, CPU miner, compact blocks, PSBT, and block pruning, written in Rust. No `bitcoin` crate — all protocol types, encoding, validation, key derivation, and block template construction are implemented independently.
 
 ## Architecture
 
@@ -16,6 +16,7 @@ rbtc/
 │   ├── rbtc-net/          # P2P: wire protocol, peer management (tokio), IBD
 │   ├── rbtc-wallet/       # HD wallet: BIP32/39, address generation, UTXO tracking, signing
 │   ├── rbtc-miner/        # Mining: block template, tx selection, CPU PoW worker
+│   ├── rbtc-psbt/         # BIP174 PSBT: Creator/Updater/Signer/Combiner/Finalizer/Extractor
 │   └── rbtc-node/         # Binary: node loop, JSON-RPC server, config
 ```
 
@@ -26,7 +27,7 @@ rbtc/
 - **SegWit support**: P2WPKH, P2WSH, witness commitment validation (BIP141/143)
 - **Taproot support**: P2TR key path + script path verification (BIP340/341/342)
 - **P2P protocol**: Complete Bitcoin wire protocol (version/verack/inv/getdata/block/tx/headers/getheaders/ping/pong)
-- **Initial Block Download**: Headers-first IBD with batch block download (16 blocks in flight)
+- **Initial Block Download**: Headers-first IBD with batch block download (64 blocks in flight)
 - **Persistent storage**: RocksDB-backed UTXO set, block index, and chain state
 - **Multi-network**: mainnet, testnet4, regtest, signet
 
@@ -67,6 +68,21 @@ rbtc/
 - **`getaddressutxos`**: returns all currently unspent outputs for an address: `{txid, vout, value, height, confirmations}`
 - **`getaddressbalance`**: returns `{balance, received}` in satoshis — `balance` = unspent, `received` = all-time total received
 
+
+### Phase 6 — Protocol Completeness & Performance
+- **Parallel script verification**: `verify_block()` uses `rayon::par_iter` for non-coinbase transactions, enabling 2–4× IBD speedup on multi-core machines; coinbase is verified sequentially before the parallel phase
+- **Larger IBD batches**: `IBD_BATCH_SIZE` raised from 16 → 64; IBD progress-check timer reduced from 5 s → 1 s; UTXO + tx_index + addr_index + chain-tip all committed in a single atomic `WriteBatch` per block
+- **Compact Blocks (BIP152)**: `crates/rbtc-net/src/compact.rs` implements `CompactBlock` / `GetBlockTxn` / `BlockTxn` wire types, SipHash-2-4 short TxID calculation, and a `reconstruct_block()` helper; peer_manager sends `sendcmpct(mode=1)` after handshake; node handles the full 3-message reconstruction flow
+- **PSBT (BIP174)** — new `rbtc-psbt` crate:
+  - `Psbt::create()` (Creator): strips scriptSig/witness and produces an unsigned PSBT
+  - `add_witness_utxo()`, `add_non_witness_utxo()`, `set_sighash_type()` (Updater)
+  - `sign_input()` (Signer): P2WPKH via BIP143 sighash + ECDSA; P2PKH via legacy sighash + ECDSA
+  - `combine()` (Combiner): merges partial signatures and metadata from multiple PSBTs
+  - `finalize()` (Finalizer): moves partial sigs into `final_script_witness` / `final_script_sig`
+  - `extract_tx()` (Extractor): returns the final signed `Transaction`
+  - Base64 serialize/deserialize; 6 new RPCs: `createpsbt`, `walletprocesspsbt`, `finalizepsbt`, `combinepsbt`, `decodepsbt`, `analyzepsbt`
+- **Block Pruning**: `--prune <MiB>` CLI flag; `BlockStore::prune_blocks_below(height)` deletes `CF_BLOCK_DATA` for blocks > 288 confirmations deep; `BlockStatus::Pruned` (4) recorded in `block_index`; headers, UTXO set, and indexes are never pruned
+
 ## Dependencies
 
 | Crate | Purpose |
@@ -85,6 +101,9 @@ rbtc/
 | `tokio = "1"` | Async P2P networking and RPC server |
 | `axum = "0.8"` | JSON-RPC HTTP server |
 | `clap = "4"` | CLI argument parsing |
+| `rayon = "1"` | Parallel script verification (IBD speedup) |
+| `siphasher = "1"` | SipHash-2-4 for BIP152 compact block short TxIDs |
+| `base64 = "0.22"` | PSBT Base64 encode/decode |
 | `tracing` | Structured logging |
 
 **Not used**: `bitcoin` crate — all protocol types, encoding, and key derivation are implemented from scratch.
@@ -149,6 +168,7 @@ curl -s -d '{"method":"submitblock","params":["<hex>"]}' http://127.0.0.1:8332/
 | `--wallet` | — | Enable wallet (loads from datadir DB) |
 | `--wallet-passphrase` | `""` | AES-256-GCM passphrase for xprv encryption |
 | `--create-wallet` | — | Generate a fresh wallet, print the mnemonic, then run |
+| `--prune` | `0` | Target disk budget for block data in MiB (`0` = keep all; min 550 when enabled) |
 
 ### Environment Variables
 
@@ -227,6 +247,18 @@ curl -s -d '{"method":"sendtoaddress","params":["bc1q...","0.001"]}' http://127.
 | `getaddressutxos` | `address` | `[{txid, vout, value, height, confirmations}, …]` |
 | `getaddressbalance` | `address` | `{balance, received}` in satoshis |
 
+
+### PSBT Methods (BIP174)
+
+| Method | Parameters | Returns |
+|--------|-----------|---------|
+| `createpsbt` | `[{txid,vout,sequence?},...]`, `{address:sats,...}`, `[locktime]` | PSBT base64 string |
+| `walletprocesspsbt` | `psbt_b64` | `{psbt, complete}` |
+| `finalizepsbt` | `psbt_b64` | `{hex, complete}` or `{psbt, complete:false}` |
+| `combinepsbt` | `[psbt_b64, ...]` | Combined PSBT base64 string |
+| `decodepsbt` | `psbt_b64` | Human-readable PSBT fields (tx, inputs, outputs) |
+| `analyzepsbt` | `psbt_b64` | `{inputs: [{status, partial_sigs},...], estimated_complete}` |
+
 ## Implementation Notes
 
 ### Consensus Layer (`rbtc-consensus`)
@@ -234,6 +266,7 @@ curl -s -d '{"method":"sendtoaddress","params":["bc1q...","0.001"]}' http://127.
 - Block header validation: PoW check (`hash < target`), timestamp MTP/future checks, nBits validation
 - Transaction validation: UTXO existence, coinbase maturity, script execution via `rbtc-script`
 - Block validation: Merkle root, BIP141 witness commitment, block weight ≤ 4,000,000, sigops cost ≤ 80,000
+- **Parallel script verification**: non-coinbase transactions verified concurrently with `rayon::par_iter`; sigops counted in a second parallel pass; thread pool scales to available CPU cores
 - Difficulty adjustment: every 2016 blocks, clamped to ±4× (Bitcoin's actual algorithm)
 - Block subsidy: 50 BTC halving every 210,000 blocks
 
@@ -260,6 +293,7 @@ curl -s -d '{"method":"sendtoaddress","params":["bc1q...","0.001"]}' http://127.
 - Automatic ping/pong heartbeat with stale connection detection
 - Inbound TCP listener: accepts peers up to `max_inbound` (default 125)
 - Peer cmd_tx registration: command channel properly associated before first message
+- **BIP152 Compact Blocks**: `sendcmpct(mode=1)` sent after every handshake; `cmpctblock` / `getblocktxn` / `blocktxn` messages handled; `pending_compact` map tracks partial reconstructions
 
 ### HD Wallet (`rbtc-wallet`)
 
@@ -269,6 +303,16 @@ curl -s -d '{"method":"sendtoaddress","params":["bc1q...","0.001"]}' http://127.
 - **Signing**: ECDSA for P2PKH/P2WPKH via `secp.sign_ecdsa(msg, &sk)`; Schnorr for P2TR key-path via `secp.sign_schnorr_with_aux_rand(&sighash_bytes, &tweaked_keypair, &random_aux_rand)`
 - **Encryption**: xprv bytes encrypted with AES-256-GCM; key = PBKDF2-SHA256(passphrase, 16-byte salt, 100,000 iterations); stored as `salt || nonce || ciphertext+tag` in `CF_WALLET`
 - **Incremental UTXO scanning**: After each block is connected, `Wallet::scan_block()` checks every TxOut's scriptPubKey against the in-memory `script_to_addr` map (O(outputs)); `remove_spent()` checks TxIn outpoints against `wallet.utxos`
+
+### PSBT (`rbtc-psbt`)
+
+- **Encoding**: `psbt\xff` magic + global map + per-input maps + per-output maps; Base64 wrapper via `base64 = "0.22"`
+- **Creator**: `Psbt::create(tx)` strips all scriptSig/witness fields, producing a fully unsigned PSBT global map
+- **Signer**: BIP143 P2WPKH sighash (hashPrevouts + hashSequence + hashOutputs) computed locally; legacy P2PKH sighash using a cloned unsigned transaction; ECDSA signatures DER-encoded with sighash-type byte appended
+- **Combiner**: `combine()` merges partial signatures, UTXOs, and unknown fields using `or_insert` semantics — no duplicates, no overwrite
+- **Finalizer**: single-sig P2WPKH → `final_script_witness = [sig, pubkey]`; single-sig P2PKH → `final_script_sig = <sig><pk>`
+- **Extractor**: `extract_tx()` fails if any input lacks `final_script_sig` or `final_script_witness`
+- **Wallet integration**: `walletprocesspsbt` uses `Wallet::key_for_script()` to look up the private key by scriptPubKey for each input
 
 ### Mining (`rbtc-miner`)
 
@@ -284,6 +328,13 @@ curl -s -d '{"method":"sendtoaddress","params":["bc1q...","0.001"]}' http://127.
 - **AddrIndexStore**: key = `[script_len: 1B][scriptPubKey: N B][height: 4B BE][tx_offset: 4B BE]`; value = txid (32 bytes). Big-endian encoding for height and tx_offset ensures lexicographic order matches chronological order. `iter_by_script(script)` issues a RocksDB prefix scan over `[script_len][scriptPubKey]`, collecting all matching entries. `remove` reconstructs the exact key from script + height + tx_offset during reorgs.
 - **`getrawtransaction` (confirmed)**: looks up txid in `CF_TX_INDEX` → loads the block from `CF_BLOCK_DATA` → returns `transactions[tx_offset]`. Verbose mode includes `{blockhash, confirmations, vin, vout}`.
 - **Address RPCs**: all three (`getaddresstxids`, `getaddressutxos`, `getaddressbalance`) decode the input address to scriptPubKey via `rbtc-wallet::address::address_to_script`, then prefix-scan `CF_ADDR_INDEX`. For UTXO/balance queries each candidate output is cross-checked against the in-memory `UtxoSet` to determine if it is still unspent.
+
+### Block Pruning (`rbtc-storage` + `rbtc-node`)
+
+- **`BlockStatus::Pruned` (4)**: new enum variant in `rbtc-consensus`; persisted as `status = 4` in `block_index` CF
+- **`BlockStore::prune_blocks_below(max_height)`**: iterates all indexed blocks, deletes `CF_BLOCK_DATA` entries at heights ≤ `max_height`, updates status; skips already-pruned and absent entries
+- **`--prune <MiB>`**: CLI flag; node calls `maybe_prune(current_height)` after each block is connected; pruning depth = 288 blocks (~2 days); headers, UTXO, tx_index, addr_index are never pruned
+- **Impact**: `getrawtransaction` returns an error for pruned blocks; `getaddressbalance` / `getaddressutxos` continue to work (they use the UTXO set, not block data)
 
 ### Storage Layer (`rbtc-storage`)
 
@@ -324,7 +375,7 @@ When a competing chain with more cumulative work is detected, `reorganize_to(new
 cargo test --workspace
 ```
 
-227 tests across all crates — all pass.
+236 tests across all crates — all pass.
 
 | Crate | Tests |
 |-------|-------|
@@ -334,7 +385,8 @@ cargo test --workspace
 | `rbtc-script` | 25 |
 | `rbtc-storage` | 14 |
 | `rbtc-mempool` | 4 |
-| `rbtc-net` | 6 |
+| `rbtc-net` | 9 |
+| `rbtc-psbt` | 6 |
 | `rbtc-wallet` | 35 |
 | `rbtc-miner` | 14 |
 
@@ -391,7 +443,7 @@ cargo llvm-cov --workspace --all-features --tests --lcov --output-path lcov.info
 ## Known Limitations
 
 - No BIP37 bloom filtering
-- No compact blocks (BIP152)
+- Compact Blocks (BIP152) implemented but only tested on regtest; mainnet relay may have edge-case short-ID collisions
 - Signet challenge validation not implemented
 - Mempool eviction policy not yet implemented (no size cap)
 - `sendrawtransaction` relay requires script-valid inputs (P2PKH etc.); bare scripts that rely on policy flags may differ from Bitcoin Core behavior

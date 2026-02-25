@@ -58,6 +58,17 @@ pub struct Args {
     /// Generate a new wallet and print the mnemonic, then exit.
     #[arg(long)]
     pub create_wallet: bool,
+
+    /// Enable block pruning.  Specify the target disk budget in MiB for raw
+    /// block data (minimum 550 MiB, Bitcoin Core convention).
+    /// 0 = disabled (keep all block data, the default).
+    ///
+    /// When pruning is enabled the node deletes `CF_BLOCK_DATA` for blocks
+    /// more than 288 confirmations deep (~2 days of blocks).  Block headers,
+    /// UTXO set, tx-index, and addr-index are never pruned.
+    /// Note: `getrawtransaction` will return an error for pruned blocks.
+    #[arg(long, value_name = "MiB", default_value = "0")]
+    pub prune: u64,
 }
 
 impl Args {

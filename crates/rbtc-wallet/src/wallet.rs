@@ -492,6 +492,13 @@ impl Wallet {
     }
 
     /// Derive the BIP32 private key for the given address.
+    /// Look up the secret key for a given scriptPubKey (if the wallet owns it).
+    /// Used by PSBT signing.
+    pub fn key_for_script(&self, script: &[u8]) -> Option<SecretKey> {
+        let address = self.script_to_addr.get(script)?;
+        self.privkey_for_address(address).ok()
+    }
+
     fn privkey_for_address(&self, address: &str) -> Result<SecretKey, WalletError> {
         let info = self.addresses.get(address).ok_or(WalletError::AddressNotFound)?;
         if info.derivation_path.starts_with("imported:") {

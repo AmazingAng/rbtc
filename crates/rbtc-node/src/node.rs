@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use tokio::sync::{mpsc, RwLock};
@@ -11,6 +11,7 @@ use rbtc_consensus::{
 use rbtc_crypto::sha256d;
 use rbtc_mempool::Mempool;
 use rbtc_net::{
+    compact::{short_txid, reconstruct_block, CompactBlock, GetBlockTxn},
     message::{Inventory, InvType, NetworkMessage},
     peer_manager::{NodeEvent, PeerManager, PeerManagerConfig},
 };
@@ -31,6 +32,10 @@ use crate::{
 /// Peer ID used when a block is submitted locally (via RPC).
 const LOCAL_PEER_ID: u64 = 0;
 
+/// Maximum number of blocks requested per IBD batch.
+/// 64 blocks (~1 MB each at most) keeps the pipeline full on fast connections.
+const IBD_BATCH_SIZE: usize = 64;
+
 /// The main Bitcoin node
 pub struct Node {
     args: Args,
@@ -48,6 +53,9 @@ pub struct Node {
     submit_block_tx: mpsc::UnboundedSender<rbtc_primitives::block::Block>,
     /// Receiver for blocks submitted via the RPC `submitblock` / `generatetoaddress`.
     submit_block_rx: mpsc::UnboundedReceiver<rbtc_primitives::block::Block>,
+    /// BIP152: partially-reconstructed compact blocks awaiting `blocktxn` responses.
+    /// Key = block_hash, Value = (compact block, list of already-filled tx slots).
+    pending_compact: HashMap<rbtc_primitives::hash::Hash256, (CompactBlock, Vec<Option<rbtc_primitives::transaction::Transaction>>)>,
 }
 
 impl Node {
@@ -106,6 +114,7 @@ impl Node {
             node_event_rx,
             submit_block_tx,
             submit_block_rx,
+            pending_compact: HashMap::new(),
         })
     }
 
@@ -147,7 +156,8 @@ impl Node {
 
         // Main event loop
         let mut stats_timer = tokio::time::interval(Duration::from_secs(30));
-        let mut ibd_timer = tokio::time::interval(Duration::from_secs(5));
+        // Tick frequently during IBD so we keep the block-download pipeline full.
+        let mut ibd_timer = tokio::time::interval(Duration::from_secs(1));
 
         loop {
             tokio::select! {
@@ -220,6 +230,18 @@ impl Node {
 
             NodeEvent::TxReceived { peer_id, tx } => {
                 self.handle_tx(peer_id, tx).await;
+            }
+
+            NodeEvent::CmpctBlockReceived { peer_id, cmpct } => {
+                self.handle_cmpct_block(peer_id, cmpct).await?;
+            }
+
+            NodeEvent::GetBlockTxnReceived { peer_id, req } => {
+                self.handle_get_block_txn(peer_id, req).await;
+            }
+
+            NodeEvent::BlockTxnReceived { peer_id, resp } => {
+                self.handle_block_txn(peer_id, resp).await?;
             }
 
             NodeEvent::InvReceived { peer_id, items } => {
@@ -327,6 +349,140 @@ impl Node {
         Ok(())
     }
 
+    // ── BIP152 Compact Block handlers ─────────────────────────────────────────
+
+    async fn handle_cmpct_block(
+        &mut self,
+        peer_id: u64,
+        cmpct: CompactBlock,
+    ) -> Result<()> {
+        let block_hash = {
+            let mut buf = Vec::with_capacity(80);
+            buf.extend_from_slice(&cmpct.header.version.to_le_bytes());
+            buf.extend_from_slice(&cmpct.header.prev_block.0);
+            buf.extend_from_slice(&cmpct.header.merkle_root.0);
+            buf.extend_from_slice(&cmpct.header.time.to_le_bytes());
+            buf.extend_from_slice(&cmpct.header.bits.to_le_bytes());
+            buf.extend_from_slice(&cmpct.header.nonce.to_le_bytes());
+            rbtc_crypto::sha256d(&buf)
+        };
+
+        // Build a mempool lookup by short_id for this compact block's nonce/header
+        let mempool_lookup: HashMap<u64, rbtc_primitives::transaction::Transaction> = {
+            let mp = self.mempool.read().await;
+            mp.transactions()
+                .iter()
+                .map(|(txid, tx)| {
+                    let sid = short_txid(&cmpct.header, cmpct.nonce, txid);
+                    (sid, tx.clone())
+                })
+                .collect()
+        };
+
+        let (maybe_block, missing) = reconstruct_block(&cmpct, &mempool_lookup);
+
+        if let Some(block) = maybe_block {
+            // Full reconstruction succeeded without a round-trip
+            self.handle_block(peer_id, block).await?;
+        } else {
+            // Request missing transactions from the peer
+            info!(
+                "cmpctblock: {} txs missing, requesting getblocktxn",
+                missing.len()
+            );
+            self.pending_compact.insert(block_hash, (cmpct, vec![]));
+            self.peer_manager.send_to(
+                peer_id,
+                NetworkMessage::GetBlockTxn(GetBlockTxn { block_hash, indexes: missing }),
+            );
+        }
+
+        Ok(())
+    }
+
+    async fn handle_block_txn(
+        &mut self,
+        peer_id: u64,
+        resp: rbtc_net::compact::BlockTxn,
+    ) -> Result<()> {
+        let Some((cmpct, _)) = self.pending_compact.remove(&resp.block_hash) else {
+            return Ok(());
+        };
+
+        // Re-build the mempool lookup with the fresh nonce (same as above)
+        let mempool_lookup: HashMap<u64, rbtc_primitives::transaction::Transaction> = {
+            let mp = self.mempool.read().await;
+            mp.transactions()
+                .iter()
+                .map(|(txid, tx)| {
+                    let sid = short_txid(&cmpct.header, cmpct.nonce, txid);
+                    (sid, tx.clone())
+                })
+                .collect()
+        };
+
+        // Apply the provided missing transactions on top of the mempool lookup
+        let mut augmented = mempool_lookup;
+        for (missing_tx, &slot_idx) in resp.txns.iter().zip(
+            // We stored the missing indexes in the GetBlockTxn we sent; reconstruct
+            // them by a fresh reconstruction pass.
+            reconstruct_block(&cmpct, &augmented.clone()).1.iter(),
+        ) {
+            let sid = short_txid(&cmpct.header, cmpct.nonce, &{
+                let mut buf = Vec::new();
+                missing_tx.encode_legacy(&mut buf).ok();
+                rbtc_crypto::sha256d(&buf)
+            });
+            augmented.entry(sid).or_insert_with(|| missing_tx.clone());
+            let _ = slot_idx; // suppress unused warning
+        }
+
+        let (maybe_block, _) = reconstruct_block(&cmpct, &augmented);
+        if let Some(block) = maybe_block {
+            self.handle_block(peer_id, block).await?;
+        } else {
+            warn!("blocktxn: still could not reconstruct block {}", resp.block_hash.to_hex());
+        }
+
+        Ok(())
+    }
+
+    /// Respond to a `getblocktxn` request: send back the requested transactions.
+    async fn handle_get_block_txn(&self, peer_id: u64, req: GetBlockTxn) {
+        use rbtc_storage::BlockStore;
+        let block_store = BlockStore::new(&self.db);
+        if let Ok(Some(block)) = block_store.get_block(&req.block_hash) {
+            let txns: Vec<_> = req
+                .indexes
+                .iter()
+                .filter_map(|&i| block.transactions.get(i as usize).cloned())
+                .collect();
+            self.peer_manager.send_to(
+                peer_id,
+                NetworkMessage::BlockTxn(rbtc_net::compact::BlockTxn {
+                    block_hash: req.block_hash,
+                    txns,
+                }),
+            );
+        }
+    }
+
+    /// Delete raw block data for blocks more than 288 heights below the current tip
+    /// when `--prune <MiB>` is enabled.
+    async fn maybe_prune(&self, current_height: u32) {
+        if self.args.prune == 0 {
+            return;
+        }
+        // Keep the most recent 288 blocks (~2 days); prune everything older.
+        let prune_below = current_height.saturating_sub(288);
+        let block_store = BlockStore::new(&self.db);
+        match block_store.prune_blocks_below(prune_below) {
+            Ok(n) if n > 0 => info!("pruned {n} block(s) below height {prune_below}"),
+            Err(e) => warn!("pruning error: {e}"),
+            _ => {}
+        }
+    }
+
     async fn download_blocks(&mut self, peer_id: u64) {
         let chain = self.chain.read().await;
         let mut current_height = chain.height() + 1;
@@ -343,7 +499,7 @@ impl Node {
                 continue;
             }
             hashes.push(hash);
-            if hashes.len() >= 16 {
+            if hashes.len() >= IBD_BATCH_SIZE {
                 break;
             }
             current_height += 1;
@@ -494,10 +650,13 @@ impl Node {
                         })
                         .collect();
 
-                // Persist everything to RocksDB
+                // Persist everything to RocksDB in one atomic WriteBatch:
+                // block metadata, UTXO changes, tx_index, addr_index, chain tip.
                 {
                     let chainwork = self.chain.read().await.block_index[&block_hash].chainwork;
 
+                    // Block data (large blobs) are written separately; they don't
+                    // need to be atomic with the index updates.
                     let block_store = BlockStore::new(&self.db);
                     let stored_idx = StoredBlockIndex {
                         header: block.header.clone(),
@@ -510,23 +669,33 @@ impl Node {
                     block_store.put_block(&block_hash, &block).ok();
                     block_store.put_undo(&block_hash, &encode_block_undo(&undo_stored)).ok();
 
+                    // Single WriteBatch for UTXO + tx_index + addr_index + chain tip
+                    let mut batch = self.db.new_batch();
+
                     let utxo_store = UtxoStore::new(&self.db);
-                    utxo_store.connect_block(&txids, &block.transactions, height).ok();
+                    utxo_store.connect_block_into_batch(
+                        &mut batch, &txids, &block.transactions, height,
+                    ).ok();
 
-                    let chain_store = ChainStore::new(&self.db);
-                    chain_store.update_tip(&block_hash, height, chainwork).ok();
-                }
-
-                // Write transaction index and address index
-                {
                     let tx_idx = TxIndexStore::new(&self.db);
                     let addr_idx = AddrIndexStore::new(&self.db);
                     for (offset, (tx, txid)) in block.transactions.iter().zip(txids.iter()).enumerate() {
-                        tx_idx.put(txid, &block_hash, offset as u32).ok();
+                        tx_idx.batch_put(&mut batch, txid, &block_hash, offset as u32).ok();
                         for output in &tx.outputs {
-                            addr_idx.put(&output.script_pubkey.0, height, offset as u32, txid).ok();
+                            addr_idx.batch_put(
+                                &mut batch,
+                                &output.script_pubkey.0,
+                                height,
+                                offset as u32,
+                                txid,
+                            ).ok();
                         }
                     }
+
+                    let chain_store = ChainStore::new(&self.db);
+                    chain_store.update_tip_batch(&mut batch, &block_hash, height, chainwork).ok();
+
+                    self.db.write_batch(batch).ok();
                 }
 
                 // Remove confirmed transactions from the mempool
@@ -549,6 +718,9 @@ impl Node {
                 if !self.ibd.is_complete() {
                     self.download_blocks(peer_id).await;
                 }
+
+                // Prune old block data if requested
+                self.maybe_prune(height).await;
 
                 // ── Reorg detection ─────────────────────────────────────────
                 // If a new block arrives that doesn't extend our current best tip

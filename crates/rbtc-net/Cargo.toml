@@ -13,6 +13,7 @@ bytes           = { workspace = true }
 thiserror       = { workspace = true }
 tracing         = { workspace = true }
 anyhow          = { workspace = true }
+siphasher       = { workspace = true }
 
 [dev-dependencies]
 tokio   = { workspace = true }

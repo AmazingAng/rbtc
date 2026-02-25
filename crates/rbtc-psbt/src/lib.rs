@@ -1,0 +1,31 @@
+//! `rbtc-psbt` — BIP174 Partially Signed Bitcoin Transactions (v0).
+//!
+//! ## Roles
+//!
+//! | Role       | Method / function                          |
+//! |------------|--------------------------------------------|
+//! | Creator    | [`Psbt::create`]                           |
+//! | Updater    | [`Psbt::add_witness_utxo`], etc.           |
+//! | Signer     | [`Psbt::sign_input`]                       |
+//! | Combiner   | [`Psbt::combine`]                          |
+//! | Finalizer  | [`Psbt::finalize`]                         |
+//! | Extractor  | [`Psbt::extract_tx`]                       |
+//!
+//! ## Serialization
+//!
+//! ```no_run
+//! # use rbtc_psbt::Psbt;
+//! # fn make() -> Psbt { unimplemented!() }
+//! let psbt = make();
+//! let b64 = psbt.to_base64();
+//! let decoded = Psbt::from_base64(&b64).unwrap();
+//! ```
+
+pub mod error;
+pub mod types;
+pub mod serialize;
+pub mod roles;
+pub mod signer;
+
+pub use types::{Psbt, PsbtGlobal, PsbtInput, PsbtOutput};
+pub use error::{PsbtError, Result};
