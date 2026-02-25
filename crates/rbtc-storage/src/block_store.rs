@@ -250,4 +250,131 @@ mod tests {
         assert!(store.get_index(&hash).unwrap().is_none());
         assert!(store.get_block(&hash).unwrap().is_none());
     }
+
+    #[test]
+    fn block_store_iter_all_indices_put_undo_get_undo() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        let store = BlockStore::new(&db);
+        let hash: BlockHash = Hash256([10; 32]);
+        let index = StoredBlockIndex {
+            header: BlockHeader {
+                version: 1,
+                prev_block: Hash256::ZERO,
+                merkle_root: Hash256::ZERO,
+                time: 0,
+                bits: 0,
+                nonce: 0,
+            },
+            height: 5,
+            chainwork_lo: 1,
+            chainwork_hi: 0,
+            status: 1,
+        };
+        store.put_index(&hash, &index).unwrap();
+        let indices = store.iter_all_indices();
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].1.height, 5);
+
+        store.put_undo(&hash, b"undo_data").unwrap();
+        let got = store.get_undo(&hash).unwrap().unwrap();
+        assert_eq!(got, b"undo_data");
+    }
+
+    #[test]
+    fn block_store_put_block_atomic() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        let store = BlockStore::new(&db);
+        let hash: BlockHash = Hash256([15; 32]);
+        let index = StoredBlockIndex {
+            header: BlockHeader {
+                version: 1,
+                prev_block: Hash256::ZERO,
+                merkle_root: Hash256::ZERO,
+                time: 0,
+                bits: 0,
+                nonce: 0,
+            },
+            height: 0,
+            chainwork_lo: 1,
+            chainwork_hi: 0,
+            status: 0,
+        };
+        use rbtc_primitives::transaction::{OutPoint, TxIn, TxOut};
+        use rbtc_primitives::script::Script;
+        let block = Block {
+            header: index.header.clone(),
+            transactions: vec![Transaction {
+                version: 1,
+                inputs: vec![TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: Script::from_bytes(vec![2, 0, 0]),
+                    sequence: 0xffffffff,
+                    witness: vec![],
+                }],
+                outputs: vec![TxOut { value: 0, script_pubkey: Script::new() }],
+                lock_time: 0,
+            }],
+        };
+        store.put_block_atomic(&hash, &index, &block).unwrap();
+        assert!(store.get_index(&hash).unwrap().is_some());
+        assert!(store.get_block(&hash).unwrap().is_some());
+    }
+
+    #[test]
+    fn block_store_get_index_decode_error() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        let store = BlockStore::new(&db);
+        let hash: BlockHash = Hash256([16; 32]);
+        db.put_cf(CF_BLOCK_INDEX, &hash.0, b"truncated").unwrap();
+        let r = store.get_index(&hash);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn block_store_prune_blocks_below() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        let store = BlockStore::new(&db);
+        use rbtc_primitives::transaction::{OutPoint, TxIn, TxOut};
+        use rbtc_primitives::script::Script;
+        let hash: BlockHash = Hash256([20; 32]);
+        let index = StoredBlockIndex {
+            header: BlockHeader {
+                version: 1,
+                prev_block: Hash256::ZERO,
+                merkle_root: Hash256::ZERO,
+                time: 0,
+                bits: 0,
+                nonce: 0,
+            },
+            height: 1,
+            chainwork_lo: 1,
+            chainwork_hi: 0,
+            status: 2,
+        };
+        let block = Block {
+            header: index.header.clone(),
+            transactions: vec![Transaction {
+                version: 1,
+                inputs: vec![TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: Script::from_bytes(vec![2, 0, 0]),
+                    sequence: 0xffffffff,
+                    witness: vec![],
+                }],
+                outputs: vec![TxOut { value: 0, script_pubkey: Script::new() }],
+                lock_time: 0,
+            }],
+        };
+        store.put_index(&hash, &index).unwrap();
+        store.put_block(&hash, &block).unwrap();
+        let count = store.prune_blocks_below(1).unwrap();
+        assert_eq!(count, 1);
+        assert!(store.get_block(&hash).unwrap().is_none());
+        let idx = store.get_index(&hash).unwrap().unwrap();
+        assert_eq!(idx.status, 4);
+    }
 }

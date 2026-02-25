@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, net::IpAddr, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use tokio::sync::{mpsc, RwLock};
@@ -13,13 +13,13 @@ use rbtc_mempool::Mempool;
 use rbtc_net::{
     compact::{short_txid, reconstruct_block, CompactBlock, GetBlockTxn},
     message::{Inventory, InvType, NetworkMessage},
-    peer_manager::{NodeEvent, PeerManager, PeerManagerConfig},
+    peer_manager::{BAN_DURATION, NodeEvent, PeerManager, PeerManagerConfig},
 };
 use rbtc_primitives::hash::Hash256;
 use rbtc_script::ScriptFlags;
 use rbtc_storage::{
     encode_block_undo, decode_block_undo, AddrIndexStore, BlockStore, ChainStore, Database,
-    StoredBlockIndex, StoredUtxo, TxIndexStore, UtxoStore,
+    PeerStore, StoredBlockIndex, StoredUtxo, TxIndexStore, UtxoStore,
 };
 use rbtc_wallet::Wallet;
 
@@ -56,6 +56,8 @@ pub struct Node {
     /// BIP152: partially-reconstructed compact blocks awaiting `blocktxn` responses.
     /// Key = block_hash, Value = (compact block, list of already-filled tx slots).
     pending_compact: HashMap<rbtc_primitives::hash::Hash256, (CompactBlock, Vec<Option<rbtc_primitives::transaction::Transaction>>)>,
+    /// Timestamp of last peer address persistence flush
+    last_peer_persist: std::time::Instant,
 }
 
 impl Node {
@@ -84,7 +86,9 @@ impl Node {
         );
 
         let chain = Arc::new(RwLock::new(chain));
-        let mempool = Arc::new(RwLock::new(Mempool::new()));
+        // Mempool size limit: convert MB to bytes (vsize ≈ bytes for legacy txs)
+        let mempool_max_vsize = args.mempool_size * 1_000_000;
+        let mempool = Arc::new(RwLock::new(Mempool::with_max_vsize(mempool_max_vsize)));
 
         // Optionally load the wallet
         let wallet = load_wallet(&args, Arc::clone(&db));
@@ -101,7 +105,18 @@ impl Node {
             ..Default::default()
         };
         let current_height = chain.read().await.height() as i32;
-        let peer_manager = PeerManager::new(pm_config, node_event_tx, current_height);
+        let mut peer_manager = PeerManager::new(pm_config, node_event_tx, current_height);
+
+        // Load persisted peer addresses and ban list
+        {
+            let peer_store = PeerStore::new(&db);
+            // Expire stale bans first
+            peer_store.expire_bans().ok();
+            // Load known addresses into candidate pool
+            if let Ok(addrs) = peer_store.load_addrs() {
+                peer_manager.seed_candidate_addrs(addrs.into_iter().map(|(addr, _, _)| addr));
+            }
+        }
 
         Ok(Self {
             args,
@@ -115,6 +130,7 @@ impl Node {
             submit_block_tx,
             submit_block_rx,
             pending_compact: HashMap::new(),
+            last_peer_persist: std::time::Instant::now(),
         })
     }
 
@@ -158,6 +174,7 @@ impl Node {
         let mut stats_timer = tokio::time::interval(Duration::from_secs(30));
         // Tick frequently during IBD so we keep the block-download pipeline full.
         let mut ibd_timer = tokio::time::interval(Duration::from_secs(1));
+        let mut persist_timer = tokio::time::interval(Duration::from_secs(5 * 60));
 
         loop {
             tokio::select! {
@@ -169,6 +186,10 @@ impl Node {
 
                 _ = ibd_timer.tick() => {
                     self.check_ibd_progress().await;
+                }
+
+                _ = persist_timer.tick() => {
+                    self.persist_peer_addrs();
                 }
             }
         }
@@ -242,6 +263,14 @@ impl Node {
 
             NodeEvent::BlockTxnReceived { peer_id, resp } => {
                 self.handle_block_txn(peer_id, resp).await?;
+            }
+
+            NodeEvent::BanPeer { ip } => {
+                self.handle_ban_peer(ip);
+            }
+
+            NodeEvent::AddrReceived { peer_id: _, addrs } => {
+                self.handle_addr_received(addrs);
             }
 
             NodeEvent::InvReceived { peer_id, items } => {
@@ -757,11 +786,15 @@ impl Node {
                     "mempool: accepted tx {} from peer {peer_id}",
                     accepted_txid.to_hex()
                 );
+                // Compute fee rate in sat/kvB for feefilter comparison
+                let fee_rate_sat_kvb = mp.get(&accepted_txid)
+                    .map(|e| e.fee_rate * 1000)
+                    .unwrap_or(0);
                 drop(mp);
                 drop(chain);
-                // Announce to all other peers
+                // Announce to peers whose feefilter allows this tx
                 let inv = vec![Inventory { inv_type: InvType::WitnessTx, hash: txid }];
-                self.peer_manager.broadcast(NetworkMessage::Inv(inv));
+                self.peer_manager.broadcast_tx_inv(NetworkMessage::Inv(inv), fee_rate_sat_kvb);
             }
             Err(e) => {
                 // AlreadyKnown is not worth logging
@@ -997,6 +1030,60 @@ impl Node {
         info!(
             "height={height} peers={peers} best_peer={best_peer_height} utxos={utxos} mempool={mp_size}"
         );
+    }
+
+    /// Persist the ban to RocksDB and update the in-memory ban set.
+    fn handle_ban_peer(&self, ip: IpAddr) {
+        let peer_store = PeerStore::new(&self.db);
+        if let Err(e) = peer_store.ban(ip, BAN_DURATION) {
+            warn!("failed to persist ban for {ip}: {e}");
+        }
+        info!("banned peer IP {ip} for 24h");
+    }
+
+    /// Update the candidate address pool from a received `addr` message.
+    fn handle_addr_received(&mut self, entries: Vec<(u32, u64, [u8; 16], u16)>) {
+        for (_, services, ip_bytes, port) in &entries {
+            use std::net::{Ipv6Addr, IpAddr, SocketAddr};
+            let v6 = Ipv6Addr::from(*ip_bytes);
+            let ip = v6.to_ipv4_mapped()
+                .map(IpAddr::V4)
+                .or_else(|| v6.to_ipv4().map(IpAddr::V4))
+                .unwrap_or(IpAddr::V6(v6));
+            let addr = SocketAddr::new(ip, *port);
+            let _ = services; // services not used here; stored in peer_store
+            self.peer_manager.add_candidate_addr(addr);
+        }
+    }
+
+    /// Flush known peer addresses to RocksDB (called periodically and on startup).
+    fn persist_peer_addrs(&mut self) {
+        let now = std::time::Instant::now();
+        if now.duration_since(self.last_peer_persist) < Duration::from_secs(5 * 60) {
+            return;
+        }
+        self.last_peer_persist = now;
+
+        let candidates = self.peer_manager.candidate_addrs_snapshot();
+        if candidates.is_empty() {
+            return;
+        }
+
+        let unix_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let entries: Vec<_> = candidates.iter()
+            .map(|addr| (*addr, unix_now, 1u64))
+            .collect();
+
+        let peer_store = PeerStore::new(&self.db);
+        if let Err(e) = peer_store.save_addrs(&entries) {
+            warn!("failed to persist peer addresses: {e}");
+        } else {
+            info!("persisted {} candidate peer addresses", entries.len());
+        }
     }
 }
 

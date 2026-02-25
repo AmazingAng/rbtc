@@ -144,4 +144,51 @@ mod tests {
         assert_eq!(store.get_best_height().unwrap(), Some(200));
         assert_eq!(store.get_chainwork().unwrap(), 2000);
     }
+
+    #[test]
+    fn chain_store_update_tip_batch() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        let store = ChainStore::new(&db);
+        let hash: BlockHash = Hash256([3; 32]);
+        let mut batch = db.new_batch();
+        store.update_tip_batch(&mut batch, &hash, 300, 3000).unwrap();
+        db.write_batch(batch).unwrap();
+        assert_eq!(store.get_best_block().unwrap(), Some(hash));
+        assert_eq!(store.get_best_height().unwrap(), Some(300));
+        assert_eq!(store.get_chainwork().unwrap(), 3000);
+    }
+
+    #[test]
+    fn chain_store_invalid_best_block_hash_length() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        db.put_cf(crate::db::CF_CHAIN_STATE, b"best_block", b"short").unwrap();
+        let store = ChainStore::new(&db);
+        let r = store.get_best_block();
+        assert!(r.is_err());
+        assert!(r.unwrap_err().to_string().contains("invalid best block hash"));
+    }
+
+    #[test]
+    fn chain_store_invalid_chainwork_length() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        db.put_cf(crate::db::CF_CHAIN_STATE, b"chainwork", b"x").unwrap();
+        let store = ChainStore::new(&db);
+        let r = store.get_chainwork();
+        assert!(r.is_err());
+        assert!(r.unwrap_err().to_string().contains("invalid chainwork"));
+    }
+
+    #[test]
+    fn chain_store_invalid_network_magic_length() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        db.put_cf(crate::db::CF_CHAIN_STATE, b"network", b"xy").unwrap();
+        let store = ChainStore::new(&db);
+        let r = store.get_network_magic();
+        assert!(r.is_err());
+        assert!(r.unwrap_err().to_string().contains("invalid network magic"));
+    }
 }

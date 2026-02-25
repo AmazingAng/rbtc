@@ -12,6 +12,10 @@ pub const CF_TX_INDEX: &str = "tx_index";
 pub const CF_ADDR_INDEX: &str = "addr_index";
 pub const CF_UNDO: &str = "undo";
 pub const CF_WALLET: &str = "wallet";
+/// Peer ban list: key = IP bytes (4 or 16), value = expiry Unix timestamp (u64 LE)
+pub const CF_PEER_BANS: &str = "peer_bans";
+/// Peer address book: key = IP:port (18 bytes), value = last_seen u64 LE + services u64 LE
+pub const CF_PEER_ADDRS: &str = "peer_addrs";
 
 /// Wrapper around RocksDB with Bitcoin-specific column families
 pub struct Database {
@@ -34,6 +38,8 @@ impl Database {
             ColumnFamilyDescriptor::new(CF_ADDR_INDEX, Options::default()),
             ColumnFamilyDescriptor::new(CF_UNDO, Options::default()),
             ColumnFamilyDescriptor::new(CF_WALLET, Options::default()),
+            ColumnFamilyDescriptor::new(CF_PEER_BANS, Options::default()),
+            ColumnFamilyDescriptor::new(CF_PEER_ADDRS, Options::default()),
         ];
 
         let db = DB::open_cf_descriptors(&opts, path, cfs)?;
@@ -151,5 +157,31 @@ mod tests {
         let r = db.get_cf("no_such_cf", b"x");
         assert!(r.is_err());
         assert!(matches!(r.unwrap_err(), StorageError::Corruption(_)));
+    }
+
+    #[test]
+    fn db_iter_cf_prefix() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        db.put_cf(CF_UTXO, b"aa\x00\x01", b"v1").unwrap();
+        db.put_cf(CF_UTXO, b"aa\x00\x02", b"v2").unwrap();
+        db.put_cf(CF_UTXO, b"ab\x00\x00", b"v3").unwrap();
+        let rows = db.iter_cf_prefix(CF_UTXO, b"aa").unwrap();
+        assert_eq!(rows.len(), 2);
+        let rows_ab = db.iter_cf_prefix(CF_UTXO, b"ab").unwrap();
+        assert_eq!(rows_ab.len(), 1);
+    }
+
+    #[test]
+    fn db_delete_range_cf() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        db.put_cf(CF_UTXO, b"r1", b"v1").unwrap();
+        db.put_cf(CF_UTXO, b"r2", b"v2").unwrap();
+        db.put_cf(CF_UTXO, b"r3", b"v3").unwrap();
+        db.delete_range_cf(CF_UTXO, b"r1", b"r3").unwrap();
+        assert!(db.get_cf(CF_UTXO, b"r1").unwrap().is_none());
+        assert!(db.get_cf(CF_UTXO, b"r2").unwrap().is_none());
+        assert_eq!(db.get_cf(CF_UTXO, b"r3").unwrap(), Some(b"v3".to_vec()));
     }
 }

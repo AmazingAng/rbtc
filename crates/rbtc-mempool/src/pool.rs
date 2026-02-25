@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rbtc_consensus::{
     tx_verify::verify_transaction,
@@ -9,9 +9,12 @@ use rbtc_primitives::{
     transaction::{OutPoint, Transaction},
 };
 use rbtc_script::ScriptFlags;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::{entry::MempoolEntry, error::MempoolError};
+
+/// Default maximum total vsize (~300 MB).
+const DEFAULT_MAX_VSIZE: u64 = 300_000_000;
 
 /// In-memory transaction pool
 pub struct Mempool {
@@ -20,6 +23,8 @@ pub struct Mempool {
     mempool_utxos: UtxoSet,
     /// Minimum relay fee rate in sat/vbyte (default 1)
     min_relay_fee_rate: u64,
+    /// Maximum total virtual size of all transactions in the pool.
+    max_vsize: u64,
 }
 
 impl Default for Mempool {
@@ -34,12 +39,18 @@ impl Mempool {
             entries: HashMap::new(),
             mempool_utxos: UtxoSet::new(),
             min_relay_fee_rate: 1,
+            max_vsize: DEFAULT_MAX_VSIZE,
         }
+    }
+
+    pub fn with_max_vsize(max_vsize: u64) -> Self {
+        Self { max_vsize, ..Self::new() }
     }
 
     /// Try to accept a transaction into the mempool.
     ///
-    /// Validates consensus rules and fee rate. On success returns the txid.
+    /// Implements BIP125 Replace-by-Fee when conflicting inputs are detected.
+    /// On success returns the txid.
     pub fn accept_tx(
         &mut self,
         tx: Transaction,
@@ -59,6 +70,31 @@ impl Mempool {
 
         if self.entries.contains_key(&txid) {
             return Err(MempoolError::AlreadyKnown);
+        }
+
+        let new_signals_rbf = signals_rbf(&tx);
+
+        // Collect the set of outpoints spent by this transaction
+        let tx_spends: HashSet<&OutPoint> = tx.inputs.iter()
+            .map(|i| &i.previous_output)
+            .collect();
+
+        // ── BIP125 conflict detection ──────────────────────────────────────
+        let conflicting: Vec<TxId> = self.entries.values()
+            .filter(|e| e.tx.inputs.iter().any(|i| tx_spends.contains(&i.previous_output)))
+            .map(|e| e.txid)
+            .collect();
+
+        if !conflicting.is_empty() {
+            // All conflicting transactions must signal RBF
+            for cid in &conflicting {
+                if !self.entries[cid].signals_rbf {
+                    return Err(MempoolError::RbfNotSignaling);
+                }
+            }
+            if conflicting.len() > 100 {
+                return Err(MempoolError::TooManyReplacements(conflicting.len()));
+            }
         }
 
         // Build a minimal UTXO view that covers exactly the inputs of this tx
@@ -84,10 +120,40 @@ impl Mempool {
             return Err(MempoolError::FeeTooLow(fee_rate, self.min_relay_fee_rate));
         }
 
+        // ── RBF fee bump check ────────────────────────────────────────────
+        if !conflicting.is_empty() {
+            // New fee rate must exceed the highest conflicting rate + relay fee
+            let max_conflict_rate = conflicting.iter()
+                .map(|cid| self.entries[cid].fee_rate)
+                .max()
+                .unwrap_or(0);
+            let required = max_conflict_rate.saturating_add(self.min_relay_fee_rate);
+            if fee_rate < required {
+                return Err(MempoolError::RbfInsufficientFee(fee_rate, max_conflict_rate, self.min_relay_fee_rate));
+            }
+
+            // Remove all conflicting transactions
+            for cid in &conflicting {
+                self.entries.remove(cid);
+            }
+            info!(
+                "mempool: RBF replaced {} tx(s) with {} fee_rate={fee_rate}",
+                conflicting.len(),
+                txid.to_hex()
+            );
+            self.rebuild_mempool_utxos();
+        }
+
+        // ── CPFP ancestor fee rate ────────────────────────────────────────
+        let ancestor_fee_rate = self.compute_ancestor_fee_rate(&tx, fee, vsize);
+
         // Track outputs in our mempool UTXO set for chained-tx support
         self.mempool_utxos.add_tx(txid, &tx, chain_height);
 
-        info!("mempool: accepted tx {} fee={fee} sat vsize={vsize} rate={fee_rate}", txid.to_hex());
+        info!(
+            "mempool: accepted tx {} fee={fee} sat vsize={vsize} rate={fee_rate} ancestor_rate={ancestor_fee_rate}",
+            txid.to_hex()
+        );
 
         let entry = MempoolEntry {
             tx,
@@ -95,9 +161,16 @@ impl Mempool {
             fee,
             vsize,
             fee_rate,
+            signals_rbf: new_signals_rbf,
+            ancestor_fee_rate,
             added_at: std::time::Instant::now(),
         };
         self.entries.insert(txid, entry);
+
+        // ── Size cap eviction ─────────────────────────────────────────────
+        if self.total_vsize() > self.max_vsize {
+            self.evict_below_fee_rate(fee_rate)?;
+        }
 
         Ok(txid)
     }
@@ -132,10 +205,10 @@ impl Mempool {
         self.entries.is_empty()
     }
 
-    /// Return all txids sorted by descending fee rate (highest priority first).
+    /// Return all txids sorted by descending ancestor fee rate (highest priority first).
     pub fn txids_by_fee_rate(&self) -> Vec<TxId> {
         let mut v: Vec<_> = self.entries.values().collect();
-        v.sort_unstable_by(|a, b| b.fee_rate.cmp(&a.fee_rate));
+        v.sort_unstable_by(|a, b| b.ancestor_fee_rate.cmp(&a.ancestor_fee_rate));
         v.iter().map(|e| e.txid).collect()
     }
 
@@ -164,6 +237,93 @@ impl Mempool {
         })
     }
 
+    /// Return the minimum fee_rate (sat/vbyte) of any entry currently in the pool,
+    /// or `min_relay_fee_rate` when the pool is empty.  Used by `estimatesmartfee`.
+    pub fn min_fee_rate(&self) -> u64 {
+        self.entries.values().map(|e| e.fee_rate).min()
+            .unwrap_or(self.min_relay_fee_rate)
+    }
+
+    // ── CPFP ancestor computation ─────────────────────────────────────────────
+
+    /// Recursively collect unconfirmed ancestor transactions and return
+    /// `(total_ancestor_fee, total_ancestor_vsize)` including `tx` itself.
+    pub fn ancestor_package(&self, txid: &TxId) -> (u64, u64) {
+        let mut visited = HashSet::new();
+        self.collect_ancestors(txid, &mut visited)
+    }
+
+    fn collect_ancestors(&self, txid: &TxId, visited: &mut HashSet<TxId>) -> (u64, u64) {
+        if !visited.insert(*txid) {
+            return (0, 0);
+        }
+        let Some(entry) = self.entries.get(txid) else { return (0, 0); };
+        let mut total_fee = entry.fee;
+        let mut total_vsize = entry.vsize;
+        for input in &entry.tx.inputs {
+            let parent_txid = &input.previous_output.txid;
+            if self.entries.contains_key(parent_txid) {
+                let (f, v) = self.collect_ancestors(parent_txid, visited);
+                total_fee += f;
+                total_vsize += v;
+            }
+        }
+        (total_fee, total_vsize)
+    }
+
+    /// Compute the effective (ancestor) fee rate for a transaction that is
+    /// about to be inserted but not yet in `self.entries`.
+    fn compute_ancestor_fee_rate(&self, tx: &Transaction, own_fee: u64, own_vsize: u64) -> u64 {
+        let mut visited: HashSet<TxId> = HashSet::new();
+        let mut total_fee = own_fee;
+        let mut total_vsize = own_vsize;
+
+        for input in &tx.inputs {
+            let parent_txid = &input.previous_output.txid;
+            if self.entries.contains_key(parent_txid) {
+                let (f, v) = self.collect_ancestors(parent_txid, &mut visited);
+                total_fee += f;
+                total_vsize += v;
+            }
+        }
+
+        total_fee / total_vsize.max(1)
+    }
+
+    // ── Eviction ──────────────────────────────────────────────────────────────
+
+    /// Evict lowest-fee-rate transactions until `total_vsize ≤ max_vsize`.
+    /// If the just-inserted transaction (with `new_fee_rate`) has the lowest rate,
+    /// it is also removed and `MempoolFull` is returned.
+    fn evict_below_fee_rate(&mut self, new_fee_rate: u64) -> Result<(), MempoolError> {
+        // Sort ascending by fee_rate → evict cheapest first
+        let mut by_rate: Vec<(TxId, u64)> = self.entries.values()
+            .map(|e| (e.txid, e.fee_rate))
+            .collect();
+        by_rate.sort_unstable_by_key(|&(_, r)| r);
+
+        for (evict_id, evict_rate) in &by_rate {
+            if self.total_vsize() <= self.max_vsize {
+                break;
+            }
+            // If we would need to evict the just-accepted tx itself, reject it
+            if *evict_rate >= new_fee_rate {
+                self.entries.remove(&{
+                    // find the most recently inserted tx with this rate
+                    // (it is the one we just added, as existing entries had their rates set earlier)
+                    let _ = new_fee_rate;
+                    *evict_id
+                });
+                self.rebuild_mempool_utxos();
+                return Err(MempoolError::MempoolFull);
+            }
+            warn!("mempool: evicting {} (fee_rate={evict_rate}) due to size limit", evict_id.to_hex());
+            self.entries.remove(evict_id);
+        }
+        self.rebuild_mempool_utxos();
+        Ok(())
+    }
+
     // ── private helpers ──────────────────────────────────────────────────────
 
     fn rebuild_mempool_utxos(&mut self) {
@@ -172,6 +332,11 @@ impl Mempool {
             self.mempool_utxos.add_tx(*txid, &entry.tx, 0);
         }
     }
+}
+
+/// BIP125: a transaction signals opt-in RBF if any input has nSequence < 0xFFFFFFFE.
+fn signals_rbf(tx: &Transaction) -> bool {
+    tx.inputs.iter().any(|i| i.sequence < 0xFFFFFFFE)
 }
 
 #[cfg(test)]

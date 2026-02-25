@@ -320,6 +320,86 @@ mod tests {
     }
 
     #[test]
+    fn block_status_as_u8_from_u8() {
+        assert_eq!(BlockStatus::HeaderOnly.as_u8(), 0);
+        assert_eq!(BlockStatus::Valid.as_u8(), 1);
+        assert_eq!(BlockStatus::InChain.as_u8(), 2);
+        assert_eq!(BlockStatus::Invalid.as_u8(), 3);
+        assert_eq!(BlockStatus::Pruned.as_u8(), 4);
+        assert_eq!(BlockStatus::from_u8(0), BlockStatus::HeaderOnly);
+        assert_eq!(BlockStatus::from_u8(1), BlockStatus::Valid);
+        assert_eq!(BlockStatus::from_u8(2), BlockStatus::InChain);
+        assert_eq!(BlockStatus::from_u8(3), BlockStatus::Invalid);
+        assert_eq!(BlockStatus::from_u8(4), BlockStatus::Pruned);
+        assert_eq!(BlockStatus::from_u8(99), BlockStatus::HeaderOnly);
+    }
+
+    #[test]
+    fn insert_block_index_in_chain_updates_active_chain_and_best_tip() {
+        let mut chain = ChainState::new(Network::Regtest);
+        let hash = Hash256([1; 32]);
+        let index = BlockIndex {
+            hash,
+            header: BlockHeader {
+                version: 1,
+                prev_block: BlockHash::ZERO,
+                merkle_root: Hash256::ZERO,
+                time: 0,
+                bits: 0,
+                nonce: 0,
+            },
+            height: 0,
+            chainwork: 100,
+            status: BlockStatus::InChain,
+        };
+        chain.insert_block_index(hash, index);
+        assert_eq!(chain.best_hash(), Some(hash));
+        assert_eq!(chain.height(), 0);
+        assert_eq!(chain.get_ancestor_hash(0), Some(hash));
+
+        let hash2 = Hash256([2; 32]);
+        let index2 = BlockIndex {
+            hash: hash2,
+            header: BlockHeader {
+                version: 1,
+                prev_block: hash,
+                merkle_root: Hash256::ZERO,
+                time: 1,
+                bits: 0,
+                nonce: 0,
+            },
+            height: 1,
+            chainwork: 200,
+            status: BlockStatus::InChain,
+        };
+        chain.insert_block_index(hash2, index2);
+        assert_eq!(chain.best_hash(), Some(hash2));
+        assert_eq!(chain.get_ancestor_hash(1), Some(hash2));
+    }
+
+    #[test]
+    fn insert_block_index_non_in_chain_does_not_update_tip() {
+        let mut chain = ChainState::new(Network::Regtest);
+        let hash = Hash256([3; 32]);
+        let index = BlockIndex {
+            hash,
+            header: BlockHeader {
+                version: 1,
+                prev_block: BlockHash::ZERO,
+                merkle_root: Hash256::ZERO,
+                time: 0,
+                bits: 0,
+                nonce: 0,
+            },
+            height: 0,
+            chainwork: 100,
+            status: BlockStatus::HeaderOnly,
+        };
+        chain.insert_block_index(hash, index);
+        assert!(chain.best_hash().is_none());
+    }
+
+    #[test]
     fn block_index_median_time_past() {
         let bi = BlockIndex {
             hash: BlockHash::ZERO,
@@ -420,5 +500,88 @@ mod tests {
                 computed.to_hex(), expected.to_hex()
             );
         }
+    }
+
+    #[test]
+    fn get_ancestor_time_and_median_time_past() {
+        let mut chain = ChainState::new(Network::Regtest);
+        let h0 = Hash256([10; 32]);
+        let h1 = Hash256([11; 32]);
+        chain.insert_block_index(h0, BlockIndex {
+            hash: h0,
+            header: BlockHeader {
+                version: 1,
+                prev_block: BlockHash::ZERO,
+                merkle_root: Hash256::ZERO,
+                time: 100,
+                bits: 0x1d00ffff,
+                nonce: 0,
+            },
+            height: 0,
+            chainwork: 1,
+            status: BlockStatus::InChain,
+        });
+        chain.insert_block_index(h1, BlockIndex {
+            hash: h1,
+            header: BlockHeader {
+                version: 1,
+                prev_block: h0,
+                merkle_root: Hash256::ZERO,
+                time: 200,
+                bits: 0x1d00ffff,
+                nonce: 0,
+            },
+            height: 1,
+            chainwork: 2,
+            status: BlockStatus::InChain,
+        });
+        assert_eq!(chain.get_ancestor_time(0), Some(100));
+        assert_eq!(chain.get_ancestor_time(1), Some(200));
+        assert_eq!(chain.median_time_past(1), 200);
+    }
+
+    #[test]
+    fn next_required_bits_with_tip() {
+        let mut chain = ChainState::new(Network::Regtest);
+        let h0 = Hash256([20; 32]);
+        chain.insert_block_index(h0, BlockIndex {
+            hash: h0,
+            header: BlockHeader {
+                version: 1,
+                prev_block: BlockHash::ZERO,
+                merkle_root: Hash256::ZERO,
+                time: 0,
+                bits: 0x1d00ffff,
+                nonce: 0,
+            },
+            height: 0,
+            chainwork: 1,
+            status: BlockStatus::InChain,
+        });
+        assert_eq!(chain.next_required_bits(), 0x1d00ffff);
+    }
+
+    #[test]
+    fn add_header_duplicate_returns_ok() {
+        let mut chain = ChainState::new(Network::Regtest);
+        let genesis_hash_hex = chain.network.genesis_hash();
+        let gh = BlockHash::from_hex(genesis_hash_hex).unwrap();
+        let header = BlockHeader {
+            version: 1,
+            prev_block: BlockHash::ZERO,
+            merkle_root: Hash256::ZERO,
+            time: 1231006505,
+            bits: 0x1d00ffff,
+            nonce: 2083236893,
+        };
+        let h = header_hash(&header);
+        if h != gh {
+            return;
+        }
+        let r1 = chain.add_header(header.clone());
+        assert!(r1.is_ok());
+        let r2 = chain.add_header(header);
+        assert!(r2.is_ok());
+        assert_eq!(r2.unwrap(), h);
     }
 }
