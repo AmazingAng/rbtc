@@ -1,8 +1,8 @@
 use std::{
-    collections::HashMap,
-    net::SocketAddr,
+    collections::{HashMap, HashSet, VecDeque},
+    net::{IpAddr, SocketAddr},
     sync::atomic::{AtomicU64, Ordering},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use tokio::{
@@ -24,6 +24,17 @@ use crate::{
 };
 
 static NEXT_PEER_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Maximum number of candidate addresses kept in memory.
+const MAX_CANDIDATE_ADDRS: usize = 1000;
+/// How many peers we forward a `addr` announcement to (trickling).
+const ADDR_RELAY_FANOUT: usize = 2;
+/// Ban duration for misbehaving peers (24 hours).
+pub const BAN_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
+/// Misbehavior score threshold that triggers a ban.
+const BAN_THRESHOLD: u32 = 100;
+/// Maximum timestamp drift (seconds) for addr entries we relay.
+const ADDR_MAX_DRIFT_SECS: i64 = 10 * 60;
 
 /// Configuration for the peer manager
 #[derive(Debug, Clone)]
@@ -63,26 +74,35 @@ pub enum NodeEvent {
     GetBlockTxnReceived { peer_id: u64, req: crate::compact::GetBlockTxn },
     /// BIP152: peer responded with missing transactions
     BlockTxnReceived { peer_id: u64, resp: crate::compact::BlockTxn },
+    /// Peer announced addresses
+    AddrReceived { peer_id: u64, addrs: Vec<(u32, u64, [u8; 16], u16)> },
+    /// Request to ban a peer's IP (emitted by misbehave())
+    BanPeer { ip: IpAddr },
 }
 
 /// Connected peer metadata
 struct ConnectedPeer {
-    #[allow(dead_code)]
     addr: SocketAddr,
     best_height: i32,
     cmd_tx: mpsc::UnboundedSender<PeerCommand>,
+    /// Minimum fee rate (sat/kvB) the peer is willing to relay txs for
+    fee_filter: u64,
+    /// Accumulated misbehavior score
+    misbehavior: u32,
+    /// true if this is an inbound connection
+    inbound: bool,
 }
 
 /// Registration message: associates a peer_id with its command sender channel.
 /// Sent by `connect()` / inbound listener before `run_peer` is spawned.
-type CmdRegistration = (u64, SocketAddr, mpsc::UnboundedSender<PeerCommand>);
+type CmdRegistration = (u64, SocketAddr, mpsc::UnboundedSender<PeerCommand>, bool /* inbound */);
 
 /// Central peer manager – manages connections and dispatches messages
 pub struct PeerManager {
     config: PeerManagerConfig,
     peers: HashMap<u64, ConnectedPeer>,
     /// Pending (peer_id → cmd_tx) registrations not yet confirmed by PeerEvent::Ready
-    pending_cmd_txs: HashMap<u64, (SocketAddr, mpsc::UnboundedSender<PeerCommand>)>,
+    pending_cmd_txs: HashMap<u64, (SocketAddr, mpsc::UnboundedSender<PeerCommand>, bool)>,
     /// Channel for registering new peer cmd senders (outbound + inbound)
     cmd_reg_tx: mpsc::UnboundedSender<CmdRegistration>,
     cmd_reg_rx: mpsc::UnboundedReceiver<CmdRegistration>,
@@ -90,8 +110,19 @@ pub struct PeerManager {
     event_rx: mpsc::UnboundedReceiver<PeerEvent>,
     node_event_tx: mpsc::UnboundedSender<NodeEvent>,
     best_height: i32,
-    #[allow(dead_code)]
     inbound_count: usize,
+    /// Current number of established outbound connections
+    outbound_count: usize,
+    /// Candidate addresses to connect to (populated from addr messages and peer_store)
+    candidate_addrs: VecDeque<SocketAddr>,
+    /// Addresses currently being connected to (dedup guard)
+    connecting_addrs: HashSet<SocketAddr>,
+    /// Addresses of established peers
+    connected_addrs: HashSet<SocketAddr>,
+    /// IPs that are currently banned
+    banned_ips: HashSet<IpAddr>,
+    /// When we last attempted outbound reconnect
+    last_reconnect: std::time::Instant,
 }
 
 impl PeerManager {
@@ -113,6 +144,12 @@ impl PeerManager {
             node_event_tx,
             best_height,
             inbound_count: 0,
+            outbound_count: 0,
+            candidate_addrs: VecDeque::new(),
+            connecting_addrs: HashSet::new(),
+            connected_addrs: HashSet::new(),
+            banned_ips: HashSet::new(),
+            last_reconnect: std::time::Instant::now(),
         }
     }
 
@@ -120,8 +157,78 @@ impl PeerManager {
         self.peers.len()
     }
 
+    /// Seed the candidate address pool from persistent storage (call at startup).
+    pub fn seed_candidate_addrs(&mut self, addrs: impl IntoIterator<Item = SocketAddr>) {
+        for addr in addrs {
+            if self.candidate_addrs.len() >= MAX_CANDIDATE_ADDRS {
+                break;
+            }
+            if !self.connected_addrs.contains(&addr) && !self.connecting_addrs.contains(&addr) {
+                self.candidate_addrs.push_back(addr);
+            }
+        }
+    }
+
+    /// Add a discovered address to the candidate pool.
+    pub fn add_candidate_addr(&mut self, addr: SocketAddr) {
+        if self.candidate_addrs.len() >= MAX_CANDIDATE_ADDRS {
+            self.candidate_addrs.pop_front();
+        }
+        if !self.connected_addrs.contains(&addr) && !self.connecting_addrs.contains(&addr) {
+            self.candidate_addrs.push_back(addr);
+        }
+    }
+
+    /// Mark an IP as locally banned (e.g. loaded from persistent storage).
+    pub fn add_ban(&mut self, ip: IpAddr) {
+        self.banned_ips.insert(ip);
+    }
+
+    /// Get the fee_filter for a specific peer (sat/kvB).
+    pub fn peer_fee_filter(&self, peer_id: u64) -> u64 {
+        self.peers.get(&peer_id).map(|p| p.fee_filter).unwrap_or(0)
+    }
+
+    /// Drain the current candidate address list (used by the node to persist them).
+    pub fn candidate_addrs_snapshot(&self) -> Vec<SocketAddr> {
+        self.candidate_addrs.iter().copied().collect()
+    }
+
+    /// Increment a peer's misbehavior score by `score`.
+    /// If the score reaches BAN_THRESHOLD, disconnect and ban the peer's IP.
+    pub fn misbehave(&mut self, peer_id: u64, score: u32) {
+        let Some(peer) = self.peers.get_mut(&peer_id) else { return };
+        peer.misbehavior = peer.misbehavior.saturating_add(score);
+        if peer.misbehavior >= BAN_THRESHOLD {
+            let ip = peer.addr.ip();
+            warn!("peer {peer_id} ({ip}): misbehavior score {} ≥ {BAN_THRESHOLD}, banning", peer.misbehavior);
+            let _ = peer.cmd_tx.send(PeerCommand::Disconnect);
+            self.banned_ips.insert(ip);
+            let _ = self.node_event_tx.send(NodeEvent::BanPeer { ip });
+        }
+    }
+
     /// Connect to a peer by address string
-    pub async fn connect(&self, addr: &str) {
+    pub async fn connect(&mut self, addr: &str) {
+        let Ok(socket_addr) = addr.parse::<SocketAddr>() else {
+            // Try async DNS resolution later; for now skip malformed addresses
+            self.connect_raw(addr).await;
+            return;
+        };
+        if self.connecting_addrs.contains(&socket_addr)
+            || self.connected_addrs.contains(&socket_addr)
+        {
+            return;
+        }
+        if self.banned_ips.contains(&socket_addr.ip()) {
+            debug!("skipping banned address {socket_addr}");
+            return;
+        }
+        self.connecting_addrs.insert(socket_addr);
+        self.connect_raw(addr).await;
+    }
+
+    async fn connect_raw(&self, addr: &str) {
         let peer_id = NEXT_PEER_ID.fetch_add(1, Ordering::Relaxed);
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<PeerCommand>();
 
@@ -146,8 +253,8 @@ impl PeerManager {
                             .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())
                     });
                     info!("connected to peer {peer_id} at {peer_addr}");
-                    // Register cmd_tx BEFORE spawning run_peer
-                    let _ = cmd_reg_tx.send((peer_id, peer_addr, cmd_tx));
+                    // Register cmd_tx BEFORE spawning run_peer (inbound=false)
+                    let _ = cmd_reg_tx.send((peer_id, peer_addr, cmd_tx, false));
                     tokio::spawn(run_peer(
                         peer_id,
                         peer_addr,
@@ -185,14 +292,14 @@ impl PeerManager {
                         let peer_id = NEXT_PEER_ID.fetch_add(1, Ordering::Relaxed);
                         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<PeerCommand>();
                         info!("inbound connection {peer_id} from {peer_addr}");
-                        // Register BEFORE spawning
-                        let _ = cmd_reg_tx.send((peer_id, peer_addr, cmd_tx));
+                        // Register BEFORE spawning (inbound=true)
+                        let _ = cmd_reg_tx.send((peer_id, peer_addr, cmd_tx, true));
                         tokio::spawn(run_peer(
                             peer_id,
                             peer_addr,
                             stream,
                             config.network,
-                            0, // we don't know our height yet in this closure; peer will learn
+                            0,
                             event_tx.clone(),
                             cmd_rx,
                         ));
@@ -229,6 +336,17 @@ impl PeerManager {
     pub fn broadcast(&self, msg: NetworkMessage) {
         for peer in self.peers.values() {
             let _ = peer.cmd_tx.send(PeerCommand::Send(msg.clone()));
+        }
+    }
+
+    /// Broadcast an `inv(tx)` announcement, skipping peers whose fee_filter
+    /// exceeds `tx_fee_rate_sat_kvb`.
+    pub fn broadcast_tx_inv(&self, inv: NetworkMessage, tx_fee_rate_sat_kvb: u64) {
+        for peer in self.peers.values() {
+            if peer.fee_filter > tx_fee_rate_sat_kvb {
+                continue;
+            }
+            let _ = peer.cmd_tx.send(PeerCommand::Send(inv.clone()));
         }
     }
 
@@ -283,8 +401,8 @@ impl PeerManager {
     /// Process all pending peer events (non-blocking, call from event loop)
     pub async fn process_events(&mut self) {
         // Drain command registrations first (must happen before Ready arrives)
-        while let Ok((peer_id, addr, cmd_tx)) = self.cmd_reg_rx.try_recv() {
-            self.pending_cmd_txs.insert(peer_id, (addr, cmd_tx));
+        while let Ok((peer_id, addr, cmd_tx, inbound)) = self.cmd_reg_rx.try_recv() {
+            self.pending_cmd_txs.insert(peer_id, (addr, cmd_tx, inbound));
         }
 
         while let Ok(event) = self.event_rx.try_recv() {
@@ -293,16 +411,39 @@ impl PeerManager {
                     info!("peer {peer_id} ready: height={best_height} ua={user_agent}");
 
                     // Retrieve the cmd_tx stored during connect / accept
-                    let resolved_addr = if let Some((stored_addr, cmd_tx)) =
+                    let resolved_addr = if let Some((stored_addr, cmd_tx, inbound)) =
                         self.pending_cmd_txs.remove(&peer_id)
                     {
+                        // Check ban list for inbound connections
+                        if inbound && self.banned_ips.contains(&stored_addr.ip()) {
+                            warn!("rejected inbound peer {peer_id}: IP {} is banned", stored_addr.ip());
+                            let _ = cmd_tx.send(PeerCommand::Disconnect);
+                            continue;
+                        }
+
                         // BIP152: request high-bandwidth compact blocks (mode=1)
-                        let _ = cmd_tx.send(PeerCommand::Send(
-                            NetworkMessage::SendCmpct(true, 1)
-                        ));
+                        let _ = cmd_tx.send(PeerCommand::Send(NetworkMessage::SendCmpct(true, 1)));
+                        // Ask peer for their known addresses
+                        let _ = cmd_tx.send(PeerCommand::Send(NetworkMessage::GetAddr));
+
+                        if inbound {
+                            self.inbound_count += 1;
+                        } else {
+                            self.outbound_count += 1;
+                            self.connecting_addrs.remove(&stored_addr);
+                            self.connected_addrs.insert(stored_addr);
+                        }
+
                         self.peers.insert(
                             peer_id,
-                            ConnectedPeer { addr: stored_addr, best_height, cmd_tx },
+                            ConnectedPeer {
+                                addr: stored_addr,
+                                best_height,
+                                cmd_tx,
+                                fee_filter: 0,
+                                misbehavior: 0,
+                                inbound,
+                            },
                         );
                         stored_addr
                     } else {
@@ -317,7 +458,14 @@ impl PeerManager {
                     });
                 }
                 PeerEvent::Disconnected { peer_id } => {
-                    self.peers.remove(&peer_id);
+                    if let Some(peer) = self.peers.remove(&peer_id) {
+                        if peer.inbound {
+                            self.inbound_count = self.inbound_count.saturating_sub(1);
+                        } else {
+                            self.outbound_count = self.outbound_count.saturating_sub(1);
+                            self.connected_addrs.remove(&peer.addr);
+                        }
+                    }
                     self.pending_cmd_txs.remove(&peer_id);
                     let _ =
                         self.node_event_tx.send(NodeEvent::PeerDisconnected { peer_id });
@@ -326,6 +474,29 @@ impl PeerManager {
                 PeerEvent::Message { peer_id, message } => {
                     self.handle_message(peer_id, message).await;
                 }
+            }
+        }
+
+        // ── Connection manager: attempt to fill outbound slots ────────────────
+        let now = std::time::Instant::now();
+        if now.duration_since(self.last_reconnect) >= Duration::from_secs(30)
+            && self.outbound_count < self.config.max_outbound
+        {
+            self.last_reconnect = now;
+            while self.outbound_count < self.config.max_outbound {
+                let Some(candidate) = self.candidate_addrs.pop_front() else { break };
+                if self.connecting_addrs.contains(&candidate)
+                    || self.connected_addrs.contains(&candidate)
+                    || self.banned_ips.contains(&candidate.ip())
+                {
+                    continue;
+                }
+                info!("conn-mgr: connecting to candidate {candidate}");
+                let addr_str = candidate.to_string();
+                self.connecting_addrs.insert(candidate);
+                self.connect_raw(&addr_str).await;
+                // Increment speculatively; will be corrected when Ready fires
+                self.outbound_count += 1;
             }
         }
     }
@@ -351,8 +522,14 @@ impl PeerManager {
                 // Peer prefers headers over inv for new block announcements – noted
             }
             NetworkMessage::FeeFilter(rate) => {
-                // Store per-peer fee filter for transaction relay filtering
+                // Store the fee filter so we can skip this peer when relaying cheap txs
                 debug!("peer {peer_id}: feefilter rate={rate} sat/kvB");
+                if let Some(peer) = self.peers.get_mut(&peer_id) {
+                    peer.fee_filter = rate;
+                }
+            }
+            NetworkMessage::Addr(msg) => {
+                self.handle_addr(peer_id, msg.addrs).await;
             }
             NetworkMessage::CmpctBlock(cmpct) => {
                 let _ = self.node_event_tx.send(NodeEvent::CmpctBlockReceived { peer_id, cmpct });
@@ -369,11 +546,91 @@ impl PeerManager {
         }
     }
 
+    async fn handle_addr(&mut self, peer_id: u64, entries: Vec<(u32, u64, [u8; 16], u16)>) {
+        let now_secs = unix_now() as i64;
+        let mut valid: Vec<SocketAddr> = Vec::new();
+
+        for (timestamp, _services, ip_bytes, port) in &entries {
+            let ts = *timestamp as i64;
+            // Only relay addresses whose timestamps are within ADDR_MAX_DRIFT_SECS of now
+            if (ts - now_secs).abs() > ADDR_MAX_DRIFT_SECS {
+                continue;
+            }
+            let ip = ip_bytes_to_ip(*ip_bytes);
+            let addr = SocketAddr::new(ip, *port);
+            if !self.banned_ips.contains(&ip) {
+                self.add_candidate_addr(addr);
+                valid.push(addr);
+            }
+        }
+
+        if valid.is_empty() {
+            return;
+        }
+
+        // Emit to the node for persistence
+        let _ = self.node_event_tx.send(NodeEvent::AddrReceived {
+            peer_id,
+            addrs: entries,
+        });
+
+        // Trickling: forward to a random subset of peers (excluding sender)
+        let relay_targets: Vec<u64> = self.peers.keys()
+            .filter(|&&id| id != peer_id)
+            .copied()
+            .take(ADDR_RELAY_FANOUT)
+            .collect();
+
+        // Build the addr message with only the valid entries
+        // We forward up to 10 valid entries per relay message.
+        let relay_addrs: Vec<SocketAddr> = valid.into_iter().take(10).collect();
+        let relay_entries: Vec<(u32, u64, [u8; 16], u16)> = relay_addrs.iter()
+            .map(|addr| {
+                let ip_bytes = socket_addr_to_ip_bytes(addr);
+                let ts = now_secs as u32;
+                (ts, 1u64, ip_bytes, addr.port())
+            })
+            .collect();
+
+        let relay_msg = NetworkMessage::Addr(crate::message::AddrMessage { addrs: relay_entries });
+        for target in relay_targets {
+            self.send_to(target, relay_msg.clone());
+        }
+    }
+
     /// Main event loop – call this in a tokio task
     pub async fn run(mut self) {
         loop {
             self.process_events().await;
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+}
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn ip_bytes_to_ip(bytes: [u8; 16]) -> IpAddr {
+    use std::net::Ipv6Addr;
+    let v6 = Ipv6Addr::from(bytes);
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        IpAddr::V4(v4)
+    } else if let Some(v4) = v6.to_ipv4() {
+        IpAddr::V4(v4)
+    } else {
+        IpAddr::V6(v6)
+    }
+}
+
+fn socket_addr_to_ip_bytes(addr: &SocketAddr) -> [u8; 16] {
+    match addr.ip() {
+        IpAddr::V4(v4) => v4.to_ipv6_mapped().octets(),
+        IpAddr::V6(v6) => v6.octets(),
     }
 }

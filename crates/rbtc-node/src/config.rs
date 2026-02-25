@@ -69,6 +69,11 @@ pub struct Args {
     /// Note: `getrawtransaction` will return an error for pruned blocks.
     #[arg(long, value_name = "MiB", default_value = "0")]
     pub prune: u64,
+
+    /// Maximum mempool size in megabytes (default 300 MB).
+    /// When the limit is exceeded, the lowest-fee-rate transactions are evicted.
+    #[arg(long, value_name = "MB", default_value = "300")]
+    pub mempool_size: u64,
 }
 
 impl Args {

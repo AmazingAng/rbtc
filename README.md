@@ -1,6 +1,6 @@
 # rbtc — Bitcoin Core in Rust
 
-A from-scratch implementation of Bitcoin Core's consensus, P2P networking, HD wallet, CPU miner, compact blocks, PSBT, and block pruning, written in Rust. No `bitcoin` crate — all protocol types, encoding, validation, key derivation, and block template construction are implemented independently.
+A from-scratch implementation of Bitcoin Core's consensus, P2P networking, HD wallet, CPU miner, compact blocks, PSBT, block pruning, mempool policy (RBF/CPFP/eviction), and P2P robustness (ban scoring, addr relay, peer persistence, connection manager), written in Rust. No `bitcoin` crate — all protocol types, encoding, validation, key derivation, and block template construction are implemented independently.
 
 ## Architecture
 
@@ -82,6 +82,20 @@ rbtc/
   - `extract_tx()` (Extractor): returns the final signed `Transaction`
   - Base64 serialize/deserialize; 6 new RPCs: `createpsbt`, `walletprocesspsbt`, `finalizepsbt`, `combinepsbt`, `decodepsbt`, `analyzepsbt`
 - **Block Pruning**: `--prune <MiB>` CLI flag; `BlockStore::prune_blocks_below(height)` deletes `CF_BLOCK_DATA` for blocks > 288 confirmations deep; `BlockStatus::Pruned` (4) recorded in `block_index`; headers, UTXO set, and indexes are never pruned
+
+### Phase 7 — Mempool Policy & P2P Robustness
+
+#### Mempool Policy
+- **BIP125 Replace-by-Fee (RBF)**: `accept_tx()` detects double-spend conflicts; if all conflicting transactions signal RBF (`nSequence < 0xFFFFFFFE`), the replacement is accepted when `new_fee_rate ≥ max_conflict_rate + min_relay_fee`; enforces ≤ 100 replacement limit; new error variants: `RbfNotSignaling`, `RbfInsufficientFee`, `TooManyReplacements`
+- **CPFP Ancestor Fee Rate**: `MempoolEntry::ancestor_fee_rate` captures the effective fee rate including all unconfirmed parents; `ancestor_package(txid)` recursively computes `(total_fee, total_vsize)` across the dependency graph; `txids_by_fee_rate()` and `TxSelector::select()` now sort by ancestor fee rate, enabling low-fee parents to be mined when a high-fee child is present
+- **Mempool Size Cap & Eviction**: `Mempool::with_max_vsize(bytes)` caps the pool (default 300 MB); when the cap is exceeded after an insertion, `evict_below_fee_rate()` evicts the cheapest entries first; if the new transaction itself would be the cheapest, it is rejected with `MempoolError::MempoolFull`; `--mempool-size <MB>` CLI flag controls the limit
+- **`feefilter` per-peer enforcement**: `ConnectedPeer::fee_filter` is set when a peer sends a `feefilter` message; `PeerManager::broadcast_tx_inv()` skips peers whose `fee_filter > tx_fee_rate_sat_kvb`, preventing relay of transactions they wouldn't accept
+
+#### P2P Robustness
+- **Peer Misbehavior Scoring & Bans**: `ConnectedPeer::misbehavior` accumulates a score; `PeerManager::misbehave(peer_id, score)` disconnects and bans an IP when score ≥ 100; bans are persisted to `CF_PEER_BANS` (key = IP bytes, value = expiry Unix timestamp) via `PeerStore::ban()` / `is_banned()` / `expire_bans()`; inbound connections with banned IPs are rejected immediately after handshake; ban duration is 24 hours
+- **`addr` Message Relay**: `PeerManager::handle_addr()` validates timestamp drift (≤ 10 minutes); valid addresses are added to `candidate_addrs` (capped at 1 000); up to 10 entries are trickling-forwarded to 2 randomly-chosen other peers; the node emits `NodeEvent::AddrReceived` for persistence; `getaddr` is sent to every peer after the handshake completes
+- **Peer Address Persistence**: new `rbtc-storage/src/peer_store.rs` with `CF_PEER_ADDRS` column family (key = 18-byte IP:port, value = `last_seen u64` + `services u64`); `PeerStore::save_addrs()` / `load_addrs()` for bulk persistence; at startup, `load_addrs()` seeds `PeerManager::candidate_addrs`; every 5 minutes `persist_peer_addrs()` flushes the current candidate list to RocksDB
+- **Connection Manager**: `PeerManager` tracks `outbound_count`, `connecting_addrs` (dedup guard), and `connected_addrs`; every 30 s the reconnect loop fills outbound slots from `candidate_addrs` up to `max_outbound`; banned IPs and already-connected/connecting addresses are skipped; inbound and outbound counts are decremented correctly on disconnect
 
 ## Dependencies
 
@@ -169,6 +183,7 @@ curl -s -d '{"method":"submitblock","params":["<hex>"]}' http://127.0.0.1:8332/
 | `--wallet-passphrase` | `""` | AES-256-GCM passphrase for xprv encryption |
 | `--create-wallet` | — | Generate a fresh wallet, print the mnemonic, then run |
 | `--prune` | `0` | Target disk budget for block data in MiB (`0` = keep all; min 550 when enabled) |
+| `--mempool-size` | `300` | Maximum mempool size in MB; cheapest transactions are evicted when exceeded |
 
 ### Environment Variables
 
@@ -282,7 +297,9 @@ curl -s -d '{"method":"sendtoaddress","params":["bc1q...","0.001"]}' http://127.
 - `accept_tx()`: full consensus validation + fee-rate gate (min 1 sat/vbyte)
 - Chained transactions: a mempool UTXO view merges chain outputs + in-mempool outputs
 - `remove_confirmed()`: prunes confirmed transactions when a block is connected
-- `txids_by_fee_rate()`: sorted list for future block template construction
+- **BIP125 RBF**: conflict detection, fee-rate sufficiency check, ≤ 100 replacement limit
+- **CPFP**: `ancestor_fee_rate` field + `ancestor_package()` recursive computation; `txids_by_fee_rate()` sorts by ancestor fee rate
+- **Size cap eviction**: `with_max_vsize()` / `evict_below_fee_rate()`; controlled by `--mempool-size`
 
 ### P2P Layer (`rbtc-net`)
 
@@ -294,6 +311,10 @@ curl -s -d '{"method":"sendtoaddress","params":["bc1q...","0.001"]}' http://127.
 - Inbound TCP listener: accepts peers up to `max_inbound` (default 125)
 - Peer cmd_tx registration: command channel properly associated before first message
 - **BIP152 Compact Blocks**: `sendcmpct(mode=1)` sent after every handshake; `cmpctblock` / `getblocktxn` / `blocktxn` messages handled; `pending_compact` map tracks partial reconstructions
+- **`feefilter` enforcement**: per-peer `fee_filter` field stored; `broadcast_tx_inv()` skips peers whose filter exceeds the transaction's fee rate
+- **Peer ban scoring**: `ConnectedPeer::misbehavior`; `misbehave(peer_id, score)` disconnects and bans at score ≥ 100; `BanPeer` event persists the ban to RocksDB
+- **`addr` relay**: timestamp-validated, dedup'd, forwarded to 2 peers (trickling); `getaddr` sent post-handshake
+- **Connection manager**: 30 s reconnect loop fills outbound slots from `candidate_addrs`; `connecting_addrs` dedup guard; correct inbound/outbound count tracking
 
 ### HD Wallet (`rbtc-wallet`)
 
@@ -375,7 +396,7 @@ When a competing chain with more cumulative work is detected, `reorganize_to(new
 cargo test --workspace
 ```
 
-236 tests across all crates — all pass.
+274 tests across all crates — all pass.
 
 | Crate | Tests |
 |-------|-------|
@@ -383,9 +404,9 @@ cargo test --workspace
 | `rbtc-crypto` | 33 |
 | `rbtc-consensus` | 27 |
 | `rbtc-script` | 25 |
-| `rbtc-storage` | 14 |
+| `rbtc-storage` | 35 |
 | `rbtc-mempool` | 4 |
-| `rbtc-net` | 9 |
+| `rbtc-net` | 14 |
 | `rbtc-psbt` | 6 |
 | `rbtc-wallet` | 35 |
 | `rbtc-miner` | 14 |

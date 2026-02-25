@@ -13,6 +13,11 @@ pub struct MempoolEntry {
     pub vsize: u64,
     /// Fee rate in satoshis per virtual byte
     pub fee_rate: u64,
+    /// BIP125: true if any input has nSequence < 0xFFFFFFFE
+    pub signals_rbf: bool,
+    /// Effective fee rate including unconfirmed ancestors (CPFP).
+    /// Equals `fee_rate` when all inputs are confirmed.
+    pub ancestor_fee_rate: u64,
     /// Wall-clock time when the entry was accepted
     pub added_at: Instant,
 }

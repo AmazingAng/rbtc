@@ -185,6 +185,36 @@ mod tests {
     }
 
     #[test]
+    fn utxo_set_spend_tx_missing_input_ignored() {
+        let mut set = UtxoSet::new();
+        let txid1 = Hash256([1; 32]);
+        let txid2 = Hash256([2; 32]);
+        set.add_tx(txid1, &coinbase_tx(), 0);
+        let spend_tx = Transaction {
+            version: 1,
+            inputs: vec![
+                TxIn {
+                    previous_output: OutPoint { txid: txid1, vout: 0 },
+                    script_sig: Script::new(),
+                    sequence: 0,
+                    witness: vec![],
+                },
+                TxIn {
+                    previous_output: OutPoint { txid: txid2, vout: 99 },
+                    script_sig: Script::new(),
+                    sequence: 0,
+                    witness: vec![],
+                },
+            ],
+            outputs: vec![TxOut { value: 500, script_pubkey: Script::new() }],
+            lock_time: 0,
+        };
+        let spent = set.spend_tx(&spend_tx);
+        assert_eq!(spent.len(), 1);
+        assert!(set.get(&OutPoint { txid: txid1, vout: 0 }).is_none());
+    }
+
+    #[test]
     fn utxo_set_connect_disconnect_block() {
         let mut set = UtxoSet::new();
         let txid1 = Hash256([1; 32]);
@@ -200,5 +230,44 @@ mod tests {
         assert!(set.len() >= 2);
         set.disconnect_block(&[txid1, txid2], &[cb, tx2], vec![vec![], vec![]]);
         assert!(set.is_empty());
+    }
+
+    #[test]
+    fn utxo_set_insert() {
+        let mut set = UtxoSet::new();
+        let op = OutPoint { txid: Hash256([5; 32]), vout: 1 };
+        let utxo = Utxo {
+            txout: TxOut { value: 500, script_pubkey: Script::new() },
+            is_coinbase: false,
+            height: 10,
+        };
+        set.insert(op.clone(), utxo);
+        assert_eq!(set.len(), 1);
+        let got = set.get(&op).unwrap();
+        assert_eq!(got.txout.value, 500);
+    }
+
+    #[test]
+    fn utxo_set_connect_block_with_undo() {
+        let mut set = UtxoSet::new();
+        let txid1 = Hash256([1; 32]);
+        let txid2 = Hash256([2; 32]);
+        let cb = coinbase_tx();
+        let tx2 = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: txid1, vout: 0 },
+                script_sig: Script::new(),
+                sequence: 0,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 500, script_pubkey: Script::new() }],
+            lock_time: 0,
+        };
+        set.add_tx(txid1, &cb, 0);
+        let undo = set.connect_block_with_undo(&[txid1, txid2], &[cb, tx2], 1);
+        assert_eq!(undo.len(), 2);
+        assert!(undo[0].is_empty());
+        assert_eq!(undo[1].len(), 1);
     }
 }

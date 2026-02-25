@@ -291,4 +291,66 @@ mod tests {
         store.apply_batch(&[(op.clone(), utxo)], &[]).unwrap();
         assert_eq!(store.get(&op).unwrap().unwrap().value, 2000);
     }
+
+    #[test]
+    fn utxo_store_fill_batch_and_connect_block_into_batch() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        let store = UtxoStore::new(&db);
+        let mut batch = db.new_batch();
+        let op = OutPoint { txid: Hash256([3; 32]), vout: 0 };
+        let utxo = StoredUtxo {
+            value: 3000,
+            script_pubkey: Script::new(),
+            height: 3,
+            is_coinbase: false,
+        };
+        store.fill_batch(&mut batch, &[(op.clone(), utxo)], &[]).unwrap();
+        db.write_batch(batch).unwrap();
+        assert_eq!(store.get(&op).unwrap().unwrap().value, 3000);
+    }
+
+    #[test]
+    fn utxo_store_connect_block_into_batch_iter_all() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        let store = UtxoStore::new(&db);
+        use rbtc_primitives::transaction::{Transaction, TxIn};
+        let txid = Hash256([4; 32]);
+        let cb = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: Script::from_bytes(vec![2, 0, 0]),
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            lock_time: 0,
+        };
+        let mut batch = db.new_batch();
+        store.connect_block_into_batch(&mut batch, &[txid], &[cb], 0).unwrap();
+        db.write_batch(batch).unwrap();
+        let all = store.iter_all();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].1.value, 50_0000_0000);
+    }
+
+    #[test]
+    fn encode_decode_block_undo_roundtrip() {
+        let op = OutPoint { txid: Hash256([7; 32]), vout: 1 };
+        let utxo = StoredUtxo {
+            value: 100,
+            script_pubkey: Script::new(),
+            height: 1,
+            is_coinbase: false,
+        };
+        let undo = vec![vec![], vec![(op, utxo)]];
+        let bytes = encode_block_undo(&undo);
+        let decoded = decode_block_undo(&bytes).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert!(decoded[0].is_empty());
+        assert_eq!(decoded[1].len(), 1);
+        assert_eq!(decoded[1][0].0.txid.0, [7; 32]);
+    }
 }

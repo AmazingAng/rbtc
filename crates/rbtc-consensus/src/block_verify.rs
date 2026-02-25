@@ -245,8 +245,12 @@ pub fn encode_block_header(header: &rbtc_primitives::block::BlockHeader) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rbtc_primitives::block::BlockHeader;
+    use rbtc_primitives::block::{Block, BlockHeader};
     use rbtc_primitives::hash::Hash256;
+    use rbtc_primitives::script::Script;
+    use rbtc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
+    use rbtc_script::ScriptFlags;
+    use crate::utxo::UtxoSet;
 
     fn header_with_bits(bits: u32) -> BlockHeader {
         BlockHeader {
@@ -257,6 +261,205 @@ mod tests {
             bits,
             nonce: 0,
         }
+    }
+
+    #[test]
+    fn verify_block_header_timestamp_too_new() {
+        let h = header_with_bits(0x207fffff);
+        let encoded = encode_block_header(&h);
+        let hash = sha256d(&encoded);
+        if !h.meets_target(&hash) {
+            return;
+        }
+        // header.time (100000) must be <= network_time + 7200; use network_time=90000 so 97200 < 100000 -> too new
+        let r = verify_block_header(&h, h.bits, 0, 90000);
+        assert!(r.is_err());
+        assert!(matches!(r.unwrap_err(), ConsensusError::TimestampTooNew));
+    }
+
+    #[test]
+    fn verify_block_empty_txs() {
+        let h = header_with_bits(0x207fffff);
+        let block = Block { header: h, transactions: vec![] };
+        let ctx = BlockValidationContext {
+            block: &block,
+            height: 0,
+            median_time_past: 0,
+            network_time: 200000,
+            expected_bits: 0x207fffff,
+            flags: ScriptFlags::default(),
+        };
+        let r = verify_block(&ctx, &UtxoSet::new());
+        assert!(r.is_err());
+        assert!(matches!(r.unwrap_err(), ConsensusError::FirstTxNotCoinbase));
+    }
+
+    #[test]
+    fn verify_block_first_not_coinbase() {
+        let h = header_with_bits(0x207fffff);
+        let non_cb = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: Hash256([1; 32]), vout: 0 },
+                script_sig: Script::new(),
+                sequence: 0,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 0, script_pubkey: Script::new() }],
+            lock_time: 0,
+        };
+        assert!(!non_cb.is_coinbase());
+        let block = Block { header: h, transactions: vec![non_cb] };
+        let ctx = BlockValidationContext {
+            block: &block,
+            height: 0,
+            median_time_past: 0,
+            network_time: 200000,
+            expected_bits: 0x207fffff,
+            flags: ScriptFlags::default(),
+        };
+        let r = verify_block(&ctx, &UtxoSet::new());
+        assert!(r.is_err());
+        assert!(matches!(r.unwrap_err(), ConsensusError::FirstTxNotCoinbase));
+    }
+
+    #[test]
+    fn verify_block_duplicate_coinbase() {
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: Script::from_bytes(vec![2, 0, 0]),
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            lock_time: 0,
+        };
+        let h = header_with_bits(0x207fffff);
+        let block = Block { header: h, transactions: vec![coinbase.clone(), coinbase] };
+        let ctx = BlockValidationContext {
+            block: &block,
+            height: 0,
+            median_time_past: 0,
+            network_time: 200000,
+            expected_bits: 0x207fffff,
+            flags: ScriptFlags::default(),
+        };
+        let r = verify_block(&ctx, &UtxoSet::new());
+        assert!(r.is_err());
+        assert!(matches!(r.unwrap_err(), ConsensusError::DuplicateCoinbase));
+    }
+
+    #[test]
+    fn verify_block_bad_merkle_root() {
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: Script::from_bytes(vec![2, 0, 0]),
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            lock_time: 0,
+        };
+        let mut h = header_with_bits(0x207fffff);
+        h.merkle_root = Hash256([0xff; 32]); // wrong root
+        let block = Block { header: h, transactions: vec![coinbase] };
+        let ctx = BlockValidationContext {
+            block: &block,
+            height: 0,
+            median_time_past: 0,
+            network_time: 200000,
+            expected_bits: 0x207fffff,
+            flags: ScriptFlags::default(),
+        };
+        let r = verify_block(&ctx, &UtxoSet::new());
+        assert!(r.is_err());
+        assert!(matches!(r.unwrap_err(), ConsensusError::BadMerkleRoot));
+    }
+
+    #[test]
+    fn verify_block_bad_coinbase_amount() {
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: Script::from_bytes(vec![2, 0, 0]),
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 100_0000_0000, script_pubkey: Script::new() }], // > subsidy
+            lock_time: 0,
+        };
+        let mut buf = Vec::new();
+        coinbase.encode_legacy(&mut buf).ok();
+        let txid = sha256d(&buf);
+        let merkle = rbtc_crypto::merkle_root(&[txid]).unwrap();
+        let mut h = header_with_bits(0x207fffff);
+        h.merkle_root = merkle;
+        for nonce in 0..=0x10000u32 {
+            h.nonce = nonce;
+            let enc = encode_block_header(&h);
+            let hash = sha256d(&enc);
+            if h.meets_target(&hash) {
+                break;
+            }
+        }
+        let block = Block { header: h, transactions: vec![coinbase] };
+        let ctx = BlockValidationContext {
+            block: &block,
+            height: 0,
+            median_time_past: 99999,
+            network_time: 110000,
+            expected_bits: 0x207fffff,
+            flags: ScriptFlags::default(),
+        };
+        let r = verify_block(&ctx, &UtxoSet::new());
+        assert!(r.is_err());
+        assert!(matches!(r.unwrap_err(), ConsensusError::BadCoinbaseAmount(_, _)));
+    }
+
+    #[test]
+    fn verify_block_ok_minimal() {
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: Script::from_bytes(vec![2, 0, 0]),
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            lock_time: 0,
+        };
+        let mut buf = Vec::new();
+        coinbase.encode_legacy(&mut buf).ok();
+        let txid = sha256d(&buf);
+        let merkle = rbtc_crypto::merkle_root(&[txid]).unwrap();
+        let mut h = header_with_bits(0x207fffff);
+        h.merkle_root = merkle;
+        h.time = 100000;
+        for nonce in 0..=0x10000u32 {
+            h.nonce = nonce;
+            let enc = encode_block_header(&h);
+            let hash = sha256d(&enc);
+            if h.meets_target(&hash) {
+                break;
+            }
+        }
+        let block = Block { header: h, transactions: vec![coinbase] };
+        let ctx = BlockValidationContext {
+            block: &block,
+            height: 0,
+            median_time_past: 99999,
+            network_time: 110000,
+            expected_bits: 0x207fffff,
+            flags: ScriptFlags::default(),
+        };
+        let fees = verify_block(&ctx, &UtxoSet::new()).unwrap();
+        assert_eq!(fees, 0);
     }
 
     #[test]
