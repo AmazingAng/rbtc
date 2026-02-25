@@ -495,3 +495,47 @@ impl NetworkMessage {
         Ok(msg)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rbtc_primitives::network::Network;
+
+    #[test]
+    fn message_encode_verack() {
+        let magic = Network::Mainnet.magic();
+        let msg = Message::new(magic, NetworkMessage::Verack);
+        let bytes = msg.encode_to_bytes();
+        assert!(bytes.len() >= 24);
+        assert_eq!(&bytes[0..4], &magic[..]);
+    }
+
+    #[test]
+    fn inv_type_from_u32() {
+        assert_eq!(InvType::from_u32(1), InvType::Tx);
+        assert_eq!(InvType::from_u32(2), InvType::Block);
+        assert_eq!(InvType::from_u32(0), InvType::Error);
+    }
+
+    #[test]
+    fn version_message_roundtrip() {
+        let v = VersionMessage::new(0, 42);
+        let payload = v.encode_payload();
+        let decoded = VersionMessage::decode_payload(&payload).unwrap();
+        assert_eq!(decoded.nonce, 42);
+    }
+
+    #[test]
+    fn getblocks_message_roundtrip() {
+        let m = GetBlocksMessage::new(vec![Hash256::ZERO]);
+        let payload = m.encode_payload();
+        let decoded = GetBlocksMessage::decode_payload(&payload).unwrap();
+        assert_eq!(decoded.locator_hashes.len(), 1);
+    }
+
+    #[test]
+    fn network_message_command() {
+        assert_eq!(NetworkMessage::Verack.command(), "verack");
+        assert_eq!(NetworkMessage::SendHeaders.command(), "sendheaders");
+    }
+}

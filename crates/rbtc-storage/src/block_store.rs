@@ -104,3 +104,83 @@ impl<'db> BlockStore<'db> {
         Ok(self.db.get_cf(CF_BLOCK_INDEX, &hash.0)?.is_some())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rbtc_primitives::hash::Hash256;
+    use rbtc_primitives::transaction::Transaction;
+    use tempfile::TempDir;
+    use crate::db::Database;
+
+    #[test]
+    fn block_store_put_get_index() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        let store = BlockStore::new(&db);
+        let hash: BlockHash = Hash256([1; 32]);
+        let index = StoredBlockIndex {
+            header: BlockHeader {
+                version: 1,
+                prev_block: Hash256::ZERO,
+                merkle_root: Hash256::ZERO,
+                time: 0,
+                bits: 0,
+                nonce: 0,
+            },
+            height: 0,
+            chainwork_lo: 1,
+            chainwork_hi: 0,
+            status: 0,
+        };
+        store.put_index(&hash, &index).unwrap();
+        let got = store.get_index(&hash).unwrap().unwrap();
+        assert_eq!(got.height, 0);
+        assert!(store.has_index(&hash).unwrap());
+    }
+
+    #[test]
+    fn block_store_put_get_block() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        let store = BlockStore::new(&db);
+        let hash: BlockHash = Hash256([2; 32]);
+        use rbtc_primitives::transaction::{OutPoint, TxIn, TxOut};
+        use rbtc_primitives::script::Script;
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_block: Hash256::ZERO,
+                merkle_root: Hash256::ZERO,
+                time: 0,
+                bits: 0,
+                nonce: 0,
+            },
+            transactions: vec![Transaction {
+                version: 1,
+                inputs: vec![TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: Script::from_bytes(vec![2, 0, 0]),
+                    sequence: 0xffffffff,
+                    witness: vec![],
+                }],
+                outputs: vec![TxOut { value: 0, script_pubkey: Script::new() }],
+                lock_time: 0,
+            }],
+        };
+        store.put_block(&hash, &block).unwrap();
+        let got = store.get_block(&hash).unwrap().unwrap();
+        assert_eq!(got.transactions.len(), 1);
+        assert!(store.has_block(&hash).unwrap());
+    }
+
+    #[test]
+    fn block_store_get_missing() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        let store = BlockStore::new(&db);
+        let hash: BlockHash = Hash256([99; 32]);
+        assert!(store.get_index(&hash).unwrap().is_none());
+        assert!(store.get_block(&hash).unwrap().is_none());
+    }
+}

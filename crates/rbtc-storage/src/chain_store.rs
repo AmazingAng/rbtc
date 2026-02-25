@@ -94,3 +94,41 @@ impl<'db> ChainStore<'db> {
         self.db.write_batch(batch)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rbtc_primitives::hash::Hash256;
+    use tempfile::TempDir;
+    use crate::db::Database;
+
+    #[test]
+    fn chain_store_best_block_height_chainwork() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        let store = ChainStore::new(&db);
+        assert!(store.get_best_block().unwrap().is_none());
+        assert!(store.get_best_height().unwrap().is_none());
+        assert_eq!(store.get_chainwork().unwrap(), 0);
+
+        let hash: BlockHash = Hash256([1; 32]);
+        store.set_best_block(&hash).unwrap();
+        store.set_best_height(100).unwrap();
+        store.set_chainwork(1000).unwrap();
+        assert_eq!(store.get_best_block().unwrap(), Some(hash));
+        assert_eq!(store.get_best_height().unwrap(), Some(100));
+        assert_eq!(store.get_chainwork().unwrap(), 1000);
+    }
+
+    #[test]
+    fn chain_store_update_tip() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        let store = ChainStore::new(&db);
+        let hash: BlockHash = Hash256([2; 32]);
+        store.update_tip(&hash, 200, 2000).unwrap();
+        assert_eq!(store.get_best_block().unwrap(), Some(hash));
+        assert_eq!(store.get_best_height().unwrap(), Some(200));
+        assert_eq!(store.get_chainwork().unwrap(), 2000);
+    }
+}

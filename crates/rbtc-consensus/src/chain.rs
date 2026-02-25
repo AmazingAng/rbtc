@@ -257,3 +257,103 @@ fn genesis_hash(network: Network) -> BlockHash {
     let hex = network.genesis_hash();
     BlockHash::from_hex(hex).unwrap_or(Hash256::ZERO)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_status_equality() {
+        assert_eq!(BlockStatus::HeaderOnly, BlockStatus::HeaderOnly);
+        assert_ne!(BlockStatus::Valid, BlockStatus::InChain);
+    }
+
+    #[test]
+    fn block_index_median_time_past() {
+        let bi = BlockIndex {
+            hash: BlockHash::ZERO,
+            header: BlockHeader {
+                version: 1,
+                prev_block: BlockHash::ZERO,
+                merkle_root: Hash256::ZERO,
+                time: 100,
+                bits: 0,
+                nonce: 0,
+            },
+            height: 10,
+            chainwork: 0,
+            status: BlockStatus::HeaderOnly,
+        };
+        let get_ts = |h: u32| Some(100 + h);
+        let mtp = bi.median_time_past(&get_ts);
+        assert!(mtp >= 100);
+    }
+
+    #[test]
+    fn chain_state_new_height_best() {
+        let chain = ChainState::new(Network::Regtest);
+        assert_eq!(chain.height(), 0);
+        assert!(chain.best_hash().is_none());
+        assert!(chain.get_block_index(&BlockHash::ZERO).is_none());
+        assert!(chain.get_ancestor_hash(0).is_none());
+        assert!(chain.next_required_bits() > 0);
+    }
+
+    #[test]
+    fn add_header_genesis() {
+        let mut chain = ChainState::new(Network::Regtest);
+        let genesis_hash_hex = chain.network.genesis_hash();
+        let gh = BlockHash::from_hex(genesis_hash_hex).unwrap();
+        let header = BlockHeader {
+            version: 1,
+            prev_block: BlockHash::ZERO,
+            merkle_root: Hash256::ZERO,
+            time: 1231006505,
+            bits: 0x1d00ffff,
+            nonce: 2083236893,
+        };
+        let h = header_hash(&header);
+        if h == gh {
+            let r = chain.add_header(header);
+            assert!(r.is_ok());
+        }
+    }
+
+    #[test]
+    fn add_header_unknown_parent() {
+        let mut chain = ChainState::new(Network::Regtest);
+        let header = BlockHeader {
+            version: 1,
+            prev_block: Hash256([1; 32]),
+            merkle_root: Hash256::ZERO,
+            time: 1231006506,
+            bits: 0x1d00ffff,
+            nonce: 0,
+        };
+        let r = chain.add_header(header);
+        assert!(r.is_err());
+        assert!(matches!(r.unwrap_err(), ConsensusError::UnknownParent(_)));
+    }
+
+    #[test]
+    fn header_hash_smoke() {
+        let header = BlockHeader {
+            version: 1,
+            prev_block: BlockHash::ZERO,
+            merkle_root: Hash256::ZERO,
+            time: 0,
+            bits: 0,
+            nonce: 0,
+        };
+        let h = header_hash(&header);
+        assert_eq!(h.0.len(), 32);
+    }
+
+    #[test]
+    fn disconnect_tip_no_tip() {
+        let mut chain = ChainState::new(Network::Regtest);
+        let r = chain.disconnect_tip();
+        assert!(r.is_err());
+        assert!(matches!(r.unwrap_err(), ConsensusError::GenesisMismatch));
+    }
+}

@@ -236,10 +236,6 @@ mod tests {
     use super::*;
     use rbtc_primitives::block::BlockHeader;
     use rbtc_primitives::hash::Hash256;
-    use rbtc_primitives::script::Script;
-    use rbtc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
-    use rbtc_script::ScriptFlags;
-    use crate::utxo::UtxoSet;
 
     fn header_with_bits(bits: u32) -> BlockHeader {
         BlockHeader {

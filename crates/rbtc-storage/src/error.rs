@@ -17,3 +17,16 @@ pub enum StorageError {
 }
 
 pub type Result<T> = std::result::Result<T, StorageError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn storage_error_display() {
+        let _ = format!("{}", StorageError::NotFound);
+        let _ = format!("{}", StorageError::Decode("bad".into()));
+        let _ = format!("{}", StorageError::Encode("bad".into()));
+        let _ = format!("{}", StorageError::Corruption("x".into()));
+    }
+}

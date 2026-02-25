@@ -120,14 +120,46 @@ The binary crate `rbtc-node` only tests library logic (e.g. config parsing); `ma
 
 ## Testing Against Bitcoin Core
 
-The best way to validate correctness is to run in `regtest` mode alongside Bitcoin Core:
+### Automated integration tests (`rbtc-net`)
+
+Five integration tests in `crates/rbtc-net/tests/bitcoin_core_integration.rs` exercise the full
+P2P stack against a real Bitcoin Core node:
+
+| Test | What it checks |
+|------|----------------|
+| `test_handshake_with_bitcoin_core` | Complete version/verack handshake; peer user-agent contains "Satoshi" |
+| `test_ping_pong` | Send `ping` with a fixed nonce, receive matching `pong` |
+| `test_getheaders_from_genesis` | `getheaders` returns ≥1 valid `BlockHeader` structs |
+| `test_getdata_genesis_block` | `getdata(WitnessBlock, genesis)` → decode full genesis block, verify coinbase |
+| `test_sync_first_10_blocks` | Fetch and decode 10 consecutive regtest blocks |
 
 ```bash
-# Start Bitcoin Core in regtest
-bitcoind -regtest -daemon
+# 1. Start Bitcoin Core in regtest
+mkdir -p /tmp/rbtc-regtest
+cat > /tmp/rbtc-regtest/bitcoin.conf <<EOF
+[regtest]
+server=1
+rpcuser=rbtctest
+rpcpassword=rbtctest123
+EOF
+bitcoind -datadir=/tmp/rbtc-regtest -regtest -daemon
 
-# Connect rbtc to it
-./target/release/rbtc --network regtest --connect 127.0.0.1:18444
+# 2. Mine some blocks
+ADDR=$(bitcoin-cli -datadir=/tmp/rbtc-regtest -regtest getnewaddress)
+bitcoin-cli -datadir=/tmp/rbtc-regtest -regtest generatetoaddress 10 "$ADDR"
+
+# 3. Run integration tests
+cargo test -p rbtc-net --test bitcoin_core_integration -- --nocapture
+
+# 4. Stop bitcoind when done
+bitcoin-cli -datadir=/tmp/rbtc-regtest -regtest stop
+```
+
+### Run the node against regtest
+
+```bash
+# Connect rbtc to a running regtest bitcoind
+./target/release/rbtc --network regtest --addnode 127.0.0.1:18444
 ```
 
 ## Known Limitations

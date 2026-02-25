@@ -158,3 +158,47 @@ impl<'db> UtxoStore<'db> {
         self.apply_batch(&to_add, &to_remove)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rbtc_primitives::hash::Hash256;
+    use tempfile::TempDir;
+    use crate::db::Database;
+
+    #[test]
+    fn utxo_store_put_get_delete() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        let store = UtxoStore::new(&db);
+        let outpoint = OutPoint { txid: Hash256([1; 32]), vout: 0 };
+        let utxo = StoredUtxo {
+            value: 1000,
+            script_pubkey: Script::new(),
+            height: 1,
+            is_coinbase: false,
+        };
+        store.put(&outpoint, &utxo).unwrap();
+        assert!(store.contains(&outpoint).unwrap());
+        let got = store.get(&outpoint).unwrap().unwrap();
+        assert_eq!(got.value, 1000);
+        store.delete(&outpoint).unwrap();
+        assert!(store.get(&outpoint).unwrap().is_none());
+    }
+
+    #[test]
+    fn utxo_store_apply_batch() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        let store = UtxoStore::new(&db);
+        let op = OutPoint { txid: Hash256([2; 32]), vout: 0 };
+        let utxo = StoredUtxo {
+            value: 2000,
+            script_pubkey: Script::new(),
+            height: 2,
+            is_coinbase: true,
+        };
+        store.apply_batch(&[(op.clone(), utxo)], &[]).unwrap();
+        assert_eq!(store.get(&op).unwrap().unwrap().value, 2000);
+    }
+}

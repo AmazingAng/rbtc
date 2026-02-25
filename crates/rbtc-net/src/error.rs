@@ -27,3 +27,22 @@ pub enum NetError {
 }
 
 pub type Result<T> = std::result::Result<T, NetError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn net_error_display() {
+        let _ = format!("{}", NetError::MessageTooLarge(100));
+        let _ = format!("{}", NetError::InvalidMagic { expected: 0, got: 1 });
+        let _ = format!("{}", NetError::ChecksumMismatch);
+        let _ = format!("{}", NetError::UnknownCommand("x".into()));
+        let _ = format!("{}", NetError::Decode("x".into()));
+        let _ = format!("{}", NetError::ConnectionClosed);
+        let _ = format!("{}", NetError::HandshakeFailed("x".into()));
+        let _ = format!("{}", NetError::Misbehaving("x".into()));
+        let _ = format!("{}", NetError::DnsError("x".into()));
+        let _ = format!("{}", NetError::ChannelError);
+    }
+}

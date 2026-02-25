@@ -8,3 +8,6 @@ license.workspace = true
 rbtc-primitives = { workspace = true }
 rocksdb         = { workspace = true }
 thiserror       = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

@@ -168,7 +168,7 @@ mod tests {
         assert_eq!(block_subsidy(209999), 50_0000_0000);
         assert_eq!(block_subsidy(210000), 25_0000_0000);
         assert_eq!(block_subsidy(420000), 12_5000_0000);
-        assert_eq!(block_subsidy(21_000_000 * 210_000 / 50), 0);
+        assert_eq!(block_subsidy(64 * 210_000), 0);
     }
 
     #[test]

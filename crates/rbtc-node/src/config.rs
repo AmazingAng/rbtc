@@ -67,3 +67,34 @@ fn dirs_home() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_network_mainnet() {
+        let args = Args::parse_from(["rbtc", "--network", "mainnet"]);
+        assert_eq!(args.network, Network::Mainnet);
+    }
+
+    #[test]
+    fn parse_network_regtest() {
+        let args = Args::parse_from(["rbtc", "--network", "regtest"]);
+        assert_eq!(args.network, Network::Regtest);
+    }
+
+    #[test]
+    fn data_dir_default() {
+        let args = Args::parse_from(["rbtc"]);
+        let d = args.data_dir();
+        assert!(d.to_string_lossy().contains("rbtc"));
+    }
+
+    #[test]
+    fn parse_addnode() {
+        let args = Args::parse_from(["rbtc", "--addnode", "127.0.0.1:18444"]);
+        assert_eq!(args.add_nodes.len(), 1);
+        assert_eq!(args.add_nodes[0], "127.0.0.1:18444");
+    }
+}

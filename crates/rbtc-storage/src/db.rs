@@ -87,3 +87,38 @@ impl Database {
         self.db.flush().map_err(StorageError::Rocks)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn db_open_put_get_delete() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        db.put_cf(CF_BLOCK_INDEX, b"key1", b"val1").unwrap();
+        assert_eq!(db.get_cf(CF_BLOCK_INDEX, b"key1").unwrap(), Some(b"val1".to_vec()));
+        db.delete_cf(CF_BLOCK_INDEX, b"key1").unwrap();
+        assert_eq!(db.get_cf(CF_BLOCK_INDEX, b"key1").unwrap(), None);
+    }
+
+    #[test]
+    fn db_write_batch() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        let mut batch = db.new_batch();
+        db.batch_put_cf(&mut batch, CF_UTXO, b"k", b"v").unwrap();
+        db.write_batch(batch).unwrap();
+        assert_eq!(db.get_cf(CF_UTXO, b"k").unwrap(), Some(b"v".to_vec()));
+    }
+
+    #[test]
+    fn db_invalid_cf() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        let r = db.get_cf("no_such_cf", b"x");
+        assert!(r.is_err());
+        assert!(matches!(r.unwrap_err(), StorageError::Corruption(_)));
+    }
+}
