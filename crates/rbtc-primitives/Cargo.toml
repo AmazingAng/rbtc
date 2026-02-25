@@ -1,0 +1,9 @@
+[package]
+name    = "rbtc-primitives"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hex       = { workspace = true }
+thiserror = { workspace = true }

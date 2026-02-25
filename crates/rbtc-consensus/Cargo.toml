@@ -1,0 +1,11 @@
+[package]
+name    = "rbtc-consensus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rbtc-primitives = { workspace = true }
+rbtc-crypto     = { workspace = true }
+rbtc-script     = { workspace = true }
+thiserror       = { workspace = true }

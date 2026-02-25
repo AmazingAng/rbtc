@@ -1,0 +1,16 @@
+/target
+**/*.rs.bk
+Cargo.lock
+.DS_Store
+*.swp
+*.swo
+~$*
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Data directories
+.rbtc/
+chaindata/

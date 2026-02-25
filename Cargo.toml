@@ -1,0 +1,52 @@
+[workspace]
+members = [
+    "crates/rbtc-primitives",
+    "crates/rbtc-crypto",
+    "crates/rbtc-script",
+    "crates/rbtc-consensus",
+    "crates/rbtc-storage",
+    "crates/rbtc-net",
+    "crates/rbtc-node",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["rbtc contributors"]
+
+[workspace.dependencies]
+# Internal crates
+rbtc-primitives = { path = "crates/rbtc-primitives" }
+rbtc-crypto     = { path = "crates/rbtc-crypto" }
+rbtc-script     = { path = "crates/rbtc-script" }
+rbtc-consensus  = { path = "crates/rbtc-consensus" }
+rbtc-storage    = { path = "crates/rbtc-storage" }
+rbtc-net        = { path = "crates/rbtc-net" }
+
+# Cryptography
+secp256k1 = { version = "0.31", features = ["global-context"] }
+sha2      = "0.10"
+ripemd = "0.2.0-rc.5"
+
+# Async / networking
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+
+# Storage
+rocksdb = "0.22"
+
+# Serialization / utils
+hex   = "0.4"
+clap  = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+thiserror = "2"
+anyhow    = "1"

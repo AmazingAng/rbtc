@@ -1,0 +1,173 @@
+use secp256k1::{
+    ecdsa::Signature as EcdsaSig, schnorr::Signature as SchnorrSig, Message, PublicKey,
+    Secp256k1, XOnlyPublicKey,
+};
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+pub enum CryptoError {
+    #[error("invalid public key")]
+    InvalidPublicKey,
+    #[error("invalid signature")]
+    InvalidSignature,
+    #[error("invalid message")]
+    InvalidMessage,
+    #[error("signature verification failed")]
+    VerificationFailed,
+    #[error("secp256k1 error: {0}")]
+    Secp256k1(#[from] secp256k1::Error),
+}
+
+/// Verify a DER-encoded ECDSA signature.
+/// `pubkey` – 33-byte compressed or 65-byte uncompressed public key.
+/// `sig_der` – DER-encoded, with sighash type byte appended.
+/// `msg`     – 32-byte sighash.
+pub fn verify_ecdsa(pubkey: &[u8], sig_der: &[u8], msg: &[u8; 32]) -> Result<(), CryptoError> {
+    let secp = Secp256k1::verification_only();
+    let pk = PublicKey::from_slice(pubkey).map_err(|_| CryptoError::InvalidPublicKey)?;
+
+    // Strip sighash type byte if present
+    let sig_bytes = if !sig_der.is_empty() && is_der_signature(sig_der) {
+        sig_der
+    } else if sig_der.len() > 1 {
+        let stripped = &sig_der[..sig_der.len() - 1];
+        if is_der_signature(stripped) { stripped } else { sig_der }
+    } else {
+        sig_der
+    };
+
+    let sig = EcdsaSig::from_der(sig_bytes).map_err(|_| CryptoError::InvalidSignature)?;
+    let message = Message::from_digest(*msg);
+
+    secp.verify_ecdsa(message, &sig, &pk)
+        .map_err(|_| CryptoError::VerificationFailed)
+}
+
+/// Verify a 64-byte Schnorr signature (BIP340 / Taproot).
+/// `pubkey` – 32-byte x-only public key.
+/// `sig`    – 64 bytes, or 65 bytes with sighash type appended.
+/// `msg`    – 32-byte tagged sighash.
+pub fn verify_schnorr(pubkey: &[u8], sig: &[u8], msg: &[u8; 32]) -> Result<(), CryptoError> {
+    if pubkey.len() != 32 {
+        return Err(CryptoError::InvalidPublicKey);
+    }
+    if sig.len() != 64 && sig.len() != 65 {
+        return Err(CryptoError::InvalidSignature);
+    }
+
+    let secp = Secp256k1::verification_only();
+
+    let pk_arr: [u8; 32] = pubkey.try_into().map_err(|_| CryptoError::InvalidPublicKey)?;
+    let xonly = XOnlyPublicKey::from_byte_array(pk_arr)
+        .map_err(|_| CryptoError::InvalidPublicKey)?;
+
+    let sig_bytes = if sig.len() == 65 { &sig[..64] } else { sig };
+    let sig_arr: [u8; 64] = sig_bytes.try_into().map_err(|_| CryptoError::InvalidSignature)?;
+    let schnorr_sig = SchnorrSig::from_byte_array(sig_arr);
+
+    secp.verify_schnorr(&schnorr_sig, msg, &xonly)
+        .map_err(|_| CryptoError::VerificationFailed)
+}
+
+fn is_der_signature(bytes: &[u8]) -> bool {
+    bytes.len() >= 8 && bytes[0] == 0x30
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verify_ecdsa_invalid_pubkey_empty() {
+        let msg = [0u8; 32];
+        let sig = [0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01];
+        let r = verify_ecdsa(&[], &sig, &msg);
+        assert!(r.is_err());
+        assert!(matches!(r.unwrap_err(), CryptoError::InvalidPublicKey));
+    }
+
+    #[test]
+    fn verify_ecdsa_invalid_pubkey_bad_bytes() {
+        let msg = [0u8; 32];
+        let pk = [0u8; 33];
+        let sig = [0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01];
+        let r = verify_ecdsa(&pk, &sig, &msg);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn verify_ecdsa_invalid_signature() {
+        let msg = [0u8; 32];
+        let pk = [
+            0x02, 0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95, 0xce,
+            0x87, 0x0b, 0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81,
+            0x5b, 0x16, 0xf8, 0x17, 0x98,
+        ];
+        let bad_sig = [0u8; 10];
+        let r = verify_ecdsa(&pk, &bad_sig, &msg);
+        assert!(r.is_err());
+        assert!(matches!(r.unwrap_err(), CryptoError::InvalidSignature));
+    }
+
+    #[test]
+    fn verify_ecdsa_sig_with_sighash_byte() {
+        let msg = [0u8; 32];
+        let pk = [
+            0x02, 0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95, 0xce,
+            0x87, 0x0b, 0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81,
+            0x5b, 0x16, 0xf8, 0x17, 0x98,
+        ];
+        let der_plus_sighash = [
+            0x30, 0x44, 0x02, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x20, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x01,
+        ];
+        let r = verify_ecdsa(&pk, &der_plus_sighash, &msg);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn verify_schnorr_invalid_pubkey_len() {
+        let msg = [0u8; 32];
+        let pk = [0u8; 31];
+        let sig = [0u8; 64];
+        assert!(verify_schnorr(&pk, &sig, &msg).is_err());
+        let pk65 = [0u8; 65];
+        assert!(verify_schnorr(&pk65, &sig, &msg).is_err());
+    }
+
+    #[test]
+    fn verify_schnorr_invalid_sig_len() {
+        let msg = [0u8; 32];
+        let pk = [0u8; 32];
+        assert!(verify_schnorr(&pk, &[0u8; 63], &msg).is_err());
+        assert!(verify_schnorr(&pk, &[0u8; 66], &msg).is_err());
+    }
+
+    #[test]
+    fn verify_schnorr_invalid_pubkey() {
+        let msg = [0u8; 32];
+        let pk = [0u8; 32];
+        let sig = [0u8; 64];
+        let r = verify_schnorr(&pk, &sig, &msg);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn verify_schnorr_65_bytes() {
+        let msg = [0u8; 32];
+        let pk = [
+            0x17, 0x7c, 0x31, 0x4d, 0x3c, 0x77, 0x2d, 0xfc, 0x6d, 0x2f, 0x98, 0x2e, 0x2e, 0x1e,
+            0x57, 0xeb, 0x0d, 0xcd, 0x0f, 0xaf, 0x60, 0x1e, 0xc4, 0x49, 0xb7, 0x26, 0x7e, 0x72,
+            0x52, 0x57, 0x3f, 0xaf, 0xe3,
+        ];
+        let mut sig65 = [0u8; 65];
+        sig65[..64].copy_from_slice(&[0u8; 64]);
+        sig65[64] = 0x01;
+        let r = verify_schnorr(&pk, &sig65, &msg);
+        assert!(r.is_err());
+    }
+}

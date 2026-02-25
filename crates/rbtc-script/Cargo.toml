@@ -1,0 +1,12 @@
+[package]
+name    = "rbtc-script"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rbtc-primitives = { workspace = true }
+rbtc-crypto     = { workspace = true }
+secp256k1       = { workspace = true }
+ripemd          = { workspace = true }
+thiserror       = { workspace = true }
