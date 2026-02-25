@@ -20,6 +20,7 @@ use rbtc_storage::{
     encode_block_undo, decode_block_undo, BlockStore, ChainStore, Database, StoredBlockIndex,
     StoredUtxo, UtxoStore,
 };
+use rbtc_wallet::Wallet;
 
 use crate::{
     config::Args,
@@ -35,6 +36,8 @@ pub struct Node {
     chain: Arc<RwLock<ChainState>>,
     /// Mempool, shared with the RPC server via Arc<RwLock>
     mempool: Arc<RwLock<Mempool>>,
+    /// Optional HD wallet, shared with the RPC server via Arc<RwLock>
+    wallet: Option<Arc<RwLock<Wallet>>>,
     ibd: IbdState,
     peer_manager: PeerManager,
     node_event_rx: mpsc::UnboundedReceiver<NodeEvent>,
@@ -68,6 +71,9 @@ impl Node {
         let chain = Arc::new(RwLock::new(chain));
         let mempool = Arc::new(RwLock::new(Mempool::new()));
 
+        // Optionally load the wallet
+        let wallet = load_wallet(&args, Arc::clone(&db));
+
         // Create peer manager
         let (node_event_tx, node_event_rx) = mpsc::unbounded_channel();
         let pm_config = PeerManagerConfig {
@@ -84,6 +90,7 @@ impl Node {
             db,
             chain,
             mempool,
+            wallet,
             ibd: IbdState::new(),
             peer_manager,
             node_event_rx,
@@ -103,6 +110,7 @@ impl Node {
             mempool: Arc::clone(&self.mempool),
             db: Arc::clone(&self.db),
             network_name: self.args.network.to_string(),
+            wallet: self.wallet.as_ref().map(Arc::clone),
         };
         tokio::spawn(async move {
             if let Err(e) = start_rpc_server(&rpc_addr, rpc_state).await {
@@ -494,6 +502,13 @@ impl Node {
                     mp.remove_confirmed(&txids);
                 }
 
+                // Update wallet UTXO tracking (incremental block scan)
+                if let Some(wallet) = &self.wallet {
+                    let mut w = wallet.write().await;
+                    w.scan_block(&block, height);
+                    w.remove_spent(&block);
+                }
+
                 // Update peer manager's best height
                 self.peer_manager.set_best_height(height as i32);
 
@@ -726,6 +741,58 @@ impl Node {
         info!(
             "height={height} peers={peers} best_peer={best_peer_height} utxos={utxos} mempool={mp_size}"
         );
+    }
+}
+
+// ── Wallet initialisation ─────────────────────────────────────────────────────
+
+fn load_wallet(args: &Args, db: Arc<Database>) -> Option<Arc<RwLock<Wallet>>> {
+    if args.wallet.is_none() && !args.create_wallet {
+        return None;
+    }
+
+    let passphrase = &args.wallet_passphrase;
+
+    if args.create_wallet {
+        // Generate a new mnemonic, print it, and initialise the wallet
+        match rbtc_wallet::Mnemonic::generate(12) {
+            Ok(mnemonic) => {
+                println!("=== NEW WALLET MNEMONIC (keep this safe!) ===");
+                println!("{}", mnemonic.phrase());
+                println!("==============================================");
+                match Wallet::from_mnemonic(&mnemonic, "", passphrase, args.network, db) {
+                    Ok(w) => {
+                        info!("new wallet created");
+                        return Some(Arc::new(RwLock::new(w)));
+                    }
+                    Err(e) => {
+                        error!("failed to create wallet: {e}");
+                        return None;
+                    }
+                }
+            }
+            Err(e) => {
+                error!("failed to generate mnemonic: {e}");
+                return None;
+            }
+        }
+    }
+
+    // Try to load existing wallet
+    if Wallet::exists(&db) {
+        match Wallet::load(passphrase, args.network, db) {
+            Ok(w) => {
+                info!("wallet loaded");
+                Some(Arc::new(RwLock::new(w)))
+            }
+            Err(e) => {
+                error!("failed to load wallet: {e}");
+                None
+            }
+        }
+    } else {
+        info!("no wallet found at data directory (use --create-wallet to create one)");
+        None
     }
 }
 

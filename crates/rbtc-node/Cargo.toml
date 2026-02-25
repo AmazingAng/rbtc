@@ -16,6 +16,7 @@ rbtc-consensus  = { workspace = true }
 rbtc-storage    = { workspace = true }
 rbtc-net        = { workspace = true }
 rbtc-mempool    = { workspace = true }
+rbtc-wallet     = { workspace = true }
 tokio           = { workspace = true }
 clap            = { workspace = true }
 tracing         = { workspace = true }

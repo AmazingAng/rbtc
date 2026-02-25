@@ -1,0 +1,29 @@
+[package]
+name    = "rbtc-wallet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rbtc-primitives = { workspace = true }
+rbtc-crypto     = { workspace = true }
+rbtc-storage    = { workspace = true }
+
+secp256k1  = { workspace = true }
+sha2       = { workspace = true }
+hmac       = { workspace = true }
+pbkdf2     = { workspace = true }
+bip39      = { workspace = true }
+bech32     = { workspace = true }
+bs58       = { workspace = true }
+rand       = { workspace = true }
+aes-gcm    = { workspace = true }
+
+serde      = { workspace = true }
+serde_json = { workspace = true }
+hex        = { workspace = true }
+thiserror  = { workspace = true }
+tracing    = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

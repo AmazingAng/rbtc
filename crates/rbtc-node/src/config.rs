@@ -45,6 +45,19 @@ pub struct Args {
     /// Connect to only these nodes (disables all other connection attempts)
     #[arg(long = "connect", value_name = "HOST:PORT")]
     pub connect_only: Vec<String>,
+
+    /// Path to the wallet file (defaults to $datadir/wallet.dat).
+    /// If not specified the node runs without a wallet.
+    #[arg(long, value_name = "FILE")]
+    pub wallet: Option<std::path::PathBuf>,
+
+    /// Passphrase for wallet encryption / decryption.
+    #[arg(long, value_name = "PASS", default_value = "")]
+    pub wallet_passphrase: String,
+
+    /// Generate a new wallet and print the mnemonic, then exit.
+    #[arg(long)]
+    pub create_wallet: bool,
 }
 
 impl Args {

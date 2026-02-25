@@ -7,6 +7,7 @@ members = [
     "crates/rbtc-storage",
     "crates/rbtc-net",
     "crates/rbtc-mempool",
+    "crates/rbtc-wallet",
     "crates/rbtc-node",
 ]
 resolver = "2"
@@ -26,11 +27,25 @@ rbtc-consensus  = { path = "crates/rbtc-consensus" }
 rbtc-storage    = { path = "crates/rbtc-storage" }
 rbtc-net        = { path = "crates/rbtc-net" }
 rbtc-mempool    = { path = "crates/rbtc-mempool" }
+rbtc-wallet     = { path = "crates/rbtc-wallet" }
 
 # Cryptography
 secp256k1 = { version = "0.31", features = ["global-context"] }
 sha2      = "0.10"
-ripemd = "0.2.0-rc.5"
+ripemd    = "0.2.0-rc.5"
+hmac      = "0.12"
+pbkdf2    = "0.12"
+
+# HD Wallet
+bip39  = "2"
+bech32 = "0.11"
+bs58   = { version = "0.5", features = ["check"] }
+
+# Randomness
+rand = "0.8"
+
+# Encryption
+aes-gcm = "0.10"
 
 # Async / networking
 tokio = { version = "1", features = ["full"] }

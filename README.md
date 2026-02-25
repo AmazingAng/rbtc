@@ -1,6 +1,6 @@
 # rbtc — Bitcoin Core in Rust
 
-A from-scratch implementation of Bitcoin Core's consensus and P2P networking layer, written in Rust. No `bitcoin` crate — all protocol types, encoding, and validation are implemented independently.
+A from-scratch implementation of Bitcoin Core's consensus, P2P networking, and HD wallet, written in Rust. No `bitcoin` crate — all protocol types, encoding, validation, and key derivation are implemented independently.
 
 ## Architecture
 
@@ -11,9 +11,10 @@ rbtc/
 │   ├── rbtc-crypto/       # SHA256d, RIPEMD-160, Merkle tree, ECDSA/Schnorr, sighash
 │   ├── rbtc-script/       # Bitcoin Script interpreter (~180 opcodes, SegWit, Taproot)
 │   ├── rbtc-consensus/    # PoW, difficulty adjustment, UTXO set, block/tx validation
-│   ├── rbtc-storage/      # RocksDB: block index, UTXO store, undo data, chain state
+│   ├── rbtc-storage/      # RocksDB: block index, UTXO store, undo data, chain state, wallet
 │   ├── rbtc-mempool/      # Transaction pool: validation, fee rate, relay, chained txs
 │   ├── rbtc-net/          # P2P: wire protocol, peer management (tokio), IBD
+│   ├── rbtc-wallet/       # HD wallet: BIP32/39, address generation, UTXO tracking, signing
 │   └── rbtc-node/         # Binary: node loop, JSON-RPC server, config
 ```
 
@@ -36,20 +37,40 @@ rbtc/
 - **JSON-RPC server**: HTTP/JSON-RPC endpoint (axum-based) compatible with Bitcoin Core's interface
 - **Chain reorganization**: Per-block undo data persisted to `CF_UNDO`; full reorg support via `reorganize_to()`
 
+### Phase 3 — Built-in HD Wallet
+- **BIP39 mnemonics**: 12/24-word mnemonic generation from OS entropy; phrase import and BIP39 seed derivation (PBKDF2-HMAC-SHA512)
+- **BIP32 HD derivation**: Full hierarchical deterministic key derivation with hardened and normal children; `DerivationPath` parser (`m/84'/0'/0'/0/3`)
+- **Three address types**:
+  - P2PKH (Legacy, BIP44 path `m/44'/coin'/…`) — `1…` / `m…` Base58Check addresses
+  - P2WPKH (Native SegWit, BIP84 path `m/84'/coin'/…`) — `bc1q…` / `bcrt1q…` bech32 addresses
+  - P2TR (Taproot, BIP86 path `m/86'/coin'/…`) — `bc1p…` / `bcrt1p…` bech32m addresses with proper TapTweak
+- **WIF encoding/decoding**: Import/export private keys in Wallet Import Format
+- **Incremental UTXO scanning**: `scan_block()` and `remove_spent()` hooks in `handle_block()` keep wallet UTXOs in sync with no full-rescan
+- **Transaction building**: `CoinSelector` (greedy largest-first), `TxBuilder`, and `sign_transaction()` producing valid Legacy/SegWit/Taproot signatures
+- **AES-256-GCM wallet encryption**: xprv encrypted with a PBKDF2-derived key; public keys and addresses stored in plaintext for scanning
+- **Wallet RPC methods**: `getnewaddress`, `getbalance`, `listunspent`, `sendtoaddress`, `fundrawtransaction`, `signrawtransactionwithwallet`, `dumpprivkey`, `importprivkey`, `getwalletinfo`
+
 ## Dependencies
 
 | Crate | Purpose |
 |-------|---------|
-| `secp256k1 = "0.31"` | ECDSA + Schnorr (BIP340) signature verification |
+| `secp256k1 = "0.31"` | ECDSA + Schnorr (BIP340) signing and verification |
 | `sha2 = "0.10"` | SHA-256 |
-| `ripemd = "0.2.0-rc.5"` | RIPEMD-160 |
-| `rocksdb = "0.22"` | Persistent block index, UTXO store, undo data |
+| `ripemd = "0.2.0-rc.5"` | RIPEMD-160 (hash160 for addresses) |
+| `hmac = "0.12"` | HMAC-SHA512 for BIP32 child key derivation |
+| `pbkdf2 = "0.12"` | PBKDF2-HMAC-SHA512 for BIP39 seeds; PBKDF2-HMAC-SHA256 for wallet key encryption |
+| `bip39 = "2"` | BIP39 mnemonic phrase generation and parsing |
+| `bech32 = "0.11"` | bech32 (P2WPKH) and bech32m (P2TR) address encoding |
+| `bs58 = "0.5"` | Base58Check for P2PKH addresses and WIF private keys |
+| `aes-gcm = "0.10"` | AES-256-GCM authenticated encryption for xprv storage |
+| `rand = "0.8"` | OS randomness (entropy for mnemonics, Taproot aux_rand) |
+| `rocksdb = "0.22"` | Persistent block index, UTXO store, undo data, wallet data |
 | `tokio = "1"` | Async P2P networking and RPC server |
 | `axum = "0.8"` | JSON-RPC HTTP server |
 | `clap = "4"` | CLI argument parsing |
 | `tracing` | Structured logging |
 
-**Not used**: `bitcoin` crate — all protocol types and encoding are implemented from scratch.
+**Not used**: `bitcoin` crate — all protocol types, encoding, and key derivation are implemented from scratch.
 
 ## Usage
 
@@ -69,8 +90,13 @@ cargo build --release
 # Custom data directory and RPC port
 ./target/release/rbtc --datadir /mnt/bitcoin --rpc-port 8332
 
-# Run on testnet4
-./target/release/rbtc --network testnet4
+# --- Wallet ---
+
+# Create a new wallet (generates mnemonic, prints it, then runs the node)
+./target/release/rbtc --network regtest --create-wallet --wallet-passphrase "my secret"
+
+# Run node with an existing wallet (unlocked for RPC use)
+./target/release/rbtc --network regtest --wallet --wallet-passphrase "my secret"
 
 # Show all options
 ./target/release/rbtc --help
@@ -89,6 +115,9 @@ cargo build --release
 | `--no-dns-seeds` | — | Disable automatic DNS seed lookup |
 | `--max-outbound` | `8` | Maximum outbound peer connections |
 | `--log-level` | `info` | Log level: `trace`, `debug`, `info`, `warn`, `error` |
+| `--wallet` | — | Enable wallet (loads from datadir DB) |
+| `--wallet-passphrase` | `""` | AES-256-GCM passphrase for xprv encryption |
+| `--create-wallet` | — | Generate a fresh wallet, print the mnemonic, then run |
 
 ### Environment Variables
 
@@ -112,12 +141,17 @@ curl -s -d '{"method":"getblockchaininfo","params":[]}' http://127.0.0.1:8332/
 HASH=$(curl -s -d '{"method":"getblockhash","params":[0]}' http://127.0.0.1:8332/ | python3 -c "import sys,json; print(json.load(sys.stdin)['result'])")
 curl -s -d "{\"method\":\"getblock\",\"params\":[\"$HASH\",1]}" http://127.0.0.1:8332/
 
-# List mempool transactions
-curl -s -d '{"method":"getrawmempool","params":[]}' http://127.0.0.1:8332/
+# Wallet: generate a new address (requires --wallet / --create-wallet)
+curl -s -d '{"method":"getnewaddress","params":["","bech32"]}' http://127.0.0.1:8332/
 
-# Broadcast a raw transaction
-curl -s -d '{"method":"sendrawtransaction","params":["<hex>"]}' http://127.0.0.1:8332/
+# Wallet: check balance
+curl -s -d '{"method":"getbalance","params":[]}' http://127.0.0.1:8332/
+
+# Wallet: send to an address (builds, signs, and broadcasts)
+curl -s -d '{"method":"sendtoaddress","params":["bc1q...","0.001"]}' http://127.0.0.1:8332/
 ```
+
+### Chain & Mempool Methods
 
 | Method | Parameters | Returns |
 |--------|-----------|---------|
@@ -128,6 +162,20 @@ curl -s -d '{"method":"sendrawtransaction","params":["<hex>"]}' http://127.0.0.1
 | `getrawtransaction` | `txid` | Transaction from mempool (hex or json) |
 | `getrawmempool` | — | List of txids sorted by fee rate |
 | `sendrawtransaction` | `hex` | Validates and relays a raw transaction |
+
+### Wallet Methods (require `--wallet` or `--create-wallet`)
+
+| Method | Parameters | Returns |
+|--------|-----------|---------|
+| `getnewaddress` | `[label, type]` `type` = `legacy` / `bech32` / `bech32m` | New address string |
+| `getbalance` | — | `{confirmed, unconfirmed, total}` in BTC |
+| `listunspent` | `[minconf]` | Array of wallet UTXOs |
+| `sendtoaddress` | `address, amount, [fee_rate]` | txid of broadcast transaction |
+| `fundrawtransaction` | `hex, [{"feeRate": N}]` | `{hex, fee, changepos}` |
+| `signrawtransactionwithwallet` | `hex` | `{hex, complete}` |
+| `dumpprivkey` | `address` | WIF private key |
+| `importprivkey` | `wif, [label]` | Imported address string |
+| `getwalletinfo` | — | `{balance, unconfirmed_balance, txcount, keypoolsize}` |
 
 ## Implementation Notes
 
@@ -163,6 +211,15 @@ curl -s -d '{"method":"sendrawtransaction","params":["<hex>"]}' http://127.0.0.1
 - Inbound TCP listener: accepts peers up to `max_inbound` (default 125)
 - Peer cmd_tx registration: command channel properly associated before first message
 
+### HD Wallet (`rbtc-wallet`)
+
+- **BIP39**: `Mnemonic::generate(12|24)` uses OS entropy via `rand::rngs::OsRng`; `to_seed(passphrase)` runs PBKDF2-HMAC-SHA512 (2048 iterations)
+- **BIP32**: `ExtendedPrivKey::from_seed()` seeds with HMAC-SHA512("Bitcoin seed", seed); child derivation via `add_tweak(il_scalar)` for private keys and `add_exp_tweak` for public keys
+- **Addresses**: P2PKH via Base58Check; P2WPKH via `bech32::segwit::encode(hrp, v0, hash160)`; P2TR via TapTweak (`tagged_hash("TapTweak", xonly)`) + `bech32m::encode(hrp, v1, output_key)`
+- **Signing**: ECDSA for P2PKH/P2WPKH via `secp.sign_ecdsa(msg, &sk)`; Schnorr for P2TR key-path via `secp.sign_schnorr_with_aux_rand(&sighash_bytes, &tweaked_keypair, &random_aux_rand)`
+- **Encryption**: xprv bytes encrypted with AES-256-GCM; key = PBKDF2-SHA256(passphrase, 16-byte salt, 100,000 iterations); stored as `salt || nonce || ciphertext+tag` in `CF_WALLET`
+- **Incremental UTXO scanning**: After each block is connected, `Wallet::scan_block()` checks every TxOut's scriptPubKey against the in-memory `script_to_addr` map (O(outputs)); `remove_spent()` checks TxIn outpoints against `wallet.utxos`
+
 ### Storage Layer (`rbtc-storage`)
 
 Column families in RocksDB:
@@ -175,6 +232,7 @@ Column families in RocksDB:
 | `chain_state` | Best block hash, height, chainwork |
 | `undo` | Per-block spent UTXO list (enables reorg without resync) |
 | `tx_index` | Reserved for future transaction index |
+| `wallet` | Encrypted xprv, address→pubkey map, wallet UTXOs (JSON-encoded) |
 
 ### Restart Recovery
 
@@ -200,7 +258,7 @@ When a competing chain with more cumulative work is detected, `reorganize_to(new
 cargo test --workspace
 ```
 
-170 tests across all crates — all pass.
+201 tests across all crates — all pass.
 
 | Crate | Tests |
 |-------|-------|
@@ -211,7 +269,7 @@ cargo test --workspace
 | `rbtc-storage` | 11 |
 | `rbtc-mempool` | 4 |
 | `rbtc-net` | 6 |
-| `rbtc-node` | 4 |
+| `rbtc-wallet` | 35 |
 
 ### Integration Tests Against Bitcoin Core
 
@@ -271,3 +329,5 @@ cargo llvm-cov --workspace --all-features --tests --lcov --output-path lcov.info
 - Signet challenge validation not implemented
 - Mempool eviction policy not yet implemented (no size cap)
 - `sendrawtransaction` relay requires script-valid inputs (P2PKH etc.); bare scripts that rely on policy flags may differ from Bitcoin Core behavior
+- Wallet imported keys (via `importprivkey`) are cached only for the current session; WIF keys are not re-derived from the master xprv
+- `fundrawtransaction` uses a greedy (largest-first) coin selector; Branch-and-Bound selection is a future improvement
