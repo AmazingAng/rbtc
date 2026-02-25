@@ -47,6 +47,9 @@ pub struct Node {
     /// Optional HD wallet, shared with the RPC server via Arc<RwLock>
     wallet: Option<Arc<RwLock<Wallet>>>,
     ibd: IbdState,
+    /// Canonical header chain built from block_index when entering block-download
+    /// phase. Maps height → block hash. Empty until all headers are downloaded.
+    canonical_header_chain: Vec<Hash256>,
     peer_manager: PeerManager,
     node_event_rx: mpsc::UnboundedReceiver<NodeEvent>,
     /// Sender half given to the RPC server for `submitblock` / `generatetoaddress`.
@@ -125,6 +128,7 @@ impl Node {
             mempool,
             wallet,
             ibd: IbdState::new(),
+            canonical_header_chain: Vec::new(),
             peer_manager,
             node_event_rx,
             submit_block_tx,
@@ -175,6 +179,9 @@ impl Node {
         // Tick frequently during IBD so we keep the block-download pipeline full.
         let mut ibd_timer = tokio::time::interval(Duration::from_secs(1));
         let mut persist_timer = tokio::time::interval(Duration::from_secs(5 * 60));
+        // Retry DNS seeds if we have no peers (e.g. after all connections drop).
+        let mut seed_retry_timer = tokio::time::interval(Duration::from_secs(60));
+        seed_retry_timer.tick().await; // consume the immediate first tick
 
         loop {
             tokio::select! {
@@ -190,6 +197,13 @@ impl Node {
 
                 _ = persist_timer.tick() => {
                     self.persist_peer_addrs();
+                }
+
+                _ = seed_retry_timer.tick() => {
+                    if self.peer_manager.peer_count() == 0 && !self.args.no_dns_seeds {
+                        info!("no peers; retrying DNS seeds");
+                        self.peer_manager.connect_to_seeds().await;
+                    }
                 }
             }
         }
@@ -372,10 +386,45 @@ impl Node {
             );
         } else {
             self.ibd.phase = IbdPhase::Blocks;
+            // Build canonical header chain from block_index so download_blocks
+            // can enumerate which blocks to fetch in order.
+            self.build_canonical_header_chain().await;
             self.download_blocks(peer_id).await;
         }
 
         Ok(())
+    }
+
+    /// Walk block_index backwards from the best-chainwork tip to build a
+    /// height-indexed vec of canonical hashes.  Called once when header sync
+    /// is complete and we switch to the block-download phase.
+    async fn build_canonical_header_chain(&mut self) {
+        let chain = self.chain.read().await;
+        let best = chain
+            .block_index
+            .values()
+            .max_by_key(|bi| bi.chainwork);
+        let Some(tip) = best else { return };
+        let tip_height = tip.height as usize;
+        let mut canonical = vec![Hash256::ZERO; tip_height + 1];
+        let mut cur = tip.hash;
+        loop {
+            let bi = match chain.block_index.get(&cur) {
+                Some(b) => b,
+                None => break,
+            };
+            canonical[bi.height as usize] = cur;
+            if bi.height == 0 {
+                break;
+            }
+            cur = bi.header.prev_block;
+        }
+        drop(chain);
+        info!(
+            "canonical header chain built: {} headers",
+            canonical.len()
+        );
+        self.canonical_header_chain = canonical;
     }
 
     // ── BIP152 Compact Block handlers ─────────────────────────────────────────
@@ -517,7 +566,19 @@ impl Node {
         let mut current_height = chain.height() + 1;
         let mut hashes = Vec::new();
 
-        while let Some(hash) = chain.get_ancestor_hash(current_height) {
+        loop {
+            // Prefer connected active_chain; fall back to canonical_header_chain
+            // during IBD before any blocks have been validated.
+            let hash = chain
+                .get_ancestor_hash(current_height)
+                .or_else(|| {
+                    self.canonical_header_chain
+                        .get(current_height as usize)
+                        .copied()
+                        .filter(|h| *h != Hash256::ZERO)
+                });
+            let Some(hash) = hash else { break };
+
             if chain
                 .block_index
                 .get(&hash)
@@ -967,8 +1028,19 @@ impl Node {
     async fn request_headers(&self, peer_id: u64) {
         let chain = self.chain.read().await;
         let height = chain.height();
-        let locator = build_locator(height, |h| chain.get_ancestor_hash(h));
+        let network = chain.network;
+        let mut locator = build_locator(height, |h| chain.get_ancestor_hash(h));
         drop(chain);
+
+        // Always ensure genesis hash is in the locator so peers know where to
+        // start. This matters at height=0 when active_chain is empty but the
+        // genesis header has already been seeded into block_index.
+        if let Ok(genesis) = Hash256::from_hex(network.genesis_hash()) {
+            if !locator.contains(&genesis) {
+                locator.push(genesis);
+            }
+        }
+
         self.peer_manager.send_to(
             peer_id,
             NetworkMessage::GetHeaders(rbtc_net::message::GetBlocksMessage::new(locator)),
