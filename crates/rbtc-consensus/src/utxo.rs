@@ -86,6 +86,32 @@ impl UtxoSet {
         }
     }
 
+    /// Directly insert a UTXO (used when loading from persistent storage).
+    pub fn insert(&mut self, outpoint: OutPoint, utxo: Utxo) {
+        self.coins.insert(outpoint, utxo);
+    }
+
+    /// Like `connect_block` but also returns per-tx undo data (spent UTXOs per tx).
+    /// Index `i` of the returned Vec corresponds to tx `i`; coinbase entries are empty.
+    pub fn connect_block_with_undo(
+        &mut self,
+        txids: &[TxId],
+        txs: &[Transaction],
+        height: u32,
+    ) -> Vec<Vec<(OutPoint, Utxo)>> {
+        let mut undo: Vec<Vec<(OutPoint, Utxo)>> = Vec::with_capacity(txs.len());
+        for (txid, tx) in txids.iter().zip(txs.iter()) {
+            let spent = if tx.is_coinbase() {
+                Vec::new()
+            } else {
+                self.spend_tx(tx)
+            };
+            undo.push(spent);
+            self.add_tx(*txid, tx, height);
+        }
+        undo
+    }
+
     pub fn len(&self) -> usize {
         self.coins.len()
     }

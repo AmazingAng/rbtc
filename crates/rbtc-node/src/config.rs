@@ -38,6 +38,10 @@ pub struct Args {
     #[arg(long, default_value = "info")]
     pub log_level: String,
 
+    /// JSON-RPC server port (0 = disabled)
+    #[arg(long, default_value = "8332")]
+    pub rpc_port: u16,
+
     /// Connect to only these nodes (disables all other connection attempts)
     #[arg(long = "connect", value_name = "HOST:PORT")]
     pub connect_only: Vec<String>,

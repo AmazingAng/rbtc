@@ -1,5 +1,5 @@
 [package]
-name    = "rbtc-net"
+name    = "rbtc-mempool"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,11 +8,6 @@ license.workspace = true
 rbtc-primitives = { workspace = true }
 rbtc-crypto     = { workspace = true }
 rbtc-consensus  = { workspace = true }
-tokio           = { workspace = true }
-bytes           = { workspace = true }
+rbtc-script     = { workspace = true }
 thiserror       = { workspace = true }
 tracing         = { workspace = true }
-anyhow          = { workspace = true }
-
-[dev-dependencies]
-tokio   = { workspace = true }

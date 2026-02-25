@@ -1,11 +1,11 @@
 use rbtc_primitives::{
     block::{Block, BlockHeader},
     codec::{Decodable, Encodable},
-    hash::BlockHash,
+    hash::{BlockHash, Hash256},
 };
 
 use crate::{
-    db::{Database, CF_BLOCK_DATA, CF_BLOCK_INDEX},
+    db::{Database, CF_BLOCK_DATA, CF_BLOCK_INDEX, CF_UNDO},
     error::{Result, StorageError},
 };
 
@@ -102,6 +102,35 @@ impl<'db> BlockStore<'db> {
 
     pub fn has_index(&self, hash: &BlockHash) -> Result<bool> {
         Ok(self.db.get_cf(CF_BLOCK_INDEX, &hash.0)?.is_some())
+    }
+
+    /// Iterate all stored block index entries (sorted by key / hash order, not height).
+    /// Call `.sort_by_key(|(_, idx)| idx.height)` on the result before rebuilding ChainState.
+    pub fn iter_all_indices(&self) -> Vec<(BlockHash, StoredBlockIndex)> {
+        match self.db.iter_cf(CF_BLOCK_INDEX) {
+            Ok(iter) => iter
+                .filter_map(|(k, v)| {
+                    if k.len() != 32 {
+                        return None;
+                    }
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&k);
+                    let idx = StoredBlockIndex::decode_bytes(&v).ok()?;
+                    Some((Hash256(arr), idx))
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    // ── Undo data (spent UTXOs per block, needed for reorg) ───────────────────
+
+    pub fn put_undo(&self, hash: &BlockHash, undo_bytes: &[u8]) -> Result<()> {
+        self.db.put_cf(CF_UNDO, &hash.0, undo_bytes)
+    }
+
+    pub fn get_undo(&self, hash: &BlockHash) -> Result<Option<Vec<u8>>> {
+        self.db.get_cf(CF_UNDO, &hash.0)
     }
 }
 

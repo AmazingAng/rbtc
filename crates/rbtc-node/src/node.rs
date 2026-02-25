@@ -1,28 +1,40 @@
 use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, RwLock};
 use tracing::{error, info, warn};
 
-use rbtc_consensus::chain::{ChainState, header_hash};
+use rbtc_consensus::{
+    block_verify::{verify_block, BlockValidationContext},
+    chain::{BlockIndex, BlockStatus, ChainState, header_hash},
+};
+use rbtc_crypto::sha256d;
+use rbtc_mempool::Mempool;
 use rbtc_net::{
     message::{Inventory, InvType, NetworkMessage},
     peer_manager::{NodeEvent, PeerManager, PeerManagerConfig},
 };
 use rbtc_primitives::hash::Hash256;
 use rbtc_script::ScriptFlags;
-use rbtc_storage::{BlockStore, ChainStore, Database};
+use rbtc_storage::{
+    encode_block_undo, decode_block_undo, BlockStore, ChainStore, Database, StoredBlockIndex,
+    StoredUtxo, UtxoStore,
+};
 
 use crate::{
     config::Args,
     ibd::{build_locator, IbdPhase, IbdState},
+    rpc::{start_rpc_server, RpcState},
 };
 
 /// The main Bitcoin node
 pub struct Node {
     args: Args,
     db: Arc<Database>,
-    chain: ChainState,
+    /// Chain state, shared with the RPC server via Arc<RwLock>
+    chain: Arc<RwLock<ChainState>>,
+    /// Mempool, shared with the RPC server via Arc<RwLock>
+    mempool: Arc<RwLock<Mempool>>,
     ibd: IbdState,
     peer_manager: PeerManager,
     node_event_rx: mpsc::UnboundedReceiver<NodeEvent>,
@@ -41,10 +53,9 @@ impl Node {
             Database::open(&db_path)
                 .with_context(|| format!("failed to open database at {db_path:?}"))?,
         );
-
         info!("database opened at {db_path:?}");
 
-        // Load or initialize chain state
+        // Load or initialize chain state from persistent storage
         let mut chain = ChainState::new(args.network);
         load_chain_state(&mut chain, &db)?;
 
@@ -54,19 +65,25 @@ impl Node {
             chain.best_hash().map(|h| h.to_hex())
         );
 
+        let chain = Arc::new(RwLock::new(chain));
+        let mempool = Arc::new(RwLock::new(Mempool::new()));
+
         // Create peer manager
         let (node_event_tx, node_event_rx) = mpsc::unbounded_channel();
         let pm_config = PeerManagerConfig {
             network: args.network,
             max_outbound: args.max_outbound,
+            listen_port: args.listen_port,
             ..Default::default()
         };
-        let peer_manager = PeerManager::new(pm_config, node_event_tx, chain.height() as i32);
+        let current_height = chain.read().await.height() as i32;
+        let peer_manager = PeerManager::new(pm_config, node_event_tx, current_height);
 
         Ok(Self {
             args,
             db,
             chain,
+            mempool,
             ibd: IbdState::new(),
             peer_manager,
             node_event_rx,
@@ -75,6 +92,23 @@ impl Node {
 
     pub async fn run(mut self) -> Result<()> {
         info!("starting node on network: {}", self.args.network);
+
+        // Start inbound connection listener if a port is configured
+        self.peer_manager.start_inbound_listener().await.ok();
+
+        // Start JSON-RPC server
+        let rpc_addr = format!("127.0.0.1:{}", self.args.rpc_port);
+        let rpc_state = RpcState {
+            chain: Arc::clone(&self.chain),
+            mempool: Arc::clone(&self.mempool),
+            db: Arc::clone(&self.db),
+            network_name: self.args.network.to_string(),
+        };
+        tokio::spawn(async move {
+            if let Err(e) = start_rpc_server(&rpc_addr, rpc_state).await {
+                error!("RPC server error: {e}");
+            }
+        });
 
         // Connect to seeds / explicit nodes
         if !self.args.connect_only.is_empty() {
@@ -96,15 +130,12 @@ impl Node {
 
         loop {
             tokio::select! {
-                // Process peer events
                 _ = self.process_pending_events() => {}
 
-                // Periodic stats logging
                 _ = stats_timer.tick() => {
-                    self.log_stats();
+                    self.log_stats().await;
                 }
 
-                // IBD progress / stall detection
                 _ = ibd_timer.tick() => {
                     self.check_ibd_progress().await;
                 }
@@ -113,7 +144,6 @@ impl Node {
     }
 
     async fn process_pending_events(&mut self) {
-        // Drain all pending events
         self.peer_manager.process_events().await;
 
         while let Ok(event) = self.node_event_rx.try_recv() {
@@ -129,11 +159,10 @@ impl Node {
         match event {
             NodeEvent::PeerConnected { peer_id, addr, best_height } => {
                 info!("peer {peer_id} connected from {addr}, height={best_height}");
-
-                // Kick off IBD if we're behind
-                if best_height > self.chain.height() as i32 && self.ibd.sync_peer.is_none() {
+                let our_height = self.chain.read().await.height() as i32;
+                if best_height > our_height && self.ibd.sync_peer.is_none() {
                     self.ibd.sync_peer = Some(peer_id);
-                    self.request_headers(peer_id);
+                    self.request_headers(peer_id).await;
                 }
             }
 
@@ -141,10 +170,9 @@ impl Node {
                 info!("peer {peer_id} disconnected");
                 if self.ibd.sync_peer == Some(peer_id) {
                     self.ibd.sync_peer = None;
-                    // Find another peer to sync from
                     if let Some(new_peer) = self.peer_manager.best_peer() {
                         self.ibd.sync_peer = Some(new_peer);
-                        self.request_headers(new_peer);
+                        self.request_headers(new_peer).await;
                     }
                 }
             }
@@ -156,24 +184,26 @@ impl Node {
             }
 
             NodeEvent::BlockReceived { peer_id, block } => {
-                let height = self.chain.height();
+                let height = self.chain.read().await.height();
                 info!("received block from peer {peer_id}, our height={height}");
                 self.handle_block(peer_id, block).await?;
             }
 
             NodeEvent::TxReceived { peer_id, tx } => {
-                // Basic mempool acceptance (not implemented yet)
-                let txid = rbtc_crypto::sha256d(&tx_legacy_bytes(&tx));
-                info!("received tx {} from peer {peer_id}", txid.to_hex());
+                self.handle_tx(peer_id, tx).await;
             }
 
             NodeEvent::InvReceived { peer_id, items } => {
-                // Request any blocks/txs we don't have
                 let mut to_request: Vec<Inventory> = Vec::new();
+                let mut tx_to_request: Vec<Inventory> = Vec::new();
+
+                let chain = self.chain.read().await;
+                let mp = self.mempool.read().await;
+
                 for item in items {
                     match item.inv_type {
                         InvType::Block | InvType::WitnessBlock => {
-                            if !self.chain.block_index.contains_key(&item.hash) {
+                            if !chain.block_index.contains_key(&item.hash) {
                                 to_request.push(Inventory {
                                     inv_type: InvType::WitnessBlock,
                                     hash: item.hash,
@@ -181,13 +211,26 @@ impl Node {
                             }
                         }
                         InvType::Tx | InvType::WitnessTx => {
-                            // Could request txs for mempool; skip for now
+                            if !mp.contains(&item.hash) {
+                                tx_to_request.push(Inventory {
+                                    inv_type: InvType::WitnessTx,
+                                    hash: item.hash,
+                                });
+                            }
                         }
                         _ => {}
                     }
                 }
+                drop(chain);
+                drop(mp);
+
                 if !to_request.is_empty() {
-                    self.peer_manager.send_to(peer_id, NetworkMessage::GetData(to_request));
+                    self.peer_manager
+                        .send_to(peer_id, NetworkMessage::GetData(to_request));
+                }
+                if !tx_to_request.is_empty() {
+                    self.peer_manager
+                        .send_to(peer_id, NetworkMessage::GetData(tx_to_request));
                 }
             }
         }
@@ -195,48 +238,59 @@ impl Node {
         Ok(())
     }
 
-    async fn handle_headers(&mut self, peer_id: u64, headers: Vec<rbtc_primitives::block::BlockHeader>) -> Result<()> {
+    async fn handle_headers(
+        &mut self,
+        peer_id: u64,
+        headers: Vec<rbtc_primitives::block::BlockHeader>,
+    ) -> Result<()> {
         if headers.is_empty() {
-            // We're caught up with this peer
             if self.ibd.phase == IbdPhase::Headers {
                 self.ibd.phase = IbdPhase::Blocks;
                 info!("IBD: entering block download phase");
-                // Request blocks for all known headers
                 self.download_blocks(peer_id).await;
             }
             return Ok(());
         }
 
         let last_header = headers.last().cloned();
+        let block_store = BlockStore::new(&self.db);
+        let mut chain = self.chain.write().await;
 
-        // Add headers to our index
         for header in &headers {
-            let _hash = header_hash(header);
-            match self.chain.add_header(header.clone()) {
-                Ok(_) => {}
+            match chain.add_header(header.clone()) {
+                Ok(hash) => {
+                    // Persist the header to block_store if it's new
+                    if block_store.get_index(&hash).ok().flatten().is_none() {
+                        if let Some(bi) = chain.get_block_index(&hash) {
+                            let stored = StoredBlockIndex {
+                                header: header.clone(),
+                                height: bi.height,
+                                chainwork_lo: bi.chainwork as u64,
+                                chainwork_hi: (bi.chainwork >> 64) as u64,
+                                status: bi.status.as_u8(),
+                            };
+                            block_store.put_index(&hash, &stored).ok();
+                        }
+                    }
+                }
                 Err(e) => {
-                    warn!("header validation error from peer {peer_id}: {e}");
-                    // Don't break – might just be a fork
+                    warn!("header from peer {peer_id}: {e}");
                 }
             }
         }
+        drop(chain);
 
-        // Request more headers
         if headers.len() == 2000 {
-            // Bitcoin sends up to 2000 headers at a time; if we got 2000, request more
             let last_hash = last_header.map(|h| header_hash(&h)).unwrap_or(Hash256::ZERO);
             self.peer_manager.send_to(
                 peer_id,
-                NetworkMessage::GetHeaders(
-                    rbtc_net::message::GetBlocksMessage {
-                        version: 70016,
-                        locator_hashes: vec![last_hash],
-                        stop_hash: Hash256::ZERO,
-                    },
-                ),
+                NetworkMessage::GetHeaders(rbtc_net::message::GetBlocksMessage {
+                    version: 70016,
+                    locator_hashes: vec![last_hash],
+                    stop_hash: Hash256::ZERO,
+                }),
             );
         } else {
-            // Fewer than 2000 – we have all headers up to their tip
             self.ibd.phase = IbdPhase::Blocks;
             self.download_blocks(peer_id).await;
         }
@@ -245,14 +299,15 @@ impl Node {
     }
 
     async fn download_blocks(&mut self, peer_id: u64) {
-        // Find blocks in our index that we don't have in the UTXO chain yet
-        // Start from our current tip height + 1
-        let mut current_height = self.chain.height() + 1;
+        let chain = self.chain.read().await;
+        let mut current_height = chain.height() + 1;
         let mut hashes = Vec::new();
 
-        while let Some(hash) = self.chain.get_ancestor_hash(current_height) {
-            if self.chain.block_index.get(&hash)
-                .map(|bi| bi.status == rbtc_consensus::chain::BlockStatus::InChain)
+        while let Some(hash) = chain.get_ancestor_hash(current_height) {
+            if chain
+                .block_index
+                .get(&hash)
+                .map(|bi| bi.status == BlockStatus::InChain)
                 .unwrap_or(false)
             {
                 current_height += 1;
@@ -264,80 +319,193 @@ impl Node {
             }
             current_height += 1;
         }
+        drop(chain);
 
         if !hashes.is_empty() {
-            info!("IBD: requesting {} blocks starting at height {}", hashes.len(), self.chain.height() + 1);
+            info!(
+                "IBD: requesting {} blocks starting at height {}",
+                hashes.len(),
+                self.chain.read().await.height() + 1
+            );
             self.peer_manager.request_blocks(peer_id, &hashes);
         } else if self.ibd.phase == IbdPhase::Blocks {
             self.ibd.mark_complete();
         }
     }
 
-    async fn handle_block(&mut self, peer_id: u64, block: rbtc_primitives::block::Block) -> Result<()> {
-        use rbtc_consensus::block_verify::{verify_block, BlockValidationContext};
-
+    async fn handle_block(
+        &mut self,
+        peer_id: u64,
+        block: rbtc_primitives::block::Block,
+    ) -> Result<()> {
         let block_hash = header_hash(&block.header);
 
-        // Check if we already have this block
-        if self.chain.block_index.get(&block_hash)
-            .map(|bi| bi.status == rbtc_consensus::chain::BlockStatus::InChain)
-            .unwrap_or(false)
+        // Already in chain?
         {
-            return Ok(());
+            let chain = self.chain.read().await;
+            if chain
+                .block_index
+                .get(&block_hash)
+                .map(|bi| bi.status == BlockStatus::InChain)
+                .unwrap_or(false)
+            {
+                return Ok(());
+            }
         }
 
-        let height = match self.chain.block_index.get(&block_hash) {
-            Some(bi) => bi.height,
-            None => {
-                // Unknown block – try to add the header first
-                if let Err(e) = self.chain.add_header(block.header.clone()) {
-                    warn!("unknown block header from peer {peer_id}: {e}");
-                    return Ok(());
+        let height = {
+            let mut chain = self.chain.write().await;
+            match chain.block_index.get(&block_hash) {
+                Some(bi) => bi.height,
+                None => {
+                    if let Err(e) = chain.add_header(block.header.clone()) {
+                        warn!("unknown block header from peer {peer_id}: {e}");
+                        return Ok(());
+                    }
+                    chain.block_index[&block_hash].height
                 }
-                self.chain.block_index[&block_hash].height
             }
         };
 
-        let expected_bits = self.chain.next_required_bits();
-        let mtp = self.chain.median_time_past(height.saturating_sub(1));
+        let (expected_bits, mtp) = {
+            let chain = self.chain.read().await;
+            (
+                chain.next_required_bits(),
+                chain.median_time_past(height.saturating_sub(1)),
+            )
+        };
+
         let network_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as u32;
 
         let flags = ScriptFlags::standard();
-        let ctx = BlockValidationContext {
-            block: &block,
-            height,
-            median_time_past: mtp,
-            network_time,
-            expected_bits,
-            flags,
+
+        // Validate block (takes read lock on utxos via chain read)
+        let validation_result = {
+            let chain = self.chain.read().await;
+            let ctx = BlockValidationContext {
+                block: &block,
+                height,
+                median_time_past: mtp,
+                network_time,
+                expected_bits,
+                flags,
+            };
+            verify_block(&ctx, &chain.utxos)
         };
 
-        match verify_block(&ctx, &self.chain.utxos) {
+        match validation_result {
             Ok(fees) => {
                 info!(
                     "block {} at height {height} validated (fees={fees} sat)",
                     block_hash.to_hex()
                 );
-                self.chain.connect_block(&block, block_hash)?;
 
-                // Persist the new tip
-                let chain_store = ChainStore::new(&self.db);
-                chain_store.update_tip(
-                    &block_hash,
-                    height,
-                    self.chain.block_index[&block_hash].chainwork,
-                ).ok();
+                // Compute txids for UTXO tracking
+                let txids: Vec<_> = block
+                    .transactions
+                    .iter()
+                    .map(|tx| {
+                        let mut buf = Vec::new();
+                        tx.encode_legacy(&mut buf).ok();
+                        sha256d(&buf)
+                    })
+                    .collect();
 
-                let block_store = BlockStore::new(&self.db);
-                block_store.put_block(&block_hash, &block).ok();
+                // Connect block to in-memory chain state and collect undo data
+                let undo = {
+                    let mut chain = self.chain.write().await;
+                    let undo = chain.utxos.connect_block_with_undo(
+                        &txids,
+                        &block.transactions,
+                        height,
+                    );
+                    // Mark block as in-chain in the index
+                    if let Some(bi) = chain.block_index.get_mut(&block_hash) {
+                        bi.status = BlockStatus::InChain;
+                    }
+                    // Update active chain
+                    if height as usize >= chain.active_chain.len() {
+                        chain.active_chain.resize(height as usize + 1, Hash256::ZERO);
+                    }
+                    chain.active_chain[height as usize] = block_hash;
+                    // Update best tip
+                    let new_work = chain.block_index[&block_hash].chainwork;
+                    let cur_work = chain
+                        .best_tip
+                        .and_then(|h| chain.block_index.get(&h))
+                        .map(|bi| bi.chainwork)
+                        .unwrap_or(0);
+                    if new_work > cur_work {
+                        chain.best_tip = Some(block_hash);
+                    }
+                    undo
+                };
+
+                // Convert undo data to storage format and persist
+                let undo_stored: Vec<Vec<(rbtc_primitives::transaction::OutPoint, StoredUtxo)>> =
+                    undo.iter()
+                        .map(|tx_undo| {
+                            tx_undo
+                                .iter()
+                                .map(|(op, u)| {
+                                    (
+                                        op.clone(),
+                                        StoredUtxo {
+                                            value: u.txout.value,
+                                            script_pubkey: u.txout.script_pubkey.clone(),
+                                            height: u.height,
+                                            is_coinbase: u.is_coinbase,
+                                        },
+                                    )
+                                })
+                                .collect()
+                        })
+                        .collect();
+
+                // Persist everything to RocksDB
+                {
+                    let chainwork = self.chain.read().await.block_index[&block_hash].chainwork;
+
+                    let block_store = BlockStore::new(&self.db);
+                    let stored_idx = StoredBlockIndex {
+                        header: block.header.clone(),
+                        height,
+                        chainwork_lo: chainwork as u64,
+                        chainwork_hi: (chainwork >> 64) as u64,
+                        status: BlockStatus::InChain.as_u8(),
+                    };
+                    block_store.put_index(&block_hash, &stored_idx).ok();
+                    block_store.put_block(&block_hash, &block).ok();
+                    block_store.put_undo(&block_hash, &encode_block_undo(&undo_stored)).ok();
+
+                    let utxo_store = UtxoStore::new(&self.db);
+                    utxo_store.connect_block(&txids, &block.transactions, height).ok();
+
+                    let chain_store = ChainStore::new(&self.db);
+                    chain_store.update_tip(&block_hash, height, chainwork).ok();
+                }
+
+                // Remove confirmed transactions from the mempool
+                {
+                    let mut mp = self.mempool.write().await;
+                    mp.remove_confirmed(&txids);
+                }
+
+                // Update peer manager's best height
+                self.peer_manager.set_best_height(height as i32);
 
                 // Continue IBD
                 if !self.ibd.is_complete() {
                     self.download_blocks(peer_id).await;
                 }
+
+                // ── Reorg detection ─────────────────────────────────────────
+                // If a new block arrives that doesn't extend our current best tip
+                // but has more chainwork, initiate a reorganization.
+                // (Full reorg logic: handled separately by `reorganize_to` below)
             }
             Err(e) => {
                 warn!("block {} rejected from peer {peer_id}: {e}", block_hash.to_hex());
@@ -347,9 +515,187 @@ impl Node {
         Ok(())
     }
 
-    fn request_headers(&self, peer_id: u64) {
-        let height = self.chain.height();
-        let locator = build_locator(height, |h| self.chain.get_ancestor_hash(h));
+    /// Accept an unconfirmed transaction into the mempool and relay it.
+    async fn handle_tx(
+        &mut self,
+        peer_id: u64,
+        tx: rbtc_primitives::transaction::Transaction,
+    ) {
+        let txid = {
+            let mut buf = Vec::new();
+            tx.encode_legacy(&mut buf).ok();
+            sha256d(&buf)
+        };
+
+        let chain = self.chain.read().await;
+        let height = chain.height();
+        let mut mp = self.mempool.write().await;
+
+        match mp.accept_tx(tx, &chain.utxos, height) {
+            Ok(accepted_txid) => {
+                info!(
+                    "mempool: accepted tx {} from peer {peer_id}",
+                    accepted_txid.to_hex()
+                );
+                drop(mp);
+                drop(chain);
+                // Announce to all other peers
+                let inv = vec![Inventory { inv_type: InvType::WitnessTx, hash: txid }];
+                self.peer_manager.broadcast(NetworkMessage::Inv(inv));
+            }
+            Err(e) => {
+                // AlreadyKnown is not worth logging
+                if !matches!(e, rbtc_mempool::MempoolError::AlreadyKnown) {
+                    warn!("mempool: rejected tx {} from peer {peer_id}: {e}", txid.to_hex());
+                }
+            }
+        }
+    }
+
+    /// Reorg: disconnect the current best chain back to `fork_point` and
+    /// connect the new chain. Requires undo data to be present in storage.
+    #[allow(dead_code)]
+    async fn reorganize_to(&mut self, new_tip: rbtc_primitives::hash::BlockHash) -> Result<()> {
+        let (fork_point, old_chain, new_chain) = {
+            let chain = self.chain.read().await;
+            find_fork(&chain, new_tip)?
+        };
+
+        info!(
+            "reorg: fork at height {fork_point}, disconnecting {} blocks, connecting {} blocks",
+            old_chain.len(),
+            new_chain.len()
+        );
+
+        let block_store = BlockStore::new(&self.db);
+        let utxo_store = UtxoStore::new(&self.db);
+
+        // Disconnect old chain (reverse order)
+        for hash in old_chain.iter().rev() {
+            let block = block_store
+                .get_block(hash)?
+                .ok_or_else(|| anyhow::anyhow!("reorg: missing block {}", hash.to_hex()))?;
+            let undo_bytes = block_store
+                .get_undo(hash)?
+                .ok_or_else(|| anyhow::anyhow!("reorg: missing undo for {}", hash.to_hex()))?;
+            let undo = decode_block_undo(&undo_bytes)?;
+
+            let txids: Vec<_> = block
+                .transactions
+                .iter()
+                .map(|tx| {
+                    let mut buf = Vec::new();
+                    tx.encode_legacy(&mut buf).ok();
+                    sha256d(&buf)
+                })
+                .collect();
+
+            // In-memory UTXO undo
+            let mem_undo: Vec<Vec<(rbtc_primitives::transaction::OutPoint, rbtc_consensus::utxo::Utxo)>> = undo
+                .iter()
+                .map(|tx_undo| {
+                    tx_undo
+                        .iter()
+                        .map(|(op, s)| {
+                            use rbtc_primitives::transaction::TxOut;
+                            (
+                                op.clone(),
+                                rbtc_consensus::utxo::Utxo {
+                                    txout: TxOut {
+                                        value: s.value,
+                                        script_pubkey: s.script_pubkey.clone(),
+                                    },
+                                    is_coinbase: s.is_coinbase,
+                                    height: s.height,
+                                },
+                            )
+                        })
+                        .collect()
+                })
+                .collect();
+
+            {
+                let mut chain = self.chain.write().await;
+                chain.utxos.disconnect_block(&txids, &block.transactions, mem_undo);
+                chain.disconnect_tip()?;
+            }
+
+            // Persist UTXO undo
+            utxo_store.disconnect_block(&txids, &block.transactions, &undo.concat()).ok();
+        }
+
+        // Connect new chain (forward order)
+        for hash in &new_chain {
+            let block = block_store
+                .get_block(hash)?
+                .ok_or_else(|| anyhow::anyhow!("reorg: missing block {}", hash.to_hex()))?;
+            // Re-use handle_block logic would require a lot of restructuring;
+            // for now we do a simplified connect without peer context.
+            let height = self.chain.read().await.block_index[hash].height;
+            let txids: Vec<_> = block
+                .transactions
+                .iter()
+                .map(|tx| {
+                    let mut buf = Vec::new();
+                    tx.encode_legacy(&mut buf).ok();
+                    sha256d(&buf)
+                })
+                .collect();
+
+            let undo = {
+                let mut chain = self.chain.write().await;
+                chain.utxos.connect_block_with_undo(&txids, &block.transactions, height)
+            };
+
+            let undo_stored: Vec<Vec<(rbtc_primitives::transaction::OutPoint, StoredUtxo)>> = undo
+                .iter()
+                .map(|tx_undo| {
+                    tx_undo
+                        .iter()
+                        .map(|(op, u)| {
+                            (
+                                op.clone(),
+                                StoredUtxo {
+                                    value: u.txout.value,
+                                    script_pubkey: u.txout.script_pubkey.clone(),
+                                    height: u.height,
+                                    is_coinbase: u.is_coinbase,
+                                },
+                            )
+                        })
+                        .collect()
+                })
+                .collect();
+
+            block_store.put_undo(hash, &encode_block_undo(&undo_stored)).ok();
+            utxo_store.connect_block(&txids, &block.transactions, height).ok();
+
+            {
+                let mut chain = self.chain.write().await;
+                if let Some(bi) = chain.block_index.get_mut(hash) {
+                    bi.status = BlockStatus::InChain;
+                }
+                if height as usize >= chain.active_chain.len() {
+                    chain.active_chain.resize(height as usize + 1, Hash256::ZERO);
+                }
+                chain.active_chain[height as usize] = *hash;
+                chain.best_tip = Some(*hash);
+            }
+
+            let chainwork = self.chain.read().await.block_index[hash].chainwork;
+            let chain_store = ChainStore::new(&self.db);
+            chain_store.update_tip(hash, height, chainwork).ok();
+        }
+
+        info!("reorg complete; new tip {}", new_tip.to_hex());
+        Ok(())
+    }
+
+    async fn request_headers(&self, peer_id: u64) {
+        let chain = self.chain.read().await;
+        let height = chain.height();
+        let locator = build_locator(height, |h| chain.get_ancestor_hash(h));
+        drop(chain);
         self.peer_manager.send_to(
             peer_id,
             NetworkMessage::GetHeaders(rbtc_net::message::GetBlocksMessage::new(locator)),
@@ -361,37 +707,129 @@ impl Node {
         if self.ibd.is_complete() {
             return;
         }
-        // If no sync peer, find one
         if self.ibd.sync_peer.is_none() {
             if let Some(peer_id) = self.peer_manager.best_peer() {
                 self.ibd.sync_peer = Some(peer_id);
-                self.request_headers(peer_id);
+                self.request_headers(peer_id).await;
             }
         }
     }
 
-    fn log_stats(&self) {
-        let height = self.chain.height();
+    async fn log_stats(&self) {
+        let chain = self.chain.read().await;
+        let height = chain.height();
+        let utxos = chain.utxos.len();
+        drop(chain);
         let peers = self.peer_manager.peer_count();
         let best_peer_height = self.peer_manager.best_peer_height();
-        let utxos = self.chain.utxos.len();
+        let mp_size = self.mempool.read().await.len();
         info!(
-            "height={height} peers={peers} best_peer_height={best_peer_height} utxos={utxos}"
+            "height={height} peers={peers} best_peer={best_peer_height} utxos={utxos} mempool={mp_size}"
         );
     }
 }
 
-fn load_chain_state(_chain: &mut ChainState, db: &Database) -> Result<()> {
-    let chain_store = ChainStore::new(db);
-    // If there's a stored best block, we could reload it here
-    // For now, we start fresh (IBD will re-sync)
-    if let Ok(Some(_tip)) = chain_store.get_best_block() {
-        info!("loaded existing chain state from disk");
-        // TODO: rebuild in-memory block index from stored block headers
+// ── Chain rebuild from persistent storage ────────────────────────────────────
+
+fn load_chain_state(chain: &mut ChainState, db: &Database) -> Result<()> {
+    let block_store = BlockStore::new(db);
+    let utxo_store = UtxoStore::new(db);
+
+    // Load all stored block indices
+    let mut indices = block_store.iter_all_indices();
+    if indices.is_empty() {
+        info!("no stored chain state; starting from genesis");
+        return Ok(());
     }
+
+    // Sort by height for correct parent-before-child insertion
+    indices.sort_by_key(|(_, idx)| idx.height);
+    let count = indices.len();
+    info!("rebuilding block index from {count} stored entries");
+
+    for (hash, stored) in indices {
+        let status = BlockStatus::from_u8(stored.status);
+        let chainwork = stored.chainwork();
+        let index = BlockIndex {
+            hash,
+            header: stored.header,
+            height: stored.height,
+            chainwork,
+            status,
+        };
+        chain.insert_block_index(hash, index);
+    }
+
+    // Load UTXOs from RocksDB into the in-memory UTXO set
+    let utxos = utxo_store.iter_all();
+    let utxo_count = utxos.len();
+    for (outpoint, stored) in utxos {
+        use rbtc_consensus::utxo::Utxo;
+        chain.utxos.insert(
+            outpoint,
+            Utxo {
+                txout: stored.to_txout(),
+                is_coinbase: stored.is_coinbase,
+                height: stored.height,
+            },
+        );
+    }
+
+    info!(
+        "chain rebuilt: height={} utxos={utxo_count}",
+        chain.height()
+    );
     Ok(())
 }
 
+// ── Reorg helper ─────────────────────────────────────────────────────────────
+
+/// Find the fork point between the active chain and a new tip.
+/// Returns `(fork_height, old_chain_hashes, new_chain_hashes)`.
+fn find_fork(
+    chain: &ChainState,
+    new_tip: rbtc_primitives::hash::BlockHash,
+) -> Result<(u32, Vec<rbtc_primitives::hash::BlockHash>, Vec<rbtc_primitives::hash::BlockHash>)>
+{
+    let mut old_chain = Vec::new();
+    let mut new_chain = Vec::new();
+
+    // Walk new_tip back until we find a block that is InChain
+    let mut cursor = new_tip;
+    loop {
+        let bi = chain
+            .block_index
+            .get(&cursor)
+            .ok_or_else(|| anyhow::anyhow!("fork search: unknown block {}", cursor.to_hex()))?;
+        if bi.status == BlockStatus::InChain {
+            // Found the fork point
+            let fork_height = bi.height;
+            // Collect old chain from tip to fork
+            let best = chain.best_tip.unwrap_or(Hash256::ZERO);
+            let mut old_cursor = best;
+            loop {
+                let obi = chain.block_index.get(&old_cursor);
+                if let Some(obi) = obi {
+                    if obi.height <= fork_height {
+                        break;
+                    }
+                    old_chain.push(old_cursor);
+                    old_cursor = obi.header.prev_block;
+                } else {
+                    break;
+                }
+            }
+            new_chain.reverse();
+            return Ok((fork_height, old_chain, new_chain));
+        }
+        new_chain.push(cursor);
+        cursor = bi.header.prev_block;
+    }
+}
+
+// ── Misc helpers ─────────────────────────────────────────────────────────────
+
+#[allow(dead_code)]
 fn tx_legacy_bytes(tx: &rbtc_primitives::transaction::Transaction) -> Vec<u8> {
     let mut buf = Vec::new();
     tx.encode_legacy(&mut buf).ok();

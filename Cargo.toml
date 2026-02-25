@@ -6,6 +6,7 @@ members = [
     "crates/rbtc-consensus",
     "crates/rbtc-storage",
     "crates/rbtc-net",
+    "crates/rbtc-mempool",
     "crates/rbtc-node",
 ]
 resolver = "2"
@@ -24,6 +25,7 @@ rbtc-script     = { path = "crates/rbtc-script" }
 rbtc-consensus  = { path = "crates/rbtc-consensus" }
 rbtc-storage    = { path = "crates/rbtc-storage" }
 rbtc-net        = { path = "crates/rbtc-net" }
+rbtc-mempool    = { path = "crates/rbtc-mempool" }
 
 # Cryptography
 secp256k1 = { version = "0.31", features = ["global-context"] }
@@ -46,6 +48,11 @@ serde_json = "1"
 # Logging
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# HTTP / JSON-RPC
+axum       = "0.8"
+tower      = "0.5"
+tower-http = { version = "0.6", features = ["cors"] }
 
 # Error handling
 thiserror = "2"

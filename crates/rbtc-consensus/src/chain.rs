@@ -28,6 +28,26 @@ pub enum BlockStatus {
     Invalid,
 }
 
+impl BlockStatus {
+    pub fn as_u8(self) -> u8 {
+        match self {
+            BlockStatus::HeaderOnly => 0,
+            BlockStatus::Valid => 1,
+            BlockStatus::InChain => 2,
+            BlockStatus::Invalid => 3,
+        }
+    }
+
+    pub fn from_u8(b: u8) -> Self {
+        match b {
+            1 => BlockStatus::Valid,
+            2 => BlockStatus::InChain,
+            3 => BlockStatus::Invalid,
+            _ => BlockStatus::HeaderOnly,
+        }
+    }
+}
+
 /// An entry in the block index (in-memory block tree)
 #[derive(Debug, Clone)]
 pub struct BlockIndex {
@@ -215,6 +235,27 @@ impl ChainState {
         }
 
         Ok(())
+    }
+
+    /// Directly insert a BlockIndex entry (used when rebuilding from persistent storage).
+    /// Updates active_chain and best_tip if the block is InChain.
+    pub fn insert_block_index(&mut self, hash: BlockHash, index: BlockIndex) {
+        if index.status == BlockStatus::InChain {
+            let h = index.height as usize;
+            if h >= self.active_chain.len() {
+                self.active_chain.resize(h + 1, Hash256::ZERO);
+            }
+            self.active_chain[h] = hash;
+            let cur_work = self
+                .best_tip
+                .and_then(|t| self.block_index.get(&t))
+                .map(|bi| bi.chainwork)
+                .unwrap_or(0);
+            if index.chainwork > cur_work {
+                self.best_tip = Some(hash);
+            }
+        }
+        self.block_index.insert(hash, index);
     }
 
     /// Disconnect the tip block (for reorg)

@@ -1,6 +1,7 @@
 mod config;
-mod node;
 mod ibd;
+mod node;
+mod rpc;
 
 use anyhow::Result;
 use clap::Parser;

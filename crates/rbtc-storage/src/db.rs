@@ -9,6 +9,7 @@ pub const CF_UTXO: &str = "utxo";
 pub const CF_CHAIN_STATE: &str = "chain_state";
 pub const CF_BLOCK_DATA: &str = "block_data";
 pub const CF_TX_INDEX: &str = "tx_index";
+pub const CF_UNDO: &str = "undo";
 
 /// Wrapper around RocksDB with Bitcoin-specific column families
 pub struct Database {
@@ -28,6 +29,7 @@ impl Database {
             ColumnFamilyDescriptor::new(CF_CHAIN_STATE, Options::default()),
             ColumnFamilyDescriptor::new(CF_BLOCK_DATA, Options::default()),
             ColumnFamilyDescriptor::new(CF_TX_INDEX, Options::default()),
+            ColumnFamilyDescriptor::new(CF_UNDO, Options::default()),
         ];
 
         let db = DB::open_cf_descriptors(&opts, path, cfs)?;
