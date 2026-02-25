@@ -93,13 +93,18 @@ pub struct ChainState {
 
 impl ChainState {
     pub fn new(network: Network) -> Self {
-        Self {
+        let mut chain = Self {
             network,
             block_index: HashMap::new(),
             best_tip: None,
             active_chain: Vec::new(),
             utxos: UtxoSet::new(),
-        }
+        };
+        // Seed the block index with the genesis header so that the first
+        // headers-message from peers (which starts at block 1) can find its
+        // parent.
+        let _ = chain.add_header(network.genesis_header());
+        chain
     }
 
     pub fn height(&self) -> u32 {
@@ -401,5 +406,19 @@ mod tests {
         let r = chain.disconnect_tip();
         assert!(r.is_err());
         assert!(matches!(r.unwrap_err(), ConsensusError::GenesisMismatch));
+    }
+
+    #[test]
+    fn genesis_header_hash_matches_all_networks() {
+        for net in [Network::Mainnet, Network::Testnet4, Network::Regtest, Network::Signet] {
+            let header = net.genesis_header();
+            let computed = header_hash(&header);
+            let expected = genesis_hash(net);
+            assert_eq!(
+                computed, expected,
+                "{net}: computed={} expected={}",
+                computed.to_hex(), expected.to_hex()
+            );
+        }
     }
 }

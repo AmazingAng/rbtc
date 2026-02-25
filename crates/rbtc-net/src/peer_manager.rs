@@ -205,16 +205,50 @@ impl PeerManager {
         Ok(())
     }
 
-    /// Connect to DNS seeds
+    /// Resolve DNS seeds and connect to the discovered peer addresses.
     pub async fn connect_to_seeds(&mut self) {
+        use tokio::net::lookup_host;
+
         let seeds = self.config.network.dns_seeds();
         let port = self.config.network.default_port();
+        let max = self.config.max_outbound;
+
+        let mut addrs: Vec<SocketAddr> = Vec::new();
 
         for seed in seeds {
-            let addr = format!("{seed}:{port}");
-            info!("connecting to seed: {addr}");
-            self.connect(&addr).await;
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            let host_port = format!("{seed}:{port}");
+            info!("resolving seed: {host_port}");
+            match lookup_host(host_port).await {
+                Ok(resolved) => {
+                    for addr in resolved {
+                        if addr.is_ipv4() {
+                            addrs.push(addr);
+                        }
+                    }
+                }
+                Err(e) => warn!("failed to resolve seed {seed}: {e}"),
+            }
+        }
+
+        info!("DNS seeds resolved to {} addresses", addrs.len());
+
+        // Simple Fisher-Yates shuffle using a time-seeded value.
+        {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut h = DefaultHasher::new();
+            std::time::SystemTime::now().hash(&mut h);
+            let mut seed = h.finish();
+            for i in (1..addrs.len()).rev() {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let j = (seed >> 33) as usize % (i + 1);
+                addrs.swap(i, j);
+            }
+        }
+
+        for addr in addrs.iter().take(max) {
+            self.connect(&addr.to_string()).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 
