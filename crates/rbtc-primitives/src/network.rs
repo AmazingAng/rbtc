@@ -56,6 +56,55 @@ impl Network {
             Network::Signet  => "00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6",
         }
     }
+
+    /// Returns the genesis block header for this network.
+    pub fn genesis_header(&self) -> crate::block::BlockHeader {
+        use crate::block::BlockHeader;
+        use crate::hash::Hash256;
+
+        match self {
+            Network::Mainnet => BlockHeader {
+                version: 1,
+                prev_block: Hash256::ZERO,
+                merkle_root: Hash256::from_hex(
+                    "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"
+                ).unwrap_or(Hash256::ZERO),
+                time: 1231006505,
+                bits: 0x1d00ffff,
+                nonce: 2083236893,
+            },
+            Network::Testnet4 => BlockHeader {
+                version: 1,
+                prev_block: Hash256::ZERO,
+                merkle_root: Hash256::from_hex(
+                    "7aa0a7ae1e223414cb807e40cd57e667b718e42aaf9306db9102fe28912b7b4e"
+                ).unwrap_or(Hash256::ZERO),
+                time: 1714777860,
+                bits: 0x1d00ffff,
+                nonce: 393743547,
+            },
+            Network::Regtest => BlockHeader {
+                version: 1,
+                prev_block: Hash256::ZERO,
+                merkle_root: Hash256::from_hex(
+                    "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"
+                ).unwrap_or(Hash256::ZERO),
+                time: 1296688602,
+                bits: 0x207fffff,
+                nonce: 2,
+            },
+            Network::Signet => BlockHeader {
+                version: 1,
+                prev_block: Hash256::ZERO,
+                merkle_root: Hash256::from_hex(
+                    "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"
+                ).unwrap_or(Hash256::ZERO),
+                time: 1598918400,
+                bits: 0x1e0377ae,
+                nonce: 52613770,
+            },
+        }
+    }
 }
 
 impl std::fmt::Display for Network {
