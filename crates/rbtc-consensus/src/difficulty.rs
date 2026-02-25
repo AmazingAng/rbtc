@@ -20,6 +20,15 @@ pub fn next_bits(first_header: &BlockHeader, last_header: &BlockHeader) -> u32 {
 
     // Perform 256-bit-safe arithmetic using u128 + carry
     let new_target = scale_target(&old_target, actual_timespan, TARGET_TIMESPAN);
+
+    // Cap at maximum allowed target (minimum difficulty).
+    // This is essential for early Bitcoin where hashrate was so low that the
+    // difficulty would otherwise be calculated to decrease below the minimum.
+    let max = max_target();
+    if target_gt(&new_target, &max) {
+        return target_to_nbits(&max);
+    }
+
     target_to_nbits(&new_target)
 }
 
@@ -59,17 +68,34 @@ fn scale_target(target: &[u8; 32], numerator: u64, denominator: u64) -> [u8; 32]
     out
 }
 
+/// Compare two 32-byte little-endian targets: returns true if a > b.
+fn target_gt(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    for i in (0..32).rev() {
+        if a[i] > b[i] {
+            return true;
+        }
+        if a[i] < b[i] {
+            return false;
+        }
+    }
+    false
+}
+
 /// Check if a difficulty adjustment is due at this height
 pub fn is_adjustment_height(height: u32) -> bool {
     height > 0 && height % DIFFICULTY_ADJUSTMENT_INTERVAL as u32 == 0
 }
 
-/// Maximum allowed target (minimum difficulty) – Bitcoin mainnet value
+/// Maximum allowed target (minimum difficulty) – Bitcoin mainnet value.
+///
+/// Corresponds to nBits = 0x1d00ffff.
+/// In little-endian 32-byte form: nbits_to_target(0x1d00ffff).
 pub fn max_target() -> [u8; 32] {
     // 0x00000000ffff0000000000000000000000000000000000000000000000000000
+    // big-endian: byte 4=0xff, byte 5=0xff → little-endian index 27=0xff, index 26=0xff
     let mut t = [0u8; 32];
-    t[29] = 0xff;
-    t[28] = 0xff;
+    t[26] = 0xff;
+    t[27] = 0xff;
     t
 }
 
@@ -135,8 +161,13 @@ mod tests {
     #[test]
     fn max_target_() {
         let t = max_target();
-        assert_eq!(t[28], 0xff);
-        assert_eq!(t[29], 0xff);
+        // max_target == nbits_to_target(0x1d00ffff): index 26=0xff, index 27=0xff
+        assert_eq!(t[26], 0xff);
+        assert_eq!(t[27], 0xff);
+        assert_eq!(t[28], 0x00);
+        assert_eq!(t[29], 0x00);
+        // Verify round-trip
+        assert_eq!(target_to_nbits(&t), 0x1d00ffff);
     }
 
     #[test]

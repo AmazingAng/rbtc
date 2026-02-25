@@ -1,7 +1,11 @@
 use std::collections::VecDeque;
+use std::time::Instant;
 
 use rbtc_primitives::{block::BlockHeader, hash::BlockHash};
 use tracing::{debug, info};
+
+/// How long to wait without progress before declaring a stall and switching peers.
+pub const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// State machine for Initial Block Download
 pub struct IbdState {
@@ -18,6 +22,8 @@ pub struct IbdState {
     pub phase: IbdPhase,
     /// Peer we're downloading from
     pub sync_peer: Option<u64>,
+    /// Timestamp of the last block connected; used to detect stalls.
+    pub last_progress: Instant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,7 +44,16 @@ impl IbdState {
             max_inflight: 128,
             phase: IbdPhase::Headers,
             sync_peer: None,
+            last_progress: Instant::now(),
         }
+    }
+
+    pub fn record_progress(&mut self) {
+        self.last_progress = Instant::now();
+    }
+
+    pub fn is_stalled(&self) -> bool {
+        self.sync_peer.is_some() && self.last_progress.elapsed() > STALL_TIMEOUT
     }
 
     pub fn is_complete(&self) -> bool {

@@ -58,7 +58,12 @@ impl BlockHeader {
     }
 }
 
-/// Expand nBits compact representation to 256-bit target
+/// Expand nBits compact representation to 256-bit target (little-endian)
+///
+/// target = coefficient × 256^(exp-3)
+/// In a little-endian 32-byte array the coefficient occupies bytes at
+/// indices [start, start+1, start+2] = [exp-3, exp-2, exp-1], with the
+/// *least* significant byte of the coefficient at the lowest index.
 pub fn nbits_to_target(bits: u32) -> [u8; 32] {
     let exp = (bits >> 24) as usize;
     let mantissa = bits & 0x007fffff;
@@ -68,29 +73,37 @@ pub fn nbits_to_target(bits: u32) -> [u8; 32] {
         return target;
     }
 
-    // mantissa is 3 bytes, stored at byte offset (exp - 3)
     let start = exp.saturating_sub(3);
-    let mantissa_bytes = mantissa.to_be_bytes();
-
-    // mantissa_bytes: [0, b1, b2, b3] → write b1,b2,b3 at start..start+3
-    for (i, &b) in mantissa_bytes[1..].iter().enumerate() {
-        let idx = start + i;
-        if idx < 32 {
-            target[idx] = b;
-        }
+    // Write mantissa in little-endian order: LSB first
+    if start < 32 {
+        target[start] = (mantissa & 0xff) as u8;
+    }
+    if start + 1 < 32 {
+        target[start + 1] = ((mantissa >> 8) & 0xff) as u8;
+    }
+    if start + 2 < 32 {
+        target[start + 2] = ((mantissa >> 16) & 0xff) as u8;
     }
     target
 }
 
-/// Compute compact nBits from a 32-byte target (little-endian)
+/// Compute compact nBits from a 32-byte target (little-endian).
+///
+/// Matches Bitcoin Core's `GetCompact`: if the top bit of the 3-byte
+/// mantissa would be set (≥ 0x800000, which could be mis-read as negative),
+/// the mantissa is shifted right one byte and the exponent is increased by one.
 pub fn target_to_nbits(target: &[u8; 32]) -> u32 {
-    // Find most significant byte
-    let mut msb = 31;
+    // Find most significant non-zero byte
+    let mut msb = 31usize;
     while msb > 0 && target[msb] == 0 {
         msb -= 1;
     }
-    let exp = msb + 1;
-    let mantissa = if msb >= 2 {
+    if target[msb] == 0 {
+        return 0;
+    }
+
+    let mut exp = msb + 1;
+    let mut mantissa = if msb >= 2 {
         ((target[msb] as u32) << 16)
             | ((target[msb - 1] as u32) << 8)
             | (target[msb - 2] as u32)
@@ -99,6 +112,14 @@ pub fn target_to_nbits(target: &[u8; 32]) -> u32 {
     } else {
         (target[msb] as u32) << 16
     };
+
+    // If the sign bit (bit 23) would be set, shift right and bump exponent
+    // (matches Bitcoin Core's GetCompact sign-bit normalisation).
+    if mantissa & 0x00800000 != 0 {
+        mantissa >>= 8;
+        exp += 1;
+    }
+
     ((exp as u32) << 24) | (mantissa & 0x007fffff)
 }
 
@@ -191,10 +212,13 @@ mod tests {
 
     #[test]
     fn target_to_nbits_msb_0() {
+        // Target is little-endian: target[0]=0x80 means only the LSB byte is set.
+        // mantissa = 0x80<<16 = 0x00800000; bit 23 set => GetCompact normalizes:
+        // shift mantissa right one byte and exp+1, so exp becomes 2 not 1.
         let mut target = [0u8; 32];
         target[0] = 0x80;
         let bits = target_to_nbits(&target);
-        assert_eq!((bits >> 24) as u8, 1);
+        assert_eq!((bits >> 24) as u8, 2);
         assert!(bits != 0);
     }
 

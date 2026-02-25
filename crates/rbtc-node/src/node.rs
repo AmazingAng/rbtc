@@ -7,6 +7,7 @@ use tracing::{error, info, warn};
 use rbtc_consensus::{
     block_verify::{verify_block, BlockValidationContext},
     chain::{BlockIndex, BlockStatus, ChainState, header_hash},
+    script_flags_for_block,
 };
 use rbtc_crypto::sha256d;
 use rbtc_mempool::Mempool;
@@ -16,7 +17,6 @@ use rbtc_net::{
     peer_manager::{BAN_DURATION, NodeEvent, PeerManager, PeerManagerConfig},
 };
 use rbtc_primitives::hash::Hash256;
-use rbtc_script::ScriptFlags;
 use rbtc_storage::{
     encode_block_undo, decode_block_undo, AddrIndexStore, BlockStore, ChainStore, Database,
     PeerStore, StoredBlockIndex, StoredUtxo, TxIndexStore, UtxoStore,
@@ -25,7 +25,7 @@ use rbtc_wallet::Wallet;
 
 use crate::{
     config::Args,
-    ibd::{build_locator, IbdPhase, IbdState},
+    ibd::{self, build_locator, IbdPhase, IbdState},
     rpc::{start_rpc_server, RpcState},
 };
 
@@ -34,7 +34,7 @@ const LOCAL_PEER_ID: u64 = 0;
 
 /// Maximum number of blocks requested per IBD batch.
 /// 64 blocks (~1 MB each at most) keeps the pipeline full on fast connections.
-const IBD_BATCH_SIZE: usize = 64;
+const IBD_BATCH_SIZE: usize = 512;
 
 /// The main Bitcoin node
 pub struct Node {
@@ -160,6 +160,33 @@ impl Node {
             }
         });
 
+        // Recover IBD phase from persisted chain state so that a restarted node
+        // doesn't re-download headers it already has stored in block_index.
+        {
+            let chain = self.chain.read().await;
+            let bi_height = chain
+                .block_index
+                .values()
+                .map(|bi| bi.height)
+                .max()
+                .unwrap_or(0);
+            let active_height = chain.height();
+            drop(chain);
+            if bi_height > active_height {
+                // We have unconnected headers from before the restart.
+                // Rebuild canonical chain and skip straight to Blocks phase.
+                info!(
+                    "detected {} unconnected headers (block_index tip={bi_height}, active_chain tip={active_height}); resuming Blocks phase",
+                    bi_height - active_height
+                );
+                self.ibd.phase = IbdPhase::Blocks;
+                self.build_canonical_header_chain().await;
+            } else if active_height > 0 {
+                info!("chain tip={active_height}; checking if fully synced");
+                // Will determine whether we're caught up once peers connect.
+            }
+        }
+
         // Connect to seeds / explicit nodes
         if !self.args.connect_only.is_empty() {
             for addr in self.args.connect_only.clone() {
@@ -180,7 +207,7 @@ impl Node {
         let mut ibd_timer = tokio::time::interval(Duration::from_secs(1));
         let mut persist_timer = tokio::time::interval(Duration::from_secs(5 * 60));
         // Retry DNS seeds if we have no peers (e.g. after all connections drop).
-        let mut seed_retry_timer = tokio::time::interval(Duration::from_secs(60));
+        let mut seed_retry_timer = tokio::time::interval(Duration::from_secs(10));
         seed_retry_timer.tick().await; // consume the immediate first tick
 
         loop {
@@ -236,7 +263,11 @@ impl Node {
                 let our_height = self.chain.read().await.height() as i32;
                 if best_height > our_height && self.ibd.sync_peer.is_none() {
                     self.ibd.sync_peer = Some(peer_id);
-                    self.request_headers(peer_id).await;
+                    if self.ibd.phase == IbdPhase::Blocks {
+                        self.download_blocks(peer_id).await;
+                    } else {
+                        self.request_headers(peer_id).await;
+                    }
                 }
             }
 
@@ -246,7 +277,12 @@ impl Node {
                     self.ibd.sync_peer = None;
                     if let Some(new_peer) = self.peer_manager.best_peer() {
                         self.ibd.sync_peer = Some(new_peer);
-                        self.request_headers(new_peer).await;
+                        if self.ibd.phase == IbdPhase::Blocks {
+                            // Already have all headers; resume block download.
+                            self.download_blocks(new_peer).await;
+                        } else {
+                            self.request_headers(new_peer).await;
+                        }
                     }
                 }
             }
@@ -281,6 +317,21 @@ impl Node {
 
             NodeEvent::BanPeer { ip } => {
                 self.handle_ban_peer(ip);
+            }
+
+            NodeEvent::NotFound { peer_id, items } => {
+                warn!(
+                    "peer {peer_id}: notfound for {} item(s) – likely pruned; switching IBD peer",
+                    items.len()
+                );
+                if self.ibd.sync_peer == Some(peer_id) {
+                    self.ibd.sync_peer = None;
+                    self.peer_manager.disconnect(peer_id);
+                    if let Some(new_peer) = self.peer_manager.best_peer() {
+                        self.ibd.sync_peer = Some(new_peer);
+                        self.download_blocks(new_peer).await;
+                    }
+                }
             }
 
             NodeEvent::AddrReceived { peer_id: _, addrs } => {
@@ -341,6 +392,7 @@ impl Node {
             if self.ibd.phase == IbdPhase::Headers {
                 self.ibd.phase = IbdPhase::Blocks;
                 info!("IBD: entering block download phase");
+                self.build_canonical_header_chain().await;
                 self.download_blocks(peer_id).await;
             }
             return Ok(());
@@ -642,11 +694,12 @@ impl Node {
             }
         };
 
-        let (expected_bits, mtp) = {
+        let (expected_bits, mtp, network) = {
             let chain = self.chain.read().await;
             (
                 chain.next_required_bits(),
                 chain.median_time_past(height.saturating_sub(1)),
+                chain.network,
             )
         };
 
@@ -655,7 +708,7 @@ impl Node {
             .unwrap_or_default()
             .as_secs() as u32;
 
-        let flags = ScriptFlags::standard();
+        let flags = script_flags_for_block(network, height, block.header.time);
 
         // Validate block (takes read lock on utxos via chain read)
         let validation_result = {
@@ -667,6 +720,7 @@ impl Node {
                 network_time,
                 expected_bits,
                 flags,
+                network,
             };
             verify_block(&ctx, &chain.utxos)
         };
@@ -806,6 +860,7 @@ impl Node {
 
                 // Continue IBD
                 if !self.ibd.is_complete() {
+                    self.ibd.record_progress();
                     self.download_blocks(peer_id).await;
                 }
 
@@ -1030,16 +1085,30 @@ impl Node {
         let height = chain.height();
         let network = chain.network;
         let mut locator = build_locator(height, |h| chain.get_ancestor_hash(h));
-        drop(chain);
 
-        // Always ensure genesis hash is in the locator so peers know where to
-        // start. This matters at height=0 when active_chain is empty but the
-        // genesis header has already been seeded into block_index.
+        // block_index may hold more headers than active_chain (e.g. after a restart
+        // or mid-download peer disconnect). Always prepend the highest known header
+        // hash so peers resume from where we left off rather than re-sending already
+        // known headers from the active_chain tip.
+        if let Some(best_hash) = chain
+            .block_index
+            .values()
+            .max_by_key(|bi| bi.height)
+            .map(|bi| bi.hash)
+        {
+            if !locator.contains(&best_hash) {
+                locator.insert(0, best_hash);
+            }
+        }
+
+        // Always ensure genesis hash is in the locator so peers know the
+        // common ancestor even when the best-header locator entry is unknown.
         if let Ok(genesis) = Hash256::from_hex(network.genesis_hash()) {
             if !locator.contains(&genesis) {
                 locator.push(genesis);
             }
         }
+        drop(chain);
 
         self.peer_manager.send_to(
             peer_id,
@@ -1052,10 +1121,25 @@ impl Node {
         if self.ibd.is_complete() {
             return;
         }
+
+        // Stall detection: if sync_peer is set but no block was connected
+        // within STALL_TIMEOUT, the peer is likely pruned or unresponsive.
+        if self.ibd.is_stalled() {
+            let stale = self.ibd.sync_peer.take().unwrap();
+            warn!("IBD stall detected (no progress for {}s); disconnecting peer {stale}",
+                ibd::STALL_TIMEOUT.as_secs());
+            self.peer_manager.disconnect(stale);
+        }
+
         if self.ibd.sync_peer.is_none() {
             if let Some(peer_id) = self.peer_manager.best_peer() {
                 self.ibd.sync_peer = Some(peer_id);
-                self.request_headers(peer_id).await;
+                self.ibd.record_progress();
+                if self.ibd.phase == IbdPhase::Blocks {
+                    self.download_blocks(peer_id).await;
+                } else {
+                    self.request_headers(peer_id).await;
+                }
             }
         }
     }

@@ -11,4 +11,4 @@ pub use hash::{BlockHash, Hash160, Hash256, TxId};
 pub use script::Script;
 pub use transaction::{OutPoint, Transaction, TxIn, TxOut};
 pub use block::{Block, BlockHeader};
-pub use network::Network;
+pub use network::{ConsensusParams, Network};

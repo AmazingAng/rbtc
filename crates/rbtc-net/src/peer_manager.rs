@@ -78,6 +78,8 @@ pub enum NodeEvent {
     AddrReceived { peer_id: u64, addrs: Vec<(u32, u64, [u8; 16], u16)> },
     /// Request to ban a peer's IP (emitted by misbehave())
     BanPeer { ip: IpAddr },
+    /// Peer replied notfound for one or more requested items (e.g. pruned node)
+    NotFound { peer_id: u64, items: Vec<Inventory> },
 }
 
 /// Connected peer metadata
@@ -539,6 +541,9 @@ impl PeerManager {
             }
             NetworkMessage::BlockTxn(resp) => {
                 let _ = self.node_event_tx.send(NodeEvent::BlockTxnReceived { peer_id, resp });
+            }
+            NetworkMessage::NotFound(items) => {
+                let _ = self.node_event_tx.send(NodeEvent::NotFound { peer_id, items });
             }
             other => {
                 debug!("peer {peer_id}: unhandled message: {}", other.command());

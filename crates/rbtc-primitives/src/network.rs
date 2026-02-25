@@ -1,3 +1,23 @@
+/// Consensus parameters: BIP activation heights and times.
+/// Used for script flags and coinbase (BIP34) checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConsensusParams {
+    /// BIP16 (P2SH) activation time (Unix timestamp).
+    pub bip16_time: u32,
+    /// BIP34 (coinbase height) activation block height.
+    pub bip34_height: u32,
+    /// BIP66 (strict DER signatures) activation block height.
+    pub bip66_height: u32,
+    /// BIP65 (CHECKLOCKTIMEVERIFY) activation block height.
+    pub bip65_height: u32,
+    /// BIP112 (CHECKSEQUENCEVERIFY) activation block height.
+    pub bip112_height: u32,
+    /// BIP141 (SegWit) activation block height.
+    pub bip141_height: u32,
+    /// BIP341 (Taproot) activation block height.
+    pub bip341_height: u32,
+}
+
 /// Bitcoin network type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Network {
@@ -8,6 +28,48 @@ pub enum Network {
 }
 
 impl Network {
+    /// Consensus parameters for this network (BIP activation points).
+    pub fn consensus_params(&self) -> ConsensusParams {
+        match self {
+            Network::Mainnet => ConsensusParams {
+                bip16_time: 1333238400,   // 2012-04-01
+                bip34_height: 227_931,
+                bip66_height: 363_725,
+                bip65_height: 388_381,
+                bip112_height: 419_328,
+                bip141_height: 481_824,
+                bip341_height: 709_632,
+            },
+            Network::Testnet4 => ConsensusParams {
+                bip16_time: 1329264000,
+                bip34_height: 211_11,
+                bip66_height: 330_776,
+                bip65_height: 581_885,
+                bip112_height: 0,
+                bip141_height: 0,
+                bip341_height: 0,
+            },
+            Network::Regtest => ConsensusParams {
+                bip16_time: 0,
+                bip34_height: 0,
+                bip66_height: 0,
+                bip65_height: 0,
+                bip112_height: 0,
+                bip141_height: 0,
+                bip341_height: 0,
+            },
+            Network::Signet => ConsensusParams {
+                bip16_time: 0,
+                bip34_height: 0,
+                bip66_height: 0,
+                bip65_height: 0,
+                bip112_height: 0,
+                bip141_height: 0,
+                bip341_height: 0,
+            },
+        }
+    }
+
     /// P2P magic bytes for this network
     pub fn magic(&self) -> [u8; 4] {
         match self {

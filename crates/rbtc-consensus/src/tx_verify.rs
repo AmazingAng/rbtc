@@ -1,6 +1,7 @@
 use rbtc_primitives::{
     constants::{COIN, COINBASE_MATURITY, INITIAL_SUBSIDY, SUBSIDY_HALVING_INTERVAL},
     transaction::Transaction,
+    Network,
 };
 use rbtc_script::{ScriptContext, ScriptFlags, verify_input};
 
@@ -102,6 +103,7 @@ pub fn verify_coinbase(
     tx: &Transaction,
     block_height: u32,
     expected_subsidy: u64,
+    network: Network,
 ) -> Result<(), ConsensusError> {
     if !tx.is_coinbase() {
         return Err(ConsensusError::FirstTxNotCoinbase);
@@ -118,8 +120,9 @@ pub fn verify_coinbase(
         )));
     }
 
-    // BIP34: block height must be first element of scriptSig for block ≥ 227931
-    if block_height >= 227931 {
+    // BIP34: block height must be first element of scriptSig for block ≥ bip34_height
+    let bip34_height = network.consensus_params().bip34_height;
+    if block_height >= bip34_height {
         check_coinbase_height(tx, block_height)?;
     }
 
@@ -157,6 +160,7 @@ fn check_coinbase_height(tx: &Transaction, height: u32) -> Result<(), ConsensusE
 mod tests {
     use super::*;
     use rbtc_primitives::hash::Hash256;
+    use rbtc_primitives::Network;
     use rbtc_primitives::script::Script;
     use rbtc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
     use rbtc_script::ScriptFlags;
@@ -223,7 +227,7 @@ mod tests {
             outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
             lock_time: 0,
         };
-        let r = verify_coinbase(&tx, 0, 50_0000_0000);
+        let r = verify_coinbase(&tx, 0, 50_0000_0000, Network::Regtest);
         assert!(r.is_err());
         assert!(matches!(r.unwrap_err(), ConsensusError::FirstTxNotCoinbase));
     }
@@ -241,7 +245,7 @@ mod tests {
             outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
             lock_time: 0,
         };
-        let r = verify_coinbase(&tx, 0, 50_0000_0000);
+        let r = verify_coinbase(&tx, 0, 50_0000_0000, Network::Regtest);
         assert!(r.is_err());
     }
 
@@ -258,6 +262,6 @@ mod tests {
             outputs: vec![TxOut { value: 25_0000_0000, script_pubkey: Script::new() }],
             lock_time: 0,
         };
-        assert!(verify_coinbase(&tx, 0, 50_0000_0000).is_ok());
+        assert!(verify_coinbase(&tx, 0, 50_0000_0000, Network::Regtest).is_ok());
     }
 }

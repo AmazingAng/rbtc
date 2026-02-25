@@ -4,6 +4,7 @@ use rbtc_primitives::{
     codec::Encodable,
     constants::{MAX_BLOCK_SIGOPS_COST, MAX_BLOCK_WEIGHT, MAX_FUTURE_BLOCK_TIME, WITNESS_SCALE_FACTOR},
     hash::Hash256,
+    Network,
 };
 use rbtc_crypto::{merkle_root, sha256d};
 use rbtc_script::ScriptFlags;
@@ -28,6 +29,8 @@ pub struct BlockValidationContext<'a> {
     pub expected_bits: u32,
     /// Script verification flags
     pub flags: ScriptFlags,
+    /// Network (for BIP34 and other consensus params)
+    pub network: Network,
 }
 
 /// Verify a complete block against the UTXO set.
@@ -79,7 +82,7 @@ pub fn verify_block(
     let subsidy = block_subsidy(ctx.height);
 
     // Verify coinbase (sequential, must be first)
-    verify_coinbase(&block.transactions[0], ctx.height, u64::MAX)?;
+    verify_coinbase(&block.transactions[0], ctx.height, u64::MAX, ctx.network)?;
     let coinbase_sigops = count_block_sigops(&block.transactions[0]) as u64;
 
     // Parallel verification of non-coinbase transactions.
@@ -249,6 +252,7 @@ mod tests {
     use rbtc_primitives::hash::Hash256;
     use rbtc_primitives::script::Script;
     use rbtc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
+    use rbtc_primitives::Network;
     use rbtc_script::ScriptFlags;
     use crate::utxo::UtxoSet;
 
@@ -263,14 +267,22 @@ mod tests {
         }
     }
 
+    fn header_with_valid_pow(bits: u32) -> BlockHeader {
+        let mut header = header_with_bits(bits);
+        for nonce in 0..=u32::MAX {
+            header.nonce = nonce;
+            let encoded = encode_block_header(&header);
+            let hash = sha256d(&encoded);
+            if header.meets_target(&hash) {
+                return header;
+            }
+        }
+        panic!("failed to find nonce meeting target for bits={bits:#x}");
+    }
+
     #[test]
     fn verify_block_header_timestamp_too_new() {
-        let h = header_with_bits(0x207fffff);
-        let encoded = encode_block_header(&h);
-        let hash = sha256d(&encoded);
-        if !h.meets_target(&hash) {
-            return;
-        }
+        let h = header_with_valid_pow(0x207fffff);
         // header.time (100000) must be <= network_time + 7200; use network_time=90000 so 97200 < 100000 -> too new
         let r = verify_block_header(&h, h.bits, 0, 90000);
         assert!(r.is_err());
@@ -279,7 +291,7 @@ mod tests {
 
     #[test]
     fn verify_block_empty_txs() {
-        let h = header_with_bits(0x207fffff);
+        let h = header_with_valid_pow(0x207fffff);
         let block = Block { header: h, transactions: vec![] };
         let ctx = BlockValidationContext {
             block: &block,
@@ -288,6 +300,7 @@ mod tests {
             network_time: 200000,
             expected_bits: 0x207fffff,
             flags: ScriptFlags::default(),
+            network: Network::Regtest,
         };
         let r = verify_block(&ctx, &UtxoSet::new());
         assert!(r.is_err());
@@ -296,7 +309,7 @@ mod tests {
 
     #[test]
     fn verify_block_first_not_coinbase() {
-        let h = header_with_bits(0x207fffff);
+        let h = header_with_valid_pow(0x207fffff);
         let non_cb = Transaction {
             version: 1,
             inputs: vec![TxIn {
@@ -317,6 +330,7 @@ mod tests {
             network_time: 200000,
             expected_bits: 0x207fffff,
             flags: ScriptFlags::default(),
+            network: Network::Regtest,
         };
         let r = verify_block(&ctx, &UtxoSet::new());
         assert!(r.is_err());
@@ -336,7 +350,7 @@ mod tests {
             outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
             lock_time: 0,
         };
-        let h = header_with_bits(0x207fffff);
+        let h = header_with_valid_pow(0x207fffff);
         let block = Block { header: h, transactions: vec![coinbase.clone(), coinbase] };
         let ctx = BlockValidationContext {
             block: &block,
@@ -345,6 +359,7 @@ mod tests {
             network_time: 200000,
             expected_bits: 0x207fffff,
             flags: ScriptFlags::default(),
+            network: Network::Regtest,
         };
         let r = verify_block(&ctx, &UtxoSet::new());
         assert!(r.is_err());
@@ -364,7 +379,7 @@ mod tests {
             outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
             lock_time: 0,
         };
-        let mut h = header_with_bits(0x207fffff);
+        let mut h = header_with_valid_pow(0x207fffff);
         h.merkle_root = Hash256([0xff; 32]); // wrong root
         let block = Block { header: h, transactions: vec![coinbase] };
         let ctx = BlockValidationContext {
@@ -374,6 +389,7 @@ mod tests {
             network_time: 200000,
             expected_bits: 0x207fffff,
             flags: ScriptFlags::default(),
+            network: Network::Regtest,
         };
         let r = verify_block(&ctx, &UtxoSet::new());
         assert!(r.is_err());
@@ -415,6 +431,7 @@ mod tests {
             network_time: 110000,
             expected_bits: 0x207fffff,
             flags: ScriptFlags::default(),
+            network: Network::Regtest,
         };
         let r = verify_block(&ctx, &UtxoSet::new());
         assert!(r.is_err());
@@ -457,6 +474,7 @@ mod tests {
             network_time: 110000,
             expected_bits: 0x207fffff,
             flags: ScriptFlags::default(),
+            network: Network::Regtest,
         };
         let fees = verify_block(&ctx, &UtxoSet::new()).unwrap();
         assert_eq!(fees, 0);
@@ -472,24 +490,15 @@ mod tests {
 
     #[test]
     fn verify_block_header_bad_bits() {
-        let h = header_with_bits(0x1d00ffff);
-        let encoded = encode_block_header(&h);
-        let hash = sha256d(&encoded);
-        if h.meets_target(&hash) {
-            let r = verify_block_header(&h, 0x1d00fffe, 0, 200000);
-            assert!(r.is_err());
-            assert!(matches!(r.unwrap_err(), ConsensusError::BadBits(_)));
-        }
+        let h = header_with_valid_pow(0x207fffff);
+        let r = verify_block_header(&h, 0x207ffffe, 0, 200000);
+        assert!(r.is_err());
+        assert!(matches!(r.unwrap_err(), ConsensusError::BadBits(_)));
     }
 
     #[test]
     fn verify_block_header_timestamp_too_old() {
-        let h = header_with_bits(0x207fffff);
-        let encoded = encode_block_header(&h);
-        let hash = sha256d(&encoded);
-        if !h.meets_target(&hash) {
-            return;
-        }
+        let h = header_with_valid_pow(0x207fffff);
         let r = verify_block_header(&h, h.bits, 100001, 200000);
         assert!(r.is_err());
         assert!(matches!(r.unwrap_err(), ConsensusError::TimestampTooOld));
