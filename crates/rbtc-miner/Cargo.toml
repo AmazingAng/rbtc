@@ -1,0 +1,20 @@
+[package]
+name    = "rbtc-miner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rbtc-primitives = { workspace = true }
+rbtc-crypto     = { workspace = true }
+rbtc-consensus  = { workspace = true }
+rbtc-mempool    = { workspace = true }
+rbtc-wallet     = { workspace = true }
+serde           = { workspace = true }
+serde_json      = { workspace = true }
+hex             = { workspace = true }
+thiserror       = { workspace = true }
+tracing         = { workspace = true }
+
+[dev-dependencies]
+rbtc-primitives = { workspace = true }

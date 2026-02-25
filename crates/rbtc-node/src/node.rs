@@ -17,8 +17,8 @@ use rbtc_net::{
 use rbtc_primitives::hash::Hash256;
 use rbtc_script::ScriptFlags;
 use rbtc_storage::{
-    encode_block_undo, decode_block_undo, BlockStore, ChainStore, Database, StoredBlockIndex,
-    StoredUtxo, UtxoStore,
+    encode_block_undo, decode_block_undo, AddrIndexStore, BlockStore, ChainStore, Database,
+    StoredBlockIndex, StoredUtxo, TxIndexStore, UtxoStore,
 };
 use rbtc_wallet::Wallet;
 
@@ -27,6 +27,9 @@ use crate::{
     ibd::{build_locator, IbdPhase, IbdState},
     rpc::{start_rpc_server, RpcState},
 };
+
+/// Peer ID used when a block is submitted locally (via RPC).
+const LOCAL_PEER_ID: u64 = 0;
 
 /// The main Bitcoin node
 pub struct Node {
@@ -41,6 +44,10 @@ pub struct Node {
     ibd: IbdState,
     peer_manager: PeerManager,
     node_event_rx: mpsc::UnboundedReceiver<NodeEvent>,
+    /// Sender half given to the RPC server for `submitblock` / `generatetoaddress`.
+    submit_block_tx: mpsc::UnboundedSender<rbtc_primitives::block::Block>,
+    /// Receiver for blocks submitted via the RPC `submitblock` / `generatetoaddress`.
+    submit_block_rx: mpsc::UnboundedReceiver<rbtc_primitives::block::Block>,
 }
 
 impl Node {
@@ -74,6 +81,9 @@ impl Node {
         // Optionally load the wallet
         let wallet = load_wallet(&args, Arc::clone(&db));
 
+        // Channel for RPC-submitted blocks (submitblock / generatetoaddress)
+        let (submit_block_tx, submit_block_rx) = mpsc::unbounded_channel();
+
         // Create peer manager
         let (node_event_tx, node_event_rx) = mpsc::unbounded_channel();
         let pm_config = PeerManagerConfig {
@@ -94,6 +104,8 @@ impl Node {
             ibd: IbdState::new(),
             peer_manager,
             node_event_rx,
+            submit_block_tx,
+            submit_block_rx,
         })
     }
 
@@ -111,6 +123,7 @@ impl Node {
             db: Arc::clone(&self.db),
             network_name: self.args.network.to_string(),
             wallet: self.wallet.as_ref().map(Arc::clone),
+            submit_block_tx: self.submit_block_tx.clone(),
         };
         tokio::spawn(async move {
             if let Err(e) = start_rpc_server(&rpc_addr, rpc_state).await {
@@ -157,6 +170,14 @@ impl Node {
         while let Ok(event) = self.node_event_rx.try_recv() {
             if let Err(e) = self.handle_node_event(event).await {
                 error!("event handling error: {e}");
+            }
+        }
+
+        // Process any blocks submitted via the RPC layer (submitblock /
+        // generatetoaddress).
+        while let Ok(block) = self.submit_block_rx.try_recv() {
+            if let Err(e) = self.handle_block(LOCAL_PEER_ID, block).await {
+                error!("submitted block error: {e}");
             }
         }
 
@@ -496,6 +517,18 @@ impl Node {
                     chain_store.update_tip(&block_hash, height, chainwork).ok();
                 }
 
+                // Write transaction index and address index
+                {
+                    let tx_idx = TxIndexStore::new(&self.db);
+                    let addr_idx = AddrIndexStore::new(&self.db);
+                    for (offset, (tx, txid)) in block.transactions.iter().zip(txids.iter()).enumerate() {
+                        tx_idx.put(txid, &block_hash, offset as u32).ok();
+                        for output in &tx.outputs {
+                            addr_idx.put(&output.script_pubkey.0, height, offset as u32, txid).ok();
+                        }
+                    }
+                }
+
                 // Remove confirmed transactions from the mempool
                 {
                     let mut mp = self.mempool.write().await;
@@ -585,6 +618,9 @@ impl Node {
         let block_store = BlockStore::new(&self.db);
         let utxo_store = UtxoStore::new(&self.db);
 
+        let tx_idx = TxIndexStore::new(&self.db);
+        let addr_idx = AddrIndexStore::new(&self.db);
+
         // Disconnect old chain (reverse order)
         for hash in old_chain.iter().rev() {
             let block = block_store
@@ -604,6 +640,15 @@ impl Node {
                     sha256d(&buf)
                 })
                 .collect();
+
+            // Remove tx and address index entries for this block
+            let disconnected_height = self.chain.read().await.block_index[hash].height;
+            for (offset, (tx, txid)) in block.transactions.iter().zip(txids.iter()).enumerate() {
+                tx_idx.remove(txid).ok();
+                for output in &tx.outputs {
+                    addr_idx.remove(&output.script_pubkey.0, disconnected_height, offset as u32).ok();
+                }
+            }
 
             // In-memory UTXO undo
             let mem_undo: Vec<Vec<(rbtc_primitives::transaction::OutPoint, rbtc_consensus::utxo::Utxo)>> = undo
@@ -684,6 +729,14 @@ impl Node {
 
             block_store.put_undo(hash, &encode_block_undo(&undo_stored)).ok();
             utxo_store.connect_block(&txids, &block.transactions, height).ok();
+
+            // Write tx + address index for the re-connected block
+            for (offset, (tx, txid)) in block.transactions.iter().zip(txids.iter()).enumerate() {
+                tx_idx.put(txid, hash, offset as u32).ok();
+                for output in &tx.outputs {
+                    addr_idx.put(&output.script_pubkey.0, height, offset as u32, txid).ok();
+                }
+            }
 
             {
                 let mut chain = self.chain.write().await;

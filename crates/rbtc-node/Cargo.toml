@@ -17,6 +17,7 @@ rbtc-storage    = { workspace = true }
 rbtc-net        = { workspace = true }
 rbtc-mempool    = { workspace = true }
 rbtc-wallet     = { workspace = true }
+rbtc-miner      = { workspace = true }
 tokio           = { workspace = true }
 clap            = { workspace = true }
 tracing         = { workspace = true }

@@ -1,6 +1,6 @@
 # rbtc — Bitcoin Core in Rust
 
-A from-scratch implementation of Bitcoin Core's consensus, P2P networking, and HD wallet, written in Rust. No `bitcoin` crate — all protocol types, encoding, validation, and key derivation are implemented independently.
+A from-scratch implementation of Bitcoin Core's consensus, P2P networking, HD wallet, and CPU miner, written in Rust. No `bitcoin` crate — all protocol types, encoding, validation, key derivation, and block template construction are implemented independently.
 
 ## Architecture
 
@@ -15,6 +15,7 @@ rbtc/
 │   ├── rbtc-mempool/      # Transaction pool: validation, fee rate, relay, chained txs
 │   ├── rbtc-net/          # P2P: wire protocol, peer management (tokio), IBD
 │   ├── rbtc-wallet/       # HD wallet: BIP32/39, address generation, UTXO tracking, signing
+│   ├── rbtc-miner/        # Mining: block template, tx selection, CPU PoW worker
 │   └── rbtc-node/         # Binary: node loop, JSON-RPC server, config
 ```
 
@@ -49,6 +50,22 @@ rbtc/
 - **Transaction building**: `CoinSelector` (greedy largest-first), `TxBuilder`, and `sign_transaction()` producing valid Legacy/SegWit/Taproot signatures
 - **AES-256-GCM wallet encryption**: xprv encrypted with a PBKDF2-derived key; public keys and addresses stored in plaintext for scanning
 - **Wallet RPC methods**: `getnewaddress`, `getbalance`, `listunspent`, `sendtoaddress`, `fundrawtransaction`, `signrawtransactionwithwallet`, `dumpprivkey`, `importprivkey`, `getwalletinfo`
+
+### Phase 4 — Mining Support
+- **Block template construction** (`rbtc-miner`): `BlockTemplate` assembles coinbase (BIP34 height encoding, extraNonce, miner tag), selects mempool transactions by fee-rate, and computes the Merkle root
+- **CPU PoW miner**: `mine_block()` iterates over `nonce ∈ [0, 2³²)`, refreshes timestamps every 1 000 000 hashes, and increments `extra_nonce` when the nonce space is exhausted; trivially fast on regtest (`0x207fffff`)
+- **BIP22 `getblocktemplate`**: returns `version`, `previousblockhash`, `target`, `bits`, `height`, `coinbasevalue`, and the full transaction list for external miners
+- **`submitblock`**: deserialises a hex-encoded block and injects it into the node's event loop via an `UnboundedSender<Block>` channel — same path as peer-received blocks
+- **`generatetoaddress` / `generate`**: CPU-mines N blocks to a given address (or the wallet's next address); each mining call runs in `spawn_blocking` so the async runtime stays responsive; broadcasts the resulting block hashes
+- **Mining info RPCs**: `getmininginfo`, `getnetworkhashps` (estimated from recent-blocks difficulty and block-time), `estimatesmartfee` (mempool median fee-rate)
+
+### Phase 5 — Transaction & Address Index
+- **Transaction index** (`CF_TX_INDEX`): every confirmed transaction is indexed by txid → `(block_hash, tx_offset)`; populated atomically when a block is connected and cleaned up on reorg
+- **Address index** (`CF_ADDR_INDEX`): every transaction output is indexed by scriptPubKey prefix → `(height, tx_offset, txid)`; prefix scan returns full history in block-height order
+- **`getrawtransaction` (confirmed)**: `TxIndexStore::get(txid)` resolves confirmed transactions; verbose=false returns raw hex, verbose=true returns `{txid, blockhash, confirmations, vin, vout}`
+- **`getaddresstxids`**: returns all txids (hex) that produced an output to a given address, with optional `{start, end}` height filter
+- **`getaddressutxos`**: returns all currently unspent outputs for an address: `{txid, vout, value, height, confirmations}`
+- **`getaddressbalance`**: returns `{balance, received}` in satoshis — `balance` = unspent, `received` = all-time total received
 
 ## Dependencies
 
@@ -97,6 +114,20 @@ cargo build --release
 
 # Run node with an existing wallet (unlocked for RPC use)
 ./target/release/rbtc --network regtest --wallet --wallet-passphrase "my secret"
+
+# --- Mining (regtest) ---
+
+# Mine 101 blocks to a specific address (makes coinbase spendable)
+curl -s -d '{"method":"generatetoaddress","params":[101,"bcrt1q..."]}' http://127.0.0.1:8332/
+
+# Mine 1 block to the wallet's next address (requires --create-wallet / --wallet)
+curl -s -d '{"method":"generate","params":[1]}' http://127.0.0.1:8332/
+
+# Get a BIP22 block template for an external miner
+curl -s -d '{"method":"getblocktemplate","params":[]}' http://127.0.0.1:8332/
+
+# Submit a solved block (hex-encoded)
+curl -s -d '{"method":"submitblock","params":["<hex>"]}' http://127.0.0.1:8332/
 
 # Show all options
 ./target/release/rbtc --help
@@ -159,7 +190,7 @@ curl -s -d '{"method":"sendtoaddress","params":["bc1q...","0.001"]}' http://127.
 | `getblockcount` | — | Current block height |
 | `getblockhash` | `height` | Block hash at given height |
 | `getblock` | `hash`, `verbosity` (0=hex, 1=json) | Block data |
-| `getrawtransaction` | `txid` | Transaction from mempool (hex or json) |
+| `getrawtransaction` | `txid`, `verbose` (bool) | Transaction from mempool or confirmed block (hex or json) |
 | `getrawmempool` | — | List of txids sorted by fee rate |
 | `sendrawtransaction` | `hex` | Validates and relays a raw transaction |
 
@@ -176,6 +207,25 @@ curl -s -d '{"method":"sendtoaddress","params":["bc1q...","0.001"]}' http://127.
 | `dumpprivkey` | `address` | WIF private key |
 | `importprivkey` | `wif, [label]` | Imported address string |
 | `getwalletinfo` | — | `{balance, unconfirmed_balance, txcount, keypoolsize}` |
+### Mining Methods
+
+| Method | Parameters | Returns |
+|--------|-----------|---------|
+| `getblocktemplate` | — | BIP22 template: `{version, previousblockhash, target, bits, height, coinbasevalue, transactions, …}` |
+| `submitblock` | `hex` | `null` on success; error on invalid block |
+| `generatetoaddress` | `nblocks, address` | Array of mined block hashes |
+| `generate` | `nblocks` | Array of mined block hashes (wallet's address; requires `--wallet`) |
+| `getmininginfo` | — | `{blocks, difficulty, networkhashps, pooledtx, chain}` |
+| `getnetworkhashps` | `[nblocks]` | Estimated network hash rate (H/s) |
+| `estimatesmartfee` | `[conf_target]` | `{feerate, blocks}` — fee rate in BTC/kB |
+
+### Address Index Methods
+
+| Method | Parameters | Returns |
+|--------|-----------|---------|
+| `getaddresstxids` | `address`, `[{"start":N,"end":M}]` | Array of txid hex strings ordered by block height |
+| `getaddressutxos` | `address` | `[{txid, vout, value, height, confirmations}, …]` |
+| `getaddressbalance` | `address` | `{balance, received}` in satoshis |
 
 ## Implementation Notes
 
@@ -220,6 +270,21 @@ curl -s -d '{"method":"sendtoaddress","params":["bc1q...","0.001"]}' http://127.
 - **Encryption**: xprv bytes encrypted with AES-256-GCM; key = PBKDF2-SHA256(passphrase, 16-byte salt, 100,000 iterations); stored as `salt || nonce || ciphertext+tag` in `CF_WALLET`
 - **Incremental UTXO scanning**: After each block is connected, `Wallet::scan_block()` checks every TxOut's scriptPubKey against the in-memory `script_to_addr` map (O(outputs)); `remove_spent()` checks TxIn outpoints against `wallet.utxos`
 
+### Mining (`rbtc-miner`)
+
+- **Block template**: `BlockTemplate::new()` receives chain tip info + mempool-selected transactions. `build_block(extra_nonce, time, nonce)` rebuilds the coinbase, computes TXIDs, constructs the Merkle tree, and returns a full `Block` candidate
+- **Coinbase construction**: `build_coinbase()` encodes block height via BIP34 CScriptNum push (1–4 bytes, little-endian with sign extension), appends a 4-byte `extra_nonce` push and a 5-byte `"rbtc\0"` coinbase tag; total scriptSig is always 2–100 bytes
+- **Transaction selection**: `TxSelector::select()` iterates `mempool.txids_by_fee_rate()` (descending fee-rate) and greedily includes transactions up to 3,996,000 WU, leaving headroom for the coinbase
+- **PoW loop**: `mine_block()` pre-computes the Merkle root once per `extra_nonce` value. The inner loop iterates nonce ∈ `[0, 2³²)`, serialises only the 80-byte header, runs `double_sha256`, and calls `BlockHeader::meets_target()`. Timestamp is refreshed every 1,000,000 iterations. On nonce exhaustion, `extra_nonce` increments and the Merkle root is recomputed
+- **Node integration**: `generatetoaddress` / `submitblock` send completed blocks via an `mpsc::UnboundedSender<Block>` channel; the node's event loop drains this channel alongside peer events and feeds blocks into the existing `handle_block()` path (validation → UTXO connect → persistence → mempool prune → wallet scan)
+
+### Transaction & Address Index (`rbtc-storage` Phase 5)
+
+- **TxIndexStore**: key = txid (32 bytes); value = block_hash (32 bytes) + tx_offset (4 bytes LE). `put` is called for every transaction when a block is connected; `remove` is called during chain reorganization. Zero-copy lookup: `get(txid)` returns `(Hash256, u32)` decoded from a fixed 36-byte value.
+- **AddrIndexStore**: key = `[script_len: 1B][scriptPubKey: N B][height: 4B BE][tx_offset: 4B BE]`; value = txid (32 bytes). Big-endian encoding for height and tx_offset ensures lexicographic order matches chronological order. `iter_by_script(script)` issues a RocksDB prefix scan over `[script_len][scriptPubKey]`, collecting all matching entries. `remove` reconstructs the exact key from script + height + tx_offset during reorgs.
+- **`getrawtransaction` (confirmed)**: looks up txid in `CF_TX_INDEX` → loads the block from `CF_BLOCK_DATA` → returns `transactions[tx_offset]`. Verbose mode includes `{blockhash, confirmations, vin, vout}`.
+- **Address RPCs**: all three (`getaddresstxids`, `getaddressutxos`, `getaddressbalance`) decode the input address to scriptPubKey via `rbtc-wallet::address::address_to_script`, then prefix-scan `CF_ADDR_INDEX`. For UTXO/balance queries each candidate output is cross-checked against the in-memory `UtxoSet` to determine if it is still unspent.
+
 ### Storage Layer (`rbtc-storage`)
 
 Column families in RocksDB:
@@ -231,7 +296,8 @@ Column families in RocksDB:
 | `utxo` | `StoredUtxo` per `OutPoint` (36-byte key: txid+vout) |
 | `chain_state` | Best block hash, height, chainwork |
 | `undo` | Per-block spent UTXO list (enables reorg without resync) |
-| `tx_index` | Reserved for future transaction index |
+| `tx_index` | txid (32 B) → block_hash (32 B) + tx_offset (4 B LE); populated on block connect |
+| `addr_index` | `[script_len][scriptPubKey][height BE][tx_offset BE]` → txid; prefix-scannable per address |
 | `wallet` | Encrypted xprv, address→pubkey map, wallet UTXOs (JSON-encoded) |
 
 ### Restart Recovery
@@ -258,7 +324,7 @@ When a competing chain with more cumulative work is detected, `reorganize_to(new
 cargo test --workspace
 ```
 
-201 tests across all crates — all pass.
+227 tests across all crates — all pass.
 
 | Crate | Tests |
 |-------|-------|
@@ -266,10 +332,11 @@ cargo test --workspace
 | `rbtc-crypto` | 33 |
 | `rbtc-consensus` | 27 |
 | `rbtc-script` | 25 |
-| `rbtc-storage` | 11 |
+| `rbtc-storage` | 14 |
 | `rbtc-mempool` | 4 |
 | `rbtc-net` | 6 |
 | `rbtc-wallet` | 35 |
+| `rbtc-miner` | 14 |
 
 ### Integration Tests Against Bitcoin Core
 
@@ -323,7 +390,6 @@ cargo llvm-cov --workspace --all-features --tests --lcov --output-path lcov.info
 
 ## Known Limitations
 
-- No transaction index (`tx_index` CF reserved but not populated; `getrawtransaction` only searches the mempool)
 - No BIP37 bloom filtering
 - No compact blocks (BIP152)
 - Signet challenge validation not implemented
@@ -331,3 +397,5 @@ cargo llvm-cov --workspace --all-features --tests --lcov --output-path lcov.info
 - `sendrawtransaction` relay requires script-valid inputs (P2PKH etc.); bare scripts that rely on policy flags may differ from Bitcoin Core behavior
 - Wallet imported keys (via `importprivkey`) are cached only for the current session; WIF keys are not re-derived from the master xprv
 - `fundrawtransaction` uses a greedy (largest-first) coin selector; Branch-and-Bound selection is a future improvement
+- CPU miner is single-threaded; no multi-core parallelism — suitable for regtest only; mainnet would require ASIC hardware
+- `generatetoaddress` waits 50 ms between blocks so the node event loop can process the previous block before the next template is built; rapid generation of many blocks may leave some unprocessed

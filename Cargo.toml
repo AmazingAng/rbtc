@@ -8,6 +8,7 @@ members = [
     "crates/rbtc-net",
     "crates/rbtc-mempool",
     "crates/rbtc-wallet",
+    "crates/rbtc-miner",
     "crates/rbtc-node",
 ]
 resolver = "2"
@@ -28,6 +29,7 @@ rbtc-storage    = { path = "crates/rbtc-storage" }
 rbtc-net        = { path = "crates/rbtc-net" }
 rbtc-mempool    = { path = "crates/rbtc-mempool" }
 rbtc-wallet     = { path = "crates/rbtc-wallet" }
+rbtc-miner      = { path = "crates/rbtc-miner" }
 
 # Cryptography
 secp256k1 = { version = "0.31", features = ["global-context"] }

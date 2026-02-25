@@ -5,9 +5,12 @@
 //!   getrawtransaction, getrawmempool, sendrawtransaction,
 //!   getnewaddress, getbalance, listunspent, sendtoaddress,
 //!   signrawtransactionwithwallet, dumpprivkey, importprivkey,
-//!   getwalletinfo, fundrawtransaction.
+//!   getwalletinfo, fundrawtransaction,
+//!   getblocktemplate, submitblock, generatetoaddress, generate,
+//!   getmininginfo, getnetworkhashps, estimatesmartfee.
 
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use axum::{
@@ -19,14 +22,21 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::sync::RwLock;
-use tracing::{debug, warn};
+use tokio::sync::{mpsc, RwLock};
+use tracing::{debug, info, warn};
 
 use rbtc_consensus::chain::ChainState;
+use rbtc_crypto::sha256d;
 use rbtc_mempool::Mempool;
-use rbtc_primitives::{codec::{Decodable, Encodable}, hash::Hash256, transaction::Transaction};
-use rbtc_storage::{BlockStore, Database};
-use rbtc_wallet::{AddressType, Wallet};
+use rbtc_miner::{BlockTemplate, TxSelector, mine_block};
+use rbtc_primitives::{
+    block::{Block, nbits_to_target},
+    codec::{Decodable, Encodable},
+    hash::Hash256,
+    transaction::{OutPoint, Transaction},
+};
+use rbtc_storage::{AddrIndexStore, BlockStore, Database, TxIndexStore};
+use rbtc_wallet::{AddressType, Wallet, address::address_to_script};
 
 // ── Shared state ─────────────────────────────────────────────────────────────
 
@@ -38,6 +48,8 @@ pub struct RpcState {
     pub network_name: String,
     /// Optional HD wallet; `None` when the node is started without `--wallet`.
     pub wallet: Option<Arc<RwLock<Wallet>>>,
+    /// Channel to submit mined / external blocks into the node's event loop.
+    pub submit_block_tx: mpsc::UnboundedSender<Block>,
 }
 
 // ── JSON-RPC envelope ─────────────────────────────────────────────────────────
@@ -115,6 +127,18 @@ async fn handle_rpc(
         "dumpprivkey"                => rpc_dumpprivkey(&state, &params).await,
         "importprivkey"              => rpc_importprivkey(&state, &params).await,
         "getwalletinfo"              => rpc_getwalletinfo(&state).await,
+        // Address index
+        "getaddresstxids"            => rpc_getaddresstxids(&state, &params).await,
+        "getaddressutxos"            => rpc_getaddressutxos(&state, &params).await,
+        "getaddressbalance"          => rpc_getaddressbalance(&state, &params).await,
+        // Mining
+        "getblocktemplate"           => rpc_getblocktemplate(&state, &params).await,
+        "submitblock"                => rpc_submitblock(&state, &params).await,
+        "generatetoaddress"          => rpc_generatetoaddress(&state, &params).await,
+        "generate"                   => rpc_generate(&state, &params).await,
+        "getmininginfo"              => rpc_getmininginfo(&state).await,
+        "getnetworkhashps"           => rpc_getnetworkhashps(&state, &params).await,
+        "estimatesmartfee"           => rpc_estimatesmartfee(&state, &params).await,
         method => {
             warn!("rpc: unknown method {method}");
             Err((-32601, format!("Method not found: {method}")))
@@ -240,8 +264,70 @@ async fn rpc_getrawtransaction(state: &RpcState, params: &Value) -> RpcResult {
         }
     }
 
-    // TODO: scan the block index for this txid (requires a tx index)
-    Err((-5, "No such mempool transaction. Use -txindex to look up confirmed transactions.".to_string()))
+    // Look up confirmed transaction via the tx index
+    let tx_idx = TxIndexStore::new(&state.db);
+    let (block_hash, tx_offset) = match tx_idx.get(&txid) {
+        Ok(Some(v)) => v,
+        Ok(None) => return Err((-5, format!("No transaction found for txid {txid_hex}"))),
+        Err(e) => return Err((-5, format!("tx index error: {e}"))),
+    };
+
+    let block_store = BlockStore::new(&state.db);
+    let block = block_store
+        .get_block(&block_hash)
+        .map_err(|e| (-5, format!("block load error: {e}")))?
+        .ok_or_else(|| (-5, format!("block {} not found", block_hash.to_hex())))?;
+
+    let tx = block
+        .transactions
+        .get(tx_offset as usize)
+        .ok_or_else(|| (-5, format!("tx offset {tx_offset} out of range")))?;
+
+    if verbose {
+        let chain = state.chain.read().await;
+        let best_height = chain.height();
+        let tx_height = chain
+            .block_index
+            .get(&block_hash)
+            .map(|bi| bi.height)
+            .unwrap_or(0);
+        let confirmations = best_height.saturating_sub(tx_height) + 1;
+        drop(chain);
+
+        let mut txid_bytes = [0u8; 32];
+        let mut buf = Vec::new();
+        tx.encode_legacy(&mut buf).ok();
+        let computed_txid = rbtc_crypto::sha256d(&buf);
+        txid_bytes.copy_from_slice(&computed_txid.0);
+
+        let vin: Vec<Value> = tx.inputs.iter().map(|inp| {
+            json!({
+                "txid": inp.previous_output.txid.to_hex(),
+                "vout": inp.previous_output.vout,
+                "sequence": inp.sequence,
+            })
+        }).collect();
+
+        let vout: Vec<Value> = tx.outputs.iter().enumerate().map(|(n, out)| {
+            json!({
+                "n": n,
+                "value": out.value,
+                "scriptPubKey": { "hex": hex::encode(&out.script_pubkey.0) },
+            })
+        }).collect();
+
+        Ok(json!({
+            "txid": txid.to_hex(),
+            "blockhash": block_hash.to_hex(),
+            "confirmations": confirmations,
+            "vin": vin,
+            "vout": vout,
+        }))
+    } else {
+        let mut buf = Vec::new();
+        tx.encode_segwit(&mut buf).ok();
+        Ok(json!(hex::encode(buf)))
+    }
 }
 
 async fn rpc_getrawmempool(state: &RpcState) -> RpcResult {
@@ -468,6 +554,442 @@ async fn rpc_getwalletinfo(state: &RpcState) -> RpcResult {
         "txcount":          w.utxo_count(),
         "keypoolsize":      w.address_count(),
     }))
+}
+
+// ── Mining RPC implementations ────────────────────────────────────────────────
+
+/// Build a `BlockTemplate` from the current chain/mempool state.
+async fn build_template(state: &RpcState, output_script: rbtc_primitives::script::Script) -> BlockTemplate {
+    let chain = state.chain.read().await;
+    let mempool = state.mempool.read().await;
+
+    let prev_hash = chain.best_hash().unwrap_or(Hash256::ZERO);
+    let next_height = chain.height() + 1;
+    let bits = chain.next_required_bits();
+
+    let (transactions, fees) = TxSelector::select(&mempool);
+
+    BlockTemplate::new(
+        0x2000_0000, // version
+        prev_hash,
+        bits,
+        next_height,
+        fees,
+        transactions,
+        output_script,
+    )
+}
+
+async fn rpc_getblocktemplate(state: &RpcState, _params: &Value) -> RpcResult {
+    let chain = state.chain.read().await;
+    let prev_hash = chain.best_hash().unwrap_or(Hash256::ZERO);
+    let next_height = chain.height() + 1;
+    let bits = chain.next_required_bits();
+    let mtp = chain.median_time_past(chain.height());
+    drop(chain);
+
+    let mempool = state.mempool.read().await;
+    let (transactions, fees) = TxSelector::select(&mempool);
+    drop(mempool);
+
+    let coinbase_value = rbtc_consensus::tx_verify::block_subsidy(next_height) + fees;
+
+    // Build target hex (big-endian)
+    let mut target_bytes = nbits_to_target(bits);
+    target_bytes.reverse();
+    let target_hex = hex::encode(target_bytes);
+
+    // Encode each selected transaction
+    let tx_entries: Vec<Value> = transactions.iter().map(|tx| {
+        let mut buf = Vec::new();
+        tx.encode(&mut buf).unwrap_or_default();
+        let mut legacy_buf = Vec::new();
+        tx.encode_legacy(&mut legacy_buf).unwrap_or_default();
+        let txid = rbtc_crypto::sha256d(&legacy_buf).to_hex();
+        json!({
+            "data":   hex::encode(&buf),
+            "txid":   txid,
+            "fee":    0u64,   // fees per-tx not tracked in mempool entry here
+            "weight": tx.weight(),
+        })
+    }).collect();
+
+    let curtime = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as u64;
+
+    Ok(json!({
+        "version":           0x2000_0000i64,
+        "rules":             ["csv", "segwit"],
+        "previousblockhash": prev_hash.to_hex(),
+        "transactions":      tx_entries,
+        "coinbaseaux":       {},
+        "coinbasevalue":     coinbase_value,
+        "longpollid":        prev_hash.to_hex(),
+        "target":            target_hex,
+        "mintime":           mtp,
+        "mutable":           ["time", "transactions", "prevblock"],
+        "noncerange":        "00000000ffffffff",
+        "sigoplimit":        80_000u64,
+        "sizelimit":         4_000_000u64,
+        "weightlimit":       4_000_000u64,
+        "curtime":           curtime,
+        "bits":              format!("{:08x}", bits),
+        "height":            next_height,
+    }))
+}
+
+async fn rpc_submitblock(state: &RpcState, params: &Value) -> RpcResult {
+    let hex_str = params
+        .get(0)
+        .and_then(Value::as_str)
+        .ok_or((-32602, "expected hex-encoded block".to_string()))?;
+
+    let raw = hex::decode(hex_str).map_err(|_| (-22, "block decode failed".to_string()))?;
+    let block = Block::decode_from_slice(&raw)
+        .map_err(|e| (-22, format!("block decode failed: {e}")))?;
+
+    state
+        .submit_block_tx
+        .send(block)
+        .map_err(|_| (-1, "node channel closed".to_string()))?;
+
+    Ok(json!(null))
+}
+
+async fn rpc_generatetoaddress(state: &RpcState, params: &Value) -> RpcResult {
+    let nblocks = params
+        .get(0)
+        .and_then(Value::as_u64)
+        .ok_or((-32602, "expected nblocks".to_string()))? as usize;
+    let address = params
+        .get(1)
+        .and_then(Value::as_str)
+        .ok_or((-32602, "expected address".to_string()))?;
+
+    let output_script = address_to_script(address)
+        .map_err(|e| (-5, format!("invalid address: {e}")))?;
+
+    let mut block_hashes: Vec<String> = Vec::with_capacity(nblocks);
+
+    for _ in 0..nblocks {
+        let template = build_template(state, output_script.clone()).await;
+
+        // Mine on a blocking thread so we don't stall the async runtime.
+        let template_clone = template.clone();
+        let block = tokio::task::spawn_blocking(move || mine_block(&template_clone))
+            .await
+            .map_err(|e| (-1, format!("mining task failed: {e}")))?;
+
+        // Record the hash before moving block into the channel.
+        let hash = {
+            use rbtc_consensus::chain::header_hash;
+            header_hash(&block.header).to_hex()
+        };
+
+        state
+            .submit_block_tx
+            .send(block)
+            .map_err(|_| (-1, "node channel closed".to_string()))?;
+
+        block_hashes.push(hash);
+        info!("generatetoaddress: mined block {}", block_hashes.last().unwrap());
+
+        // Brief yield so the node event loop can process the submitted block
+        // and update its chain state before we build the next template.
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+
+    Ok(json!(block_hashes))
+}
+
+async fn rpc_generate(state: &RpcState, params: &Value) -> RpcResult {
+    let wallet_arc = require_wallet!(state);
+
+    let nblocks = params
+        .get(0)
+        .and_then(Value::as_u64)
+        .ok_or((-32602, "expected nblocks".to_string()))? as usize;
+
+    // Get the wallet's default (most recent) P2WPKH address.
+    let address = {
+        let mut w = wallet_arc.write().await;
+        w.new_address(AddressType::SegWit)
+            .map_err(|e| (-1, e.to_string()))?
+    };
+
+    let fake_params = json!([nblocks, address]);
+    rpc_generatetoaddress(state, &fake_params).await
+}
+
+async fn rpc_getmininginfo(state: &RpcState) -> RpcResult {
+    let chain = state.chain.read().await;
+    let height = chain.height();
+    let bits = chain.next_required_bits();
+    drop(chain);
+
+    let mp = state.mempool.read().await;
+    let pooledtx = mp.len();
+    drop(mp);
+
+    // Difficulty = difficulty_1_target / current_target
+    // difficulty_1_target (for mainnet genesis) = 0x00000000ffff0000…00 (LE)
+    let difficulty = bits_to_difficulty(bits);
+
+    let networkhashps = estimate_network_hashps(state, 120).await;
+
+    Ok(json!({
+        "blocks":             height,
+        "currentblockweight": 0u64,
+        "currentblocktx":     0u64,
+        "difficulty":         difficulty,
+        "networkhashps":      networkhashps,
+        "pooledtx":           pooledtx,
+        "chain":              state.network_name,
+    }))
+}
+
+async fn rpc_getnetworkhashps(state: &RpcState, params: &Value) -> RpcResult {
+    let nblocks = params.get(0).and_then(Value::as_u64).unwrap_or(120) as u32;
+    let hashps = estimate_network_hashps(state, nblocks).await;
+    Ok(json!(hashps))
+}
+
+async fn rpc_estimatesmartfee(state: &RpcState, params: &Value) -> RpcResult {
+    let _conf_target = params.get(0).and_then(Value::as_u64).unwrap_or(6);
+
+    let mp = state.mempool.read().await;
+    let txids = mp.txids_by_fee_rate();
+
+    // Median fee rate across mempool transactions (sat/vB)
+    let fee_rate = if txids.is_empty() {
+        1.0f64 // default floor
+    } else {
+        let rates: Vec<f64> = txids
+            .iter()
+            .filter_map(|id| mp.get(id))
+            .map(|e| e.fee_rate as f64)
+            .collect();
+        let median_idx = rates.len() / 2;
+        rates[median_idx]
+    };
+
+    Ok(json!({
+        "feerate": fee_rate / 1000.0,   // convert sat/vB to BTC/kB
+        "blocks":  _conf_target,
+    }))
+}
+
+// ── Mining helpers ─────────────────────────────────────────────────────────────
+
+/// Approximate difficulty from nBits.
+/// difficulty = 0x00000000FFFF0000…/current_target (big-endian comparison).
+fn bits_to_difficulty(bits: u32) -> f64 {
+    // difficulty_1 target mantissa for mainnet genesis bits 0x1d00ffff
+    const DIFF1_MANTISSA: f64 = 0x00ff_ff00 as f64;
+
+    let exp = (bits >> 24) as i32;
+    let mantissa = (bits & 0x007f_ffff) as f64;
+    if mantissa == 0.0 {
+        return 0.0;
+    }
+
+    // difficulty ≈ diff1_mantissa / mantissa × 256^(diff1_exp - exp)
+    // diff1_exp = 0x1d - 3 + 1 = 29 (index of MSB in LE target)
+    let diff1_exp: i32 = 29;
+    let cur_exp = exp - 3; // index of MSB
+    let exp_diff = diff1_exp - cur_exp;
+    let scale = 256f64.powi(exp_diff);
+    DIFF1_MANTISSA / mantissa * scale
+}
+
+/// Estimate the network hashrate from the last `nblocks` blocks.
+/// hashrate ≈ difficulty × 2^32 / avg_block_time_seconds
+async fn estimate_network_hashps(state: &RpcState, nblocks: u32) -> f64 {
+    let chain = state.chain.read().await;
+    let height = chain.height();
+
+    if height == 0 || nblocks == 0 {
+        return 0.0;
+    }
+
+    let end_height = height;
+    let start_height = end_height.saturating_sub(nblocks.min(height));
+
+    let end_time = chain.get_ancestor_time(end_height).unwrap_or(0) as f64;
+    let start_time = chain.get_ancestor_time(start_height).unwrap_or(0) as f64;
+    let elapsed = end_time - start_time;
+
+    if elapsed <= 0.0 {
+        return 0.0;
+    }
+
+    let bits = chain.next_required_bits();
+    let difficulty = bits_to_difficulty(bits);
+    let blocks_in_period = (end_height - start_height) as f64;
+
+    difficulty * 4_294_967_296.0 * blocks_in_period / elapsed
+}
+
+// ── Address index RPCs ────────────────────────────────────────────────────────
+
+/// Resolve a Bitcoin address string to its scriptPubKey bytes.
+/// Delegates to `rbtc-wallet`'s address_to_script; returns RPC error on failure.
+fn resolve_script(address: &str) -> std::result::Result<Vec<u8>, (i32, String)> {
+    address_to_script(address)
+        .map(|s| s.0)
+        .map_err(|e| (-8, format!("Invalid address: {e}")))
+}
+
+/// `getaddresstxids address [{"start":N,"end":M}]`
+/// Returns a list of txids (hex strings) for all transactions that produced
+/// an output to `address`, ordered by block height ascending.
+async fn rpc_getaddresstxids(state: &RpcState, params: &Value) -> RpcResult {
+    let address = params
+        .get(0)
+        .and_then(Value::as_str)
+        .ok_or((-32602, "Expected address string".to_string()))?;
+
+    let script = resolve_script(address)?;
+
+    let filter_start = params.get(1).and_then(|v| v.get("start")).and_then(Value::as_u64);
+    let filter_end   = params.get(1).and_then(|v| v.get("end")).and_then(Value::as_u64);
+
+    let addr_idx = AddrIndexStore::new(&state.db);
+    let entries = addr_idx
+        .iter_by_script(&script)
+        .map_err(|e| (-5, format!("addr index error: {e}")))?;
+
+    let txids: Vec<Value> = entries
+        .into_iter()
+        .filter(|e| {
+            let h = e.height as u64;
+            filter_start.map_or(true, |s| h >= s) && filter_end.map_or(true, |en| h <= en)
+        })
+        .map(|e| json!(e.txid.to_hex()))
+        .collect();
+
+    Ok(json!(txids))
+}
+
+/// `getaddressutxos address`
+/// Returns all unspent outputs controlled by `address`:
+/// `[{txid, vout, value, height, confirmations}, …]`
+async fn rpc_getaddressutxos(state: &RpcState, params: &Value) -> RpcResult {
+    let address = params
+        .get(0)
+        .and_then(Value::as_str)
+        .ok_or((-32602, "Expected address string".to_string()))?;
+
+    let script = resolve_script(address)?;
+
+    let addr_idx = AddrIndexStore::new(&state.db);
+    let entries = addr_idx
+        .iter_by_script(&script)
+        .map_err(|e| (-5, format!("addr index error: {e}")))?;
+
+    let block_store = BlockStore::new(&state.db);
+    let chain = state.chain.read().await;
+    let best_height = chain.height();
+
+    let mut utxos = Vec::new();
+
+    for entry in entries {
+        // Load the block to read the specific output
+        let block_hash = match chain.get_ancestor_hash(entry.height) {
+            Some(h) => h,
+            None => continue,
+        };
+        let block = match block_store.get_block(&block_hash).ok().flatten() {
+            Some(b) => b,
+            None => continue,
+        };
+        let tx = match block.transactions.get(entry.tx_offset as usize) {
+            Some(t) => t,
+            None => continue,
+        };
+
+        // Check each output of this tx against our script
+        for (vout, output) in tx.outputs.iter().enumerate() {
+            if output.script_pubkey.0 != script {
+                continue;
+            }
+            // Build the OutPoint and check it's still in the UTXO set
+            let mut txid_buf = Vec::new();
+            tx.encode_legacy(&mut txid_buf).ok();
+            let txid = sha256d(&txid_buf);
+            let outpoint = OutPoint { txid, vout: vout as u32 };
+            if chain.utxos.get(&outpoint).is_some() {
+                let confirmations = best_height.saturating_sub(entry.height) + 1;
+                utxos.push(json!({
+                    "txid": txid.to_hex(),
+                    "vout": vout,
+                    "value": output.value,
+                    "height": entry.height,
+                    "confirmations": confirmations,
+                }));
+            }
+        }
+    }
+
+    Ok(json!(utxos))
+}
+
+/// `getaddressbalance address`
+/// Returns `{balance, received}` in satoshis.
+/// `balance`  = sum of all unspent outputs.
+/// `received` = sum of all outputs ever sent to this address (spent + unspent).
+async fn rpc_getaddressbalance(state: &RpcState, params: &Value) -> RpcResult {
+    let address = params
+        .get(0)
+        .and_then(Value::as_str)
+        .ok_or((-32602, "Expected address string".to_string()))?;
+
+    let script = resolve_script(address)?;
+
+    let addr_idx = AddrIndexStore::new(&state.db);
+    let entries = addr_idx
+        .iter_by_script(&script)
+        .map_err(|e| (-5, format!("addr index error: {e}")))?;
+
+    let block_store = BlockStore::new(&state.db);
+    let chain = state.chain.read().await;
+
+    let mut balance: u64 = 0;
+    let mut received: u64 = 0;
+
+    for entry in entries {
+        let block_hash = match chain.get_ancestor_hash(entry.height) {
+            Some(h) => h,
+            None => continue,
+        };
+        let block = match block_store.get_block(&block_hash).ok().flatten() {
+            Some(b) => b,
+            None => continue,
+        };
+        let tx = match block.transactions.get(entry.tx_offset as usize) {
+            Some(t) => t,
+            None => continue,
+        };
+
+        let mut txid_buf = Vec::new();
+        tx.encode_legacy(&mut txid_buf).ok();
+        let txid = sha256d(&txid_buf);
+
+        for (vout, output) in tx.outputs.iter().enumerate() {
+            if output.script_pubkey.0 != script {
+                continue;
+            }
+            received += output.value;
+            let outpoint = OutPoint { txid, vout: vout as u32 };
+            if chain.utxos.get(&outpoint).is_some() {
+                balance += output.value;
+            }
+        }
+    }
+
+    Ok(json!({ "balance": balance, "received": received }))
 }
 
 // ── Server startup ────────────────────────────────────────────────────────────

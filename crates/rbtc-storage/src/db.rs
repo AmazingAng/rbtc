@@ -1,4 +1,4 @@
-use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, Options, WriteBatch, DB};
+use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, IteratorMode, Options, WriteBatch, DB};
 use std::path::Path;
 
 use crate::error::{Result, StorageError};
@@ -9,6 +9,7 @@ pub const CF_UTXO: &str = "utxo";
 pub const CF_CHAIN_STATE: &str = "chain_state";
 pub const CF_BLOCK_DATA: &str = "block_data";
 pub const CF_TX_INDEX: &str = "tx_index";
+pub const CF_ADDR_INDEX: &str = "addr_index";
 pub const CF_UNDO: &str = "undo";
 pub const CF_WALLET: &str = "wallet";
 
@@ -30,6 +31,7 @@ impl Database {
             ColumnFamilyDescriptor::new(CF_CHAIN_STATE, Options::default()),
             ColumnFamilyDescriptor::new(CF_BLOCK_DATA, Options::default()),
             ColumnFamilyDescriptor::new(CF_TX_INDEX, Options::default()),
+            ColumnFamilyDescriptor::new(CF_ADDR_INDEX, Options::default()),
             ColumnFamilyDescriptor::new(CF_UNDO, Options::default()),
             ColumnFamilyDescriptor::new(CF_WALLET, Options::default()),
         ];
@@ -76,9 +78,25 @@ impl Database {
     pub fn iter_cf(&self, cf_name: &str) -> Result<impl Iterator<Item = (Box<[u8]>, Box<[u8]>)> + '_> {
         let cf = self.cf(cf_name)?;
         let iter = self.db
-            .iterator_cf(cf, rocksdb::IteratorMode::Start)
+            .iterator_cf(cf, IteratorMode::Start)
             .filter_map(|item| item.ok());
         Ok(iter)
+    }
+
+    /// Iterate all entries whose key starts with `prefix`, in lexicographic order.
+    /// Returns a collected `Vec` so the borrow on `self` is not held across await points.
+    pub fn iter_cf_prefix(&self, cf_name: &str, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let cf = self.cf(cf_name)?;
+        let iter = self.db.iterator_cf(cf, IteratorMode::From(prefix, rocksdb::Direction::Forward));
+        let mut result = Vec::new();
+        for item in iter {
+            let (k, v) = item.map_err(StorageError::Rocks)?;
+            if !k.starts_with(prefix) {
+                break;
+            }
+            result.push((k.to_vec(), v.to_vec()));
+        }
+        Ok(result)
     }
 
     fn cf(&self, name: &str) -> Result<&ColumnFamily> {
