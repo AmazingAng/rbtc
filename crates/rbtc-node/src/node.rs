@@ -699,6 +699,9 @@ impl Node {
     const PER_PEER_INFLIGHT_BLOCKS: u32 = 16;
     /// Global download window ahead of connected tip.
     const GLOBAL_WINDOW_BLOCKS: u32 = 1024;
+    /// If the frontier block is in-flight longer than this, re-request it from
+    /// another idle peer (without waiting for full stall timeout).
+    const FRONTIER_RETRY_TIMEOUT: Duration = Duration::from_secs(15);
 
     /// Assign pending height-range segments to idle peers.
     /// Called whenever a new peer connects, a batch finishes, or after a stall.
@@ -736,16 +739,49 @@ impl Node {
                     .map(|bi| bi.status == BlockStatus::InChain)
                     .unwrap_or(false)
             };
-            if !frontier_connected && !self.ibd.is_hash_inflight(&frontier_hash) {
-                if let Some(peer_id) = idle_peers.first().copied() {
-                    info!(
-                        "IBD: assigning frontier height {} (1 block) to peer {}",
-                        frontier, peer_id
-                    );
-                    self.ibd.assigned_ranges.insert(peer_id, (frontier, frontier));
-                    self.ibd.record_peer_request(peer_id, vec![frontier_hash]);
-                    self.peer_manager.request_blocks(peer_id, &[frontier_hash]);
-                    idle_peers.remove(0);
+            if !frontier_connected {
+                // If frontier is already in-flight, only re-issue when it has
+                // been waiting too long.
+                let frontier_inflight_age = self
+                    .ibd
+                    .peer_downloads
+                    .values()
+                    .find(|dl| dl.hashes.iter().any(|h| h == &frontier_hash))
+                    .map(|dl| dl.requested_at.elapsed());
+                let should_request_frontier = match frontier_inflight_age {
+                    None => true,
+                    Some(age) => age >= Self::FRONTIER_RETRY_TIMEOUT,
+                };
+                if should_request_frontier {
+                    if let Some(peer_id) = idle_peers.first().copied() {
+                        info!(
+                            "IBD: assigning frontier height {} (1 block) to peer {}",
+                            frontier, peer_id
+                        );
+                        self.ibd.assigned_ranges.insert(peer_id, (frontier, frontier));
+                        self.ibd.record_peer_request(peer_id, vec![frontier_hash]);
+                        self.peer_manager.request_blocks(peer_id, &[frontier_hash]);
+                        idle_peers.remove(0);
+                    }
+                }
+
+                // Remove frontier from pending_ranges so it won't be re-dispatched
+                // again by the generic range assignment loop below.
+                if let Some((idx, (start, end))) = self
+                    .ibd
+                    .pending_ranges
+                    .iter()
+                    .enumerate()
+                    .find(|(_, (start, end))| *start <= frontier && frontier <= *end)
+                    .map(|(i, r)| (i, *r))
+                {
+                    let _ = self.ibd.pending_ranges.remove(idx);
+                    if frontier < end {
+                        self.ibd.pending_ranges.push_front((frontier + 1, end));
+                    }
+                    if start < frontier {
+                        self.ibd.pending_ranges.push_front((start, frontier - 1));
+                    }
                 }
             }
         }
