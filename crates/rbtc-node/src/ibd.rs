@@ -5,10 +5,16 @@ use rbtc_primitives::hash::BlockHash;
 use tracing::{debug, info};
 
 /// How long to wait without progress before declaring a stall and switching peers.
-pub const STALL_TIMEOUT: Duration = Duration::from_secs(15);
+///
+/// Use a conservative timeout to avoid false-positive peer churn while waiting
+/// for frontier blocks during IBD.
+pub const STALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Number of block hashes in each parallel download segment.
-pub const SEGMENT_SIZE: usize = 512;
+///
+/// Smaller segments improve frontier responsiveness and reduce long stalls
+/// when a peer is slow or disconnects mid-segment.
+pub const SEGMENT_SIZE: usize = 128;
 
 /// Per-peer in-flight block download batch.
 pub struct PeerDownload {
