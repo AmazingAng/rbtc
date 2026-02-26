@@ -107,7 +107,7 @@ pub fn verify_block(
 
     // Verify coinbase (sequential, must be first)
     verify_coinbase(&block.transactions[0], ctx.height, u64::MAX, ctx.network)?;
-    let coinbase_sigops = count_block_sigops(&block.transactions[0]) as u64;
+    let coinbase_sigops = count_legacy_sigops(&block.transactions[0]) as u64 * WITNESS_SCALE_FACTOR;
 
     // Sequential verification of non-coinbase transactions.
     //
@@ -139,7 +139,8 @@ pub fn verify_block(
         total_fees = total_fees
             .checked_add(fee)
             .ok_or(ConsensusError::InputValueOverflow)?;
-        non_coinbase_sigops += count_block_sigops(tx) as u64 * WITNESS_SCALE_FACTOR;
+        non_coinbase_sigops += count_legacy_sigops(tx) as u64 * WITNESS_SCALE_FACTOR;
+        non_coinbase_sigops += count_witness_sigops(tx, &block_view, ctx.flags) as u64;
 
         // Add this transaction's outputs to the in-block view so that
         // subsequent transactions in the same block can spend them.
@@ -203,7 +204,7 @@ pub fn verify_block_header(
 }
 
 /// Count sigops in a transaction (base cost, not witness-scaled)
-fn count_block_sigops(tx: &rbtc_primitives::transaction::Transaction) -> usize {
+fn count_legacy_sigops(tx: &rbtc_primitives::transaction::Transaction) -> usize {
     let mut count = 0;
     for input in &tx.inputs {
         count += input.script_sig.count_sigops();
@@ -212,6 +213,140 @@ fn count_block_sigops(tx: &rbtc_primitives::transaction::Transaction) -> usize {
         count += output.script_pubkey.count_sigops();
     }
     count
+}
+
+fn count_witness_sigops(
+    tx: &rbtc_primitives::transaction::Transaction,
+    utxos: &impl UtxoLookup,
+    flags: ScriptFlags,
+) -> usize {
+    if !flags.verify_witness {
+        return 0;
+    }
+    let mut total = 0usize;
+    for input in &tx.inputs {
+        let Some(prevout) = utxos.get_utxo(&input.previous_output) else {
+            continue;
+        };
+        total += witness_sigops_for_input(
+            &input.script_sig,
+            &prevout.txout.script_pubkey,
+            &input.witness,
+        );
+    }
+    total
+}
+
+fn witness_sigops_for_input(
+    script_sig: &rbtc_primitives::script::Script,
+    script_pubkey: &rbtc_primitives::script::Script,
+    witness: &[Vec<u8>],
+) -> usize {
+    if let Some((version, program)) = parse_witness_program(script_pubkey) {
+        return witness_program_sigops(version, &program, witness);
+    }
+    if script_pubkey.is_p2sh() {
+        let Some(redeem) = extract_last_push_data(script_sig) else {
+            return 0;
+        };
+        let redeem_script = rbtc_primitives::script::Script::from_bytes(redeem);
+        if let Some((version, program)) = parse_witness_program(&redeem_script) {
+            return witness_program_sigops(version, &program, witness);
+        }
+    }
+    0
+}
+
+fn parse_witness_program(script: &rbtc_primitives::script::Script) -> Option<(u8, Vec<u8>)> {
+    let bytes = script.as_bytes();
+    if !(4..=42).contains(&bytes.len()) {
+        return None;
+    }
+    let version = match bytes[0] {
+        0x00 => 0,
+        0x51..=0x60 => bytes[0] - 0x50,
+        _ => return None,
+    };
+    let program_len = bytes[1] as usize;
+    if program_len < 2 || program_len > 40 || program_len + 2 != bytes.len() {
+        return None;
+    }
+    Some((version, bytes[2..].to_vec()))
+}
+
+fn witness_program_sigops(version: u8, program: &[u8], witness: &[Vec<u8>]) -> usize {
+    if version != 0 {
+        return 0;
+    }
+    if program.len() == 20 {
+        return 1;
+    }
+    if program.len() == 32 && !witness.is_empty() {
+        let ws = rbtc_primitives::script::Script::from_bytes(
+            witness.last().cloned().unwrap_or_default(),
+        );
+        return ws.count_sigops();
+    }
+    0
+}
+
+fn extract_last_push_data(script: &rbtc_primitives::script::Script) -> Option<Vec<u8>> {
+    let bytes = script.as_bytes();
+    let mut pc = 0usize;
+    let mut last: Option<Vec<u8>> = None;
+    while pc < bytes.len() {
+        let op = bytes[pc];
+        pc += 1;
+        match op {
+            0x00 => last = Some(Vec::new()),
+            0x01..=0x4b => {
+                let len = op as usize;
+                if pc + len > bytes.len() {
+                    return None;
+                }
+                last = Some(bytes[pc..pc + len].to_vec());
+                pc += len;
+            }
+            0x4c => {
+                if pc >= bytes.len() {
+                    return None;
+                }
+                let len = bytes[pc] as usize;
+                pc += 1;
+                if pc + len > bytes.len() {
+                    return None;
+                }
+                last = Some(bytes[pc..pc + len].to_vec());
+                pc += len;
+            }
+            0x4d => {
+                if pc + 1 >= bytes.len() {
+                    return None;
+                }
+                let len = u16::from_le_bytes([bytes[pc], bytes[pc + 1]]) as usize;
+                pc += 2;
+                if pc + len > bytes.len() {
+                    return None;
+                }
+                last = Some(bytes[pc..pc + len].to_vec());
+                pc += len;
+            }
+            0x4e => {
+                if pc + 3 >= bytes.len() {
+                    return None;
+                }
+                let len = u32::from_le_bytes([bytes[pc], bytes[pc + 1], bytes[pc + 2], bytes[pc + 3]]) as usize;
+                pc += 4;
+                if pc + len > bytes.len() {
+                    return None;
+                }
+                last = Some(bytes[pc..pc + len].to_vec());
+                pc += len;
+            }
+            _ => return None,
+        }
+    }
+    last
 }
 
 /// BIP141 witness commitment verification
@@ -255,14 +390,18 @@ fn verify_witness_commitment(block: &Block) -> Result<(), ConsensusError> {
     let witness_merkle_root = rbtc_crypto::merkle_root(&wtxids).unwrap_or(Hash256::ZERO);
 
     // commitment = SHA256d(witness_merkle_root || witness_reserved_value)
-    // witness_reserved_value is in coinbase input witness[0] (should be 32 zero bytes)
-    let reserved = coinbase.inputs[0].witness.first()
-        .map(|w| w.as_slice())
-        .unwrap_or(&[0u8; 32]);
+    // witness_reserved_value must be exactly 32 bytes at coinbase witness[0].
+    let reserved = coinbase.inputs[0]
+        .witness
+        .first()
+        .ok_or(ConsensusError::BadCoinbaseWitnessReservedValue)?;
+    if reserved.len() != 32 {
+        return Err(ConsensusError::BadCoinbaseWitnessReservedValue);
+    }
 
     let mut commit_preimage = Vec::with_capacity(64);
     commit_preimage.extend_from_slice(&witness_merkle_root.0);
-    commit_preimage.extend_from_slice(reserved);
+    commit_preimage.extend_from_slice(reserved.as_slice());
     let commitment = sha256d(&commit_preimage);
 
     if commitment.0 != expected_commitment {
@@ -583,6 +722,84 @@ mod tests {
         let r = verify_block_header(&h, h.bits, 100001, 200000);
         assert!(r.is_err());
         assert!(matches!(r.unwrap_err(), ConsensusError::TimestampTooOld));
+    }
+
+    #[test]
+    fn verify_witness_commitment_rejects_bad_reserved_value() {
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: Script::from_bytes(vec![2, 0, 0]),
+                sequence: 0xffff_ffff,
+                witness: vec![vec![0u8; 31]],
+            }],
+            outputs: vec![TxOut {
+                value: 0,
+                script_pubkey: Script::from_bytes({
+                    let mut s = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+                    s.extend_from_slice(&[0u8; 32]);
+                    s
+                }),
+            }],
+            lock_time: 0,
+        };
+        let spend = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: Hash256([1; 32]), vout: 0 },
+                script_sig: Script::new(),
+                sequence: 0xffff_ffff,
+                witness: vec![vec![1u8]],
+            }],
+            outputs: vec![],
+            lock_time: 0,
+        };
+        let block = Block {
+            header: header_with_valid_pow(0x207fffff),
+            transactions: vec![coinbase, spend],
+        };
+        let r = verify_witness_commitment(&block);
+        assert!(matches!(r, Err(ConsensusError::BadCoinbaseWitnessReservedValue)));
+    }
+
+    #[test]
+    fn verify_witness_commitment_rejects_mismatched_commitment() {
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: Script::from_bytes(vec![2, 0, 0]),
+                sequence: 0xffff_ffff,
+                witness: vec![vec![0u8; 32]],
+            }],
+            outputs: vec![TxOut {
+                value: 0,
+                script_pubkey: Script::from_bytes({
+                    let mut s = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+                    s.extend_from_slice(&[0u8; 32]);
+                    s
+                }),
+            }],
+            lock_time: 0,
+        };
+        let spend = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: Hash256([2; 32]), vout: 0 },
+                script_sig: Script::new(),
+                sequence: 0xffff_ffff,
+                witness: vec![vec![2u8]],
+            }],
+            outputs: vec![],
+            lock_time: 0,
+        };
+        let block = Block {
+            header: header_with_valid_pow(0x207fffff),
+            transactions: vec![coinbase, spend],
+        };
+        let r = verify_witness_commitment(&block);
+        assert!(matches!(r, Err(ConsensusError::BadCoinbaseWitnessCommitment)));
     }
 
     #[test]

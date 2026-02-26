@@ -21,6 +21,8 @@ pub enum ConsensusError {
     DuplicateCoinbase,
     #[error("invalid coinbase witness commitment")]
     BadCoinbaseWitnessCommitment,
+    #[error("invalid coinbase witness reserved value")]
+    BadCoinbaseWitnessReservedValue,
     #[error("block subsidy mismatch: got {0}, allowed {1}")]
     BadCoinbaseAmount(u64, u64),
     #[error("bad bits: {0:#010x}")]

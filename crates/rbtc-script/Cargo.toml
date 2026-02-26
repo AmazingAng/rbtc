@@ -11,3 +11,7 @@ secp256k1       = { workspace = true }
 ripemd          = { workspace = true }
 thiserror       = { workspace = true }
 sha1 = "0.10.6"
+
+[dev-dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

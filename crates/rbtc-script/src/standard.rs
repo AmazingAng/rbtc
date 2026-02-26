@@ -1,4 +1,5 @@
 use rbtc_primitives::{
+    constants::{MAX_SCRIPT_ELEMENT_SIZE, MAX_SCRIPT_SIZE},
     script::Script,
     transaction::{Transaction, TxOut},
 };
@@ -25,59 +26,124 @@ pub fn verify_input(ctx: &ScriptContext<'_>) -> Result<(), ScriptError> {
     let input = &ctx.tx.inputs[ctx.input_index];
     let script_pubkey = &ctx.prevout.script_pubkey;
     let engine = ScriptEngine::new(ctx.flags);
-
-    // ── Segwit v0 (native) ────────────────────────────────────────────────
-    if ctx.flags.verify_witness {
-        if script_pubkey.is_p2wpkh() {
-            let pubkey_hash = script_pubkey.p2wpkh_pubkey_hash().unwrap();
-            return verify_p2wpkh(ctx, pubkey_hash);
-        }
-        if script_pubkey.is_p2wsh() {
-            let script_hash = script_pubkey.p2wsh_script_hash().unwrap();
-            return verify_p2wsh(ctx, script_hash);
-        }
-        if script_pubkey.is_p2tr() {
-            let output_key = script_pubkey.p2tr_output_key().unwrap();
-            return verify_p2tr(ctx, output_key);
-        }
-    }
+    let mut had_witness = false;
 
     // ── P2SH ──────────────────────────────────────────────────────────────
     if ctx.flags.verify_p2sh && script_pubkey.is_p2sh() {
         let expected_hash = script_pubkey.p2sh_script_hash().unwrap();
-        return verify_p2sh(ctx, expected_hash, &engine);
+        had_witness = verify_p2sh(ctx, expected_hash, &engine)?;
+    } else if ctx.flags.verify_witness {
+        // ── Bare witness program ──────────────────────────────────────────
+        if let Some((version, program)) = parse_witness_program(script_pubkey) {
+            had_witness = true;
+            if !input.script_sig.is_empty() {
+                return Err(ScriptError::WitnessMalleated);
+            }
+            verify_witness_program(ctx, version, program.as_slice(), false)?;
+        } else {
+            // ── Legacy P2PKH / P2PK / others ─────────────────────────────
+            let mut stack: Vec<Vec<u8>> = Vec::new();
+            engine.execute(
+                &input.script_sig,
+                &mut stack,
+                ctx.tx,
+                ctx.input_index,
+                ctx.prevout.value,
+                &input.script_sig,
+            )?;
+            engine.execute(
+                script_pubkey,
+                &mut stack,
+                ctx.tx,
+                ctx.input_index,
+                ctx.prevout.value,
+                script_pubkey,
+            )?;
+            check_stack_true(&stack)?;
+            if ctx.flags.verify_cleanstack && stack.len() != 1 {
+                return Err(ScriptError::CleanStack);
+            }
+        }
+    } else {
+        // ── Legacy path when witness flag disabled ───────────────────────
+        let mut stack: Vec<Vec<u8>> = Vec::new();
+        engine.execute(
+            &input.script_sig,
+            &mut stack,
+            ctx.tx,
+            ctx.input_index,
+            ctx.prevout.value,
+            &input.script_sig,
+        )?;
+        engine.execute(
+            script_pubkey,
+            &mut stack,
+            ctx.tx,
+            ctx.input_index,
+            ctx.prevout.value,
+            script_pubkey,
+        )?;
+        check_stack_true(&stack)?;
+        if ctx.flags.verify_cleanstack && stack.len() != 1 {
+            return Err(ScriptError::CleanStack);
+        }
     }
 
-    // ── Legacy P2PKH / P2PK / others ─────────────────────────────────────
-    let mut stack: Vec<Vec<u8>> = Vec::new();
-
-    // Execute scriptSig
-    engine.execute(
-        &input.script_sig,
-        &mut stack,
-        ctx.tx,
-        ctx.input_index,
-        ctx.prevout.value,
-        &input.script_sig,
-    )?;
-
-    // Execute scriptPubKey
-    engine.execute(
-        script_pubkey,
-        &mut stack,
-        ctx.tx,
-        ctx.input_index,
-        ctx.prevout.value,
-        script_pubkey,
-    )?;
-
-    check_stack_true(&stack)?;
-
-    if ctx.flags.verify_cleanstack && stack.len() != 1 {
-        return Err(ScriptError::CleanStack);
+    if ctx.flags.verify_witness && !had_witness && !input.witness.is_empty() {
+        return Err(ScriptError::WitnessUnexpected);
     }
 
     Ok(())
+}
+
+fn parse_witness_program(script: &Script) -> Option<(u8, Vec<u8>)> {
+    let bytes = script.as_bytes();
+    if !(4..=42).contains(&bytes.len()) {
+        return None;
+    }
+    let version = match bytes[0] {
+        0x00 => 0,
+        0x51..=0x60 => bytes[0] - 0x50,
+        _ => return None,
+    };
+    let program_len = bytes[1] as usize;
+    if program_len < 2 || program_len > 40 || program_len + 2 != bytes.len() {
+        return None;
+    }
+    Some((version, bytes[2..].to_vec()))
+}
+
+fn verify_witness_program(
+    ctx: &ScriptContext<'_>,
+    version: u8,
+    program: &[u8],
+    is_p2sh: bool,
+) -> Result<(), ScriptError> {
+    if version == 0 {
+        match program.len() {
+            20 => {
+                let mut pkh = [0u8; 20];
+                pkh.copy_from_slice(program);
+                verify_p2wpkh(ctx, &pkh)
+            }
+            32 => {
+                let mut sh = [0u8; 32];
+                sh.copy_from_slice(program);
+                verify_p2wsh(ctx, &sh)
+            }
+            _ => Err(ScriptError::WitnessProgramWrongLength),
+        }
+    } else if version == 1 && program.len() == 32 && !is_p2sh {
+        if !ctx.flags.verify_taproot {
+            return Ok(());
+        }
+        let mut out_key = [0u8; 32];
+        out_key.copy_from_slice(program);
+        verify_p2tr(ctx, &out_key)
+    } else {
+        // Future witness versions are consensus-valid (soft-fork forward compat).
+        Ok(())
+    }
 }
 
 /// Verify P2WPKH (native SegWit v0, 20-byte key hash)
@@ -120,7 +186,7 @@ fn verify_p2wpkh(ctx: &ScriptContext<'_>, pubkey_hash: &[u8; 20]) -> Result<(), 
 fn verify_p2wsh(ctx: &ScriptContext<'_>, script_hash: &[u8; 32]) -> Result<(), ScriptError> {
     let witness = &ctx.tx.inputs[ctx.input_index].witness;
     if witness.is_empty() {
-        return Err(ScriptError::WitnessProgramMismatch);
+        return Err(ScriptError::WitnessProgramWitnessEmpty);
     }
 
     let witness_script_bytes = witness.last().unwrap();
@@ -128,11 +194,17 @@ fn verify_p2wsh(ctx: &ScriptContext<'_>, script_hash: &[u8; 32]) -> Result<(), S
     if sha256(witness_script_bytes).0 != *script_hash {
         return Err(ScriptError::WitnessProgramMismatch);
     }
+    if witness_script_bytes.len() > MAX_SCRIPT_SIZE {
+        return Err(ScriptError::ScriptTooLarge);
+    }
 
     let witness_script = Script::from_bytes(witness_script_bytes.clone());
 
     // Stack is all witness items except the last (the script itself)
     let mut stack: Vec<Vec<u8>> = witness[..witness.len()-1].to_vec();
+    if stack.iter().any(|item| item.len() > MAX_SCRIPT_ELEMENT_SIZE) {
+        return Err(ScriptError::PushSizeExceeded);
+    }
 
     let engine = ScriptEngine::new(ctx.flags);
     engine.execute(
@@ -144,7 +216,11 @@ fn verify_p2wsh(ctx: &ScriptContext<'_>, script_hash: &[u8; 32]) -> Result<(), S
         &witness_script,
     )?;
 
-    check_stack_true(&stack)
+    check_stack_true(&stack)?;
+    if stack.len() != 1 {
+        return Err(ScriptError::CleanStack);
+    }
+    Ok(())
 }
 
 /// Verify P2TR (Taproot, BIP341)
@@ -386,7 +462,7 @@ fn verify_p2sh(
     ctx: &ScriptContext<'_>,
     expected_hash: &[u8; 20],
     engine: &ScriptEngine,
-) -> Result<(), ScriptError> {
+) -> Result<bool, ScriptError> {
     let input = &ctx.tx.inputs[ctx.input_index];
 
     // scriptSig must only contain push ops (policy rule made consensus by BIP16)
@@ -414,13 +490,13 @@ fn verify_p2sh(
 
     // P2SH-wrapped SegWit (P2SH-P2WPKH, P2SH-P2WSH)
     if ctx.flags.verify_witness {
-        if redeem_script.is_p2wpkh() {
-            let pkh = redeem_script.p2wpkh_pubkey_hash().unwrap();
-            return verify_p2wpkh(ctx, pkh);
-        }
-        if redeem_script.is_p2wsh() {
-            let sh = redeem_script.p2wsh_script_hash().unwrap();
-            return verify_p2wsh(ctx, sh);
+        if let Some((version, program)) = parse_witness_program(&redeem_script) {
+            // Core rule: scriptSig must be exactly a single push of redeemScript.
+            if !script_sig_is_exact_push(&input.script_sig, redeem_script.as_bytes()) {
+                return Err(ScriptError::WitnessMalleatedP2sh);
+            }
+            verify_witness_program(ctx, version, program.as_slice(), true)?;
+            return Ok(true);
         }
     }
 
@@ -435,7 +511,31 @@ fn verify_p2sh(
         &redeem_script,
     )?;
 
-    check_stack_true(&stack)
+    check_stack_true(&stack)?;
+    Ok(false)
+}
+
+fn script_sig_is_exact_push(script_sig: &Script, data: &[u8]) -> bool {
+    script_sig.as_bytes() == encode_single_push(data).as_slice()
+}
+
+fn encode_single_push(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let len = data.len();
+    if len <= 0x4b {
+        out.push(len as u8);
+    } else if len <= 0xff {
+        out.push(0x4c);
+        out.push(len as u8);
+    } else if len <= 0xffff {
+        out.push(0x4d);
+        out.extend_from_slice(&(len as u16).to_le_bytes());
+    } else {
+        out.push(0x4e);
+        out.extend_from_slice(&(len as u32).to_le_bytes());
+    }
+    out.extend_from_slice(data);
+    out
 }
 
 fn is_push_only(script: &Script) -> bool {
@@ -473,6 +573,7 @@ fn is_push_only(script: &Script) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Deserialize;
     use rbtc_primitives::codec::Decodable;
     use rbtc_primitives::hash::Hash256;
     use rbtc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
@@ -615,6 +716,286 @@ mod tests {
             all_prevouts: &[prevout.clone()],
         };
         assert!(verify_input(&ctx).is_ok());
+    }
+
+    #[test]
+    fn verify_input_witness_malleated_non_empty_scriptsig() {
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: Hash256::ZERO, vout: 0 },
+                script_sig: Script::from_bytes(vec![0x51]),
+                sequence: 0xffff_ffff,
+                witness: vec![vec![1], vec![2]],
+            }],
+            outputs: vec![],
+            lock_time: 0,
+        };
+        let prevout = TxOut {
+            value: 1000,
+            script_pubkey: Script::from_bytes({
+                let mut s = vec![0x00, 0x14];
+                s.extend_from_slice(&[0x11; 20]);
+                s
+            }),
+        };
+        let ctx = ScriptContext {
+            tx: &tx,
+            input_index: 0,
+            prevout: &prevout,
+            flags: ScriptFlags { verify_witness: true, ..ScriptFlags::default() },
+            all_prevouts: &[prevout.clone()],
+        };
+        assert!(matches!(verify_input(&ctx), Err(ScriptError::WitnessMalleated)));
+    }
+
+    #[test]
+    fn verify_input_p2sh_witness_malleated_scriptsig_shape() {
+        let redeem = Script::from_bytes({
+            let mut s = vec![0x00, 0x20];
+            s.extend_from_slice(&[0x22; 32]);
+            s
+        });
+        let mut p2sh_spk = vec![0xa9, 0x14];
+        p2sh_spk.extend_from_slice(&hash160(redeem.as_bytes()).0);
+        p2sh_spk.push(0x87);
+        let prevout = TxOut {
+            value: 1000,
+            script_pubkey: Script::from_bytes(p2sh_spk),
+        };
+        // scriptSig pushes junk then redeemScript (not exact single push redeemScript).
+        let mut sig = vec![0x01, 0x01];
+        sig.extend_from_slice(&encode_single_push(redeem.as_bytes()));
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: Hash256::ZERO, vout: 0 },
+                script_sig: Script::from_bytes(sig),
+                sequence: 0xffff_ffff,
+                witness: vec![vec![0x01], vec![0x02]],
+            }],
+            outputs: vec![],
+            lock_time: 0,
+        };
+        let ctx = ScriptContext {
+            tx: &tx,
+            input_index: 0,
+            prevout: &prevout,
+            flags: ScriptFlags { verify_p2sh: true, verify_witness: true, ..ScriptFlags::default() },
+            all_prevouts: &[prevout.clone()],
+        };
+        assert!(matches!(verify_input(&ctx), Err(ScriptError::WitnessMalleatedP2sh)));
+    }
+
+    #[test]
+    fn verify_input_witness_unexpected_for_legacy_spk() {
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: Hash256::ZERO, vout: 0 },
+                script_sig: Script::from_bytes(vec![0x51]),
+                sequence: 0xffff_ffff,
+                witness: vec![vec![0x01]],
+            }],
+            outputs: vec![],
+            lock_time: 0,
+        };
+        let prevout = TxOut { value: 1000, script_pubkey: Script::from_bytes(vec![0x51]) };
+        let ctx = ScriptContext {
+            tx: &tx,
+            input_index: 0,
+            prevout: &prevout,
+            flags: ScriptFlags { verify_witness: true, ..ScriptFlags::default() },
+            all_prevouts: &[prevout.clone()],
+        };
+        assert!(matches!(verify_input(&ctx), Err(ScriptError::WitnessUnexpected)));
+    }
+
+    #[test]
+    fn verify_input_unknown_witness_version_consensus_ok() {
+        // OP_2 <32-byte-program>, unknown version: consensus-valid by forward-compat.
+        let mut spk = vec![0x52, 0x20];
+        spk.extend_from_slice(&[0x33; 32]);
+        let prevout = TxOut { value: 1000, script_pubkey: Script::from_bytes(spk) };
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: Hash256::ZERO, vout: 0 },
+                script_sig: Script::new(),
+                sequence: 0xffff_ffff,
+                witness: vec![vec![1, 2, 3]],
+            }],
+            outputs: vec![],
+            lock_time: 0,
+        };
+        let ctx = ScriptContext {
+            tx: &tx,
+            input_index: 0,
+            prevout: &prevout,
+            flags: ScriptFlags { verify_witness: true, ..ScriptFlags::default() },
+            all_prevouts: &[prevout.clone()],
+        };
+        assert!(verify_input(&ctx).is_ok());
+    }
+
+    #[test]
+    fn verify_input_p2wsh_enforces_cleanstack() {
+        let witness_script = vec![0x51, 0x51]; // leaves two true elements on stack
+        let mut spk = vec![0x00, 0x20];
+        spk.extend_from_slice(&sha256(&witness_script).0);
+        let prevout = TxOut {
+            value: 1000,
+            script_pubkey: Script::from_bytes(spk),
+        };
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: Hash256::ZERO, vout: 0 },
+                script_sig: Script::new(),
+                sequence: 0xffff_ffff,
+                witness: vec![witness_script.clone()],
+            }],
+            outputs: vec![],
+            lock_time: 0,
+        };
+        let ctx = ScriptContext {
+            tx: &tx,
+            input_index: 0,
+            prevout: &prevout,
+            flags: ScriptFlags { verify_witness: true, ..ScriptFlags::default() },
+            all_prevouts: &[prevout.clone()],
+        };
+        assert!(matches!(verify_input(&ctx), Err(ScriptError::CleanStack)));
+    }
+
+    #[test]
+    fn verify_input_p2wsh_witness_empty_error() {
+        let witness_script = vec![0x51];
+        let mut spk = vec![0x00, 0x20];
+        spk.extend_from_slice(&sha256(&witness_script).0);
+        let prevout = TxOut {
+            value: 1000,
+            script_pubkey: Script::from_bytes(spk),
+        };
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: Hash256::ZERO, vout: 0 },
+                script_sig: Script::new(),
+                sequence: 0xffff_ffff,
+                witness: vec![],
+            }],
+            outputs: vec![],
+            lock_time: 0,
+        };
+        let ctx = ScriptContext {
+            tx: &tx,
+            input_index: 0,
+            prevout: &prevout,
+            flags: ScriptFlags { verify_witness: true, ..ScriptFlags::default() },
+            all_prevouts: &[prevout.clone()],
+        };
+        assert!(matches!(verify_input(&ctx), Err(ScriptError::WitnessProgramWitnessEmpty)));
+    }
+
+    #[test]
+    fn verify_input_p2wsh_rejects_oversized_witness_element() {
+        let witness_script = vec![0x75, 0x51]; // OP_DROP OP_TRUE
+        let mut spk = vec![0x00, 0x20];
+        spk.extend_from_slice(&sha256(&witness_script).0);
+        let prevout = TxOut {
+            value: 1000,
+            script_pubkey: Script::from_bytes(spk),
+        };
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: Hash256::ZERO, vout: 0 },
+                script_sig: Script::new(),
+                sequence: 0xffff_ffff,
+                witness: vec![vec![0u8; MAX_SCRIPT_ELEMENT_SIZE + 1], witness_script.clone()],
+            }],
+            outputs: vec![],
+            lock_time: 0,
+        };
+        let ctx = ScriptContext {
+            tx: &tx,
+            input_index: 0,
+            prevout: &prevout,
+            flags: ScriptFlags { verify_witness: true, ..ScriptFlags::default() },
+            all_prevouts: &[prevout.clone()],
+        };
+        assert!(matches!(verify_input(&ctx), Err(ScriptError::PushSizeExceeded)));
+    }
+
+    #[test]
+    fn verify_input_segwit_vectors() {
+        #[derive(Deserialize)]
+        struct FixtureCase {
+            name: String,
+            prevout_value: u64,
+            prevout_script_pubkey_hex: String,
+            script_sig_hex: String,
+            witness_hex: Vec<String>,
+            expected: String,
+        }
+
+        fn build_tx(script_sig: Script, witness: Vec<Vec<u8>>) -> Transaction {
+            Transaction {
+                version: 2,
+                inputs: vec![TxIn {
+                    previous_output: OutPoint { txid: Hash256::ZERO, vout: 0 },
+                    script_sig,
+                    sequence: 0xffff_ffff,
+                    witness,
+                }],
+                outputs: vec![],
+                lock_time: 0,
+            }
+        }
+
+        fn expected_from_str(s: &str) -> Option<ScriptError> {
+            match s {
+                "ok" => None,
+                "WitnessMalleated" => Some(ScriptError::WitnessMalleated),
+                "WitnessProgramWitnessEmpty" => Some(ScriptError::WitnessProgramWitnessEmpty),
+                "CleanStack" => Some(ScriptError::CleanStack),
+                "WitnessMalleatedP2sh" => Some(ScriptError::WitnessMalleatedP2sh),
+                "WitnessUnexpected" => Some(ScriptError::WitnessUnexpected),
+                "WitnessProgramWrongLength" => Some(ScriptError::WitnessProgramWrongLength),
+                other => panic!("unknown expected value in fixture: {other}"),
+            }
+        }
+
+        let fixture_text = include_str!("../tests/fixtures/segwit_vectors.json");
+        let cases: Vec<FixtureCase> = serde_json::from_str(fixture_text).expect("parse segwit fixture");
+        let flags = ScriptFlags { verify_p2sh: true, verify_witness: true, ..ScriptFlags::default() };
+
+        for case in cases {
+            let prevout = TxOut {
+                value: case.prevout_value,
+                script_pubkey: Script::from_bytes(decode_hex(&case.prevout_script_pubkey_hex)),
+            };
+            let tx = build_tx(
+                Script::from_bytes(decode_hex(&case.script_sig_hex)),
+                case.witness_hex.iter().map(|h| decode_hex(h)).collect(),
+            );
+            let all_prevouts = [prevout.clone()];
+            let ctx = ScriptContext {
+                tx: &tx,
+                input_index: 0,
+                prevout: &prevout,
+                flags,
+                all_prevouts: &all_prevouts,
+            };
+            match expected_from_str(&case.expected) {
+                None => assert!(verify_input(&ctx).is_ok(), "case failed: {}", case.name),
+                Some(expected) => {
+                    let got = verify_input(&ctx).expect_err(&case.name);
+                    assert_eq!(got, expected, "case: {}", case.name);
+                }
+            }
+        }
     }
 
     #[test]

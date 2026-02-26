@@ -44,6 +44,16 @@ pub enum ScriptError {
     CleanStack,
     #[error("witness program mismatch")]
     WitnessProgramMismatch,
+    #[error("witness program wrong length")]
+    WitnessProgramWrongLength,
+    #[error("witness program witness empty")]
+    WitnessProgramWitnessEmpty,
+    #[error("witness malleated (scriptSig must be empty)")]
+    WitnessMalleated,
+    #[error("witness malleated p2sh (scriptSig must be exact redeemScript push)")]
+    WitnessMalleatedP2sh,
+    #[error("unexpected witness data for non-witness spend")]
+    WitnessUnexpected,
     #[error("taproot validation error: {0}")]
     Taproot(String),
     #[error("script too large")]

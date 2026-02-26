@@ -1,0 +1,74 @@
+[
+  {
+    "name": "native_p2wsh_valid_true_script",
+    "prevout_value": 1000,
+    "prevout_script_pubkey_hex": "00204ae81572f06e1b88fd5ced7a1a000945432e83e1551e6f721ee9c00b8cc33260",
+    "script_sig_hex": "",
+    "witness_hex": ["51"],
+    "expected": "ok"
+  },
+  {
+    "name": "native_p2wsh_non_empty_scriptsig_malleated",
+    "prevout_value": 1000,
+    "prevout_script_pubkey_hex": "00204ae81572f06e1b88fd5ced7a1a000945432e83e1551e6f721ee9c00b8cc33260",
+    "script_sig_hex": "51",
+    "witness_hex": ["51"],
+    "expected": "WitnessMalleated"
+  },
+  {
+    "name": "native_p2wsh_empty_witness",
+    "prevout_value": 1000,
+    "prevout_script_pubkey_hex": "00204ae81572f06e1b88fd5ced7a1a000945432e83e1551e6f721ee9c00b8cc33260",
+    "script_sig_hex": "",
+    "witness_hex": [],
+    "expected": "WitnessProgramWitnessEmpty"
+  },
+  {
+    "name": "native_p2wsh_cleanstack_violation",
+    "prevout_value": 1000,
+    "prevout_script_pubkey_hex": "00202f04a3aa051f1f60d695f6c44c0c3d383973dfd446ace8962664a76bb10e31a8",
+    "script_sig_hex": "",
+    "witness_hex": ["5151"],
+    "expected": "CleanStack"
+  },
+  {
+    "name": "p2sh_p2wsh_valid_exact_redeem_push",
+    "prevout_value": 1000,
+    "prevout_script_pubkey_hex": "a91472c44f957fc011d97e3406667dca5b1c930c402687",
+    "script_sig_hex": "2200204ae81572f06e1b88fd5ced7a1a000945432e83e1551e6f721ee9c00b8cc33260",
+    "witness_hex": ["51"],
+    "expected": "ok"
+  },
+  {
+    "name": "p2sh_p2wsh_malleated_scriptsig_shape",
+    "prevout_value": 1000,
+    "prevout_script_pubkey_hex": "a91472c44f957fc011d97e3406667dca5b1c930c402687",
+    "script_sig_hex": "01012200204ae81572f06e1b88fd5ced7a1a000945432e83e1551e6f721ee9c00b8cc33260",
+    "witness_hex": ["51"],
+    "expected": "WitnessMalleatedP2sh"
+  },
+  {
+    "name": "legacy_spk_with_unexpected_witness",
+    "prevout_value": 1000,
+    "prevout_script_pubkey_hex": "51",
+    "script_sig_hex": "51",
+    "witness_hex": ["01"],
+    "expected": "WitnessUnexpected"
+  },
+  {
+    "name": "unknown_witness_version_forward_compatible",
+    "prevout_value": 1000,
+    "prevout_script_pubkey_hex": "52207777777777777777777777777777777777777777777777777777777777777777",
+    "script_sig_hex": "",
+    "witness_hex": ["010203"],
+    "expected": "ok"
+  },
+  {
+    "name": "v0_wrong_program_length_rejected",
+    "prevout_value": 1000,
+    "prevout_script_pubkey_hex": "001e888888888888888888888888888888888888888888888888888888888888",
+    "script_sig_hex": "",
+    "witness_hex": ["01"],
+    "expected": "WitnessProgramWrongLength"
+  }
+]
