@@ -905,6 +905,13 @@ impl Node {
             // peer_downloads until its blocks are actually connected to the chain.
             // This prevents the runaway where cached-but-unconnected work triggers
             // ever-further segment assignments.
+            debug!(
+                "cached out-of-order block {} at height {} (tip={}) from peer {}",
+                block_hash.to_hex(),
+                height,
+                chain_height,
+                peer_id
+            );
             self.pending_blocks.entry(height).or_insert((peer_id, block));
             return Ok(());
         }
@@ -1382,6 +1389,52 @@ impl Node {
         }
 
         if self.ibd.phase == IbdPhase::Blocks {
+            // Frontier-specific fast failover: if the frontier block is still
+            // not connected and its in-flight request is stale, recycle that
+            // peer immediately instead of waiting for the full stall timeout.
+            let frontier = self.chain.read().await.height().saturating_add(1);
+            let frontier_hash = {
+                let chain = self.chain.read().await;
+                chain
+                    .get_ancestor_hash(frontier)
+                    .or_else(|| {
+                        self.canonical_header_chain
+                            .get(frontier as usize)
+                            .copied()
+                            .filter(|h| *h != Hash256::ZERO)
+                    })
+            };
+            if let Some(frontier_hash) = frontier_hash {
+                let frontier_connected = {
+                    let chain = self.chain.read().await;
+                    chain
+                        .block_index
+                        .get(&frontier_hash)
+                        .map(|bi| bi.status == BlockStatus::InChain)
+                        .unwrap_or(false)
+                };
+                if !frontier_connected {
+                    let frontier_owner = self
+                        .ibd
+                        .peer_downloads
+                        .iter()
+                        .find(|(_, dl)| dl.hashes.iter().any(|h| h == &frontier_hash))
+                        .map(|(peer_id, dl)| (*peer_id, dl.requested_at.elapsed()));
+                    if let Some((peer_id, age)) = frontier_owner {
+                        if age >= Self::FRONTIER_RETRY_TIMEOUT {
+                            warn!(
+                                "IBD frontier timeout: height {} in-flight on peer {} for {}s; failover",
+                                frontier,
+                                peer_id,
+                                age.as_secs()
+                            );
+                            self.ibd.release_peer(peer_id);
+                            self.peer_manager.disconnect(peer_id);
+                        }
+                    }
+                }
+            }
+
             // Per-peer stall detection: disconnect stalled peers and re-queue their ranges.
             let stalled = self.ibd.stalled_peers(STALL_TIMEOUT);
             for peer_id in stalled {
