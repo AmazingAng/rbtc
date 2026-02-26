@@ -51,7 +51,18 @@ pub fn sighash_legacy(
     script_code: &Script,
     sighash_type: SighashType,
 ) -> Hash256 {
-    let sighash_u32 = sighash_type as u32;
+    sighash_legacy_with_u32(tx, input_index, script_code, sighash_type as u32)
+}
+
+/// Compute legacy (pre-SegWit) sighash from a raw 32-bit sighash value.
+/// Important for early historical signatures that use non-standard hashtype
+/// bytes (e.g. 0x04) but are still consensus-valid.
+pub fn sighash_legacy_with_u32(
+    tx: &Transaction,
+    input_index: usize,
+    script_code: &Script,
+    sighash_u32: u32,
+) -> Hash256 {
     let base = sighash_u32 & 0x1f;
     let anyone_can_pay = sighash_u32 & 0x80 != 0;
 
@@ -147,7 +158,17 @@ pub fn sighash_segwit_v0(
     value: u64,
     sighash_type: SighashType,
 ) -> Hash256 {
-    let sighash_u32 = sighash_type as u32;
+    sighash_segwit_v0_with_u32(tx, input_index, script_code, value, sighash_type as u32)
+}
+
+/// Compute BIP143 sighash from a raw 32-bit sighash value.
+pub fn sighash_segwit_v0_with_u32(
+    tx: &Transaction,
+    input_index: usize,
+    script_code: &Script,
+    value: u64,
+    sighash_u32: u32,
+) -> Hash256 {
     let base = sighash_u32 & 0x1f;
     let anyone_can_pay = sighash_u32 & 0x80 != 0;
 

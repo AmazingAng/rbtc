@@ -5,7 +5,7 @@ use rbtc_primitives::{
 use rbtc_crypto::{
     digest::{hash160, sha256, tagged_hash},
     sig::{verify_ecdsa_with_policy, verify_schnorr},
-    sighash::{sighash_segwit_v0, sighash_taproot, SighashType},
+    sighash::{sighash_segwit_v0_with_u32, sighash_taproot, SighashType},
 };
 
 use crate::engine::{ScriptEngine, ScriptError, ScriptFlags};
@@ -103,9 +103,14 @@ fn verify_p2wpkh(ctx: &ScriptContext<'_>, pubkey_hash: &[u8; 20]) -> Result<(), 
     if sig.is_empty() {
         return Err(ScriptError::SigCheckFailed);
     }
-    let sighash_type = SighashType::from_u32(*sig.last().unwrap() as u32)
-        .unwrap_or(SighashType::All);
-    let hash = sighash_segwit_v0(ctx.tx, ctx.input_index, &script_code, ctx.prevout.value, sighash_type);
+    let sighash_u32 = *sig.last().unwrap() as u32;
+    let hash = sighash_segwit_v0_with_u32(
+        ctx.tx,
+        ctx.input_index,
+        &script_code,
+        ctx.prevout.value,
+        sighash_u32,
+    );
 
     verify_ecdsa_with_policy(pubkey, &sig[..sig.len() - 1], &hash.0, ctx.flags.verify_dersig)
         .map_err(|_| ScriptError::SigCheckFailed)
@@ -579,6 +584,35 @@ mod tests {
                 verify_taproot: true,
             },
             all_prevouts: &all_prevouts,
+        };
+        assert!(verify_input(&ctx).is_ok());
+    }
+
+    #[test]
+    fn verify_input_legacy_p2pkh_nonstandard_sighash_byte() {
+        // Real mainnet case around height 260788:
+        // signature has hashtype byte 0x04 (non-standard but consensus-valid).
+        let spend_hex = "01000000017047d51eb2671f08be60033dc273da6bf165aeae6f0d2b2c901ccedc592fc84e000000008b48304502210085807b5a614a1a2faf0209c7d95bf046393c19bbbdb2ccafd8cf1e87b906429e02204405c1b759e7a44bdfdd053198f5307f07830e54110bac58c36b40a19ad8cd3a044104bb8f7ebe793c32e49c8f2b929b09ca09ee2b4f121b32c9dfca121450bc2b6762c75ece327c6724c30bfd14430ab4803371185e9060721deff8bdfa7f2ce5d751ffffffff0100710200000000001976a9141e2f6af9a8564c0cb58b8662dc2c63e70bd8b35288ac00000000";
+        let prev_hex = "0100000001329846caf4e3eb2c9b78a8b0de8b5ef3240acc690247c3a382376584957d01fd000000008b483045022100ef20a65ed276ac219f9ebda34708c1290090a7dffaed96527a077cd4594e97a7022053945a0d02d4c71f48349ec6a9ac7c42be5e9cecf5ee896ff5fd86d21277d4590141049df8f56621346ecd7a1672269e2f3fffc940974514a86c4c70293a3b35df40d75ee1486965a0a1372af7070d7b49fec555fd84feab29453125422184792e9014ffffffff0250340300000000001976a914a7a120d4358dd1e8bc9566329ead42c4f394ccfc88ac01921600000000001976a91414bdd0c36e430f0fd14643f7df6ce02b53874e3c88ac00000000";
+
+        let spend = Transaction::decode(&mut Cursor::new(decode_hex(spend_hex))).expect("decode spend");
+        let prev = Transaction::decode(&mut Cursor::new(decode_hex(prev_hex))).expect("decode prev");
+        let prevout = prev.outputs[0].clone();
+        let ctx = ScriptContext {
+            tx: &spend,
+            input_index: 0,
+            prevout: &prevout,
+            flags: ScriptFlags {
+                verify_p2sh: true,
+                verify_dersig: false,
+                verify_witness: true,
+                verify_nulldummy: false,
+                verify_cleanstack: false,
+                verify_checklocktimeverify: false,
+                verify_checksequenceverify: false,
+                verify_taproot: true,
+            },
+            all_prevouts: &[prevout.clone()],
         };
         assert!(verify_input(&ctx).is_ok());
     }

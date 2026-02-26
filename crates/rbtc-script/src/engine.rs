@@ -6,7 +6,7 @@ use rbtc_primitives::{
 use rbtc_crypto::{
     digest::{hash160, sha256, sha256d},
     sig::verify_ecdsa_with_policy,
-    sighash::{sighash_legacy, SighashType},
+    sighash::sighash_legacy_with_u32,
 };
 use thiserror::Error;
 
@@ -552,8 +552,7 @@ impl ScriptEngine {
                     let sig = pop(stack)?;
 
                     let sighash_byte = sig.last().copied().unwrap_or(1);
-                    let sighash_type = SighashType::from_u32(sighash_byte as u32)
-                        .unwrap_or(SighashType::All);
+                    let sighash_u32 = sighash_byte as u32;
 
                     let sc = if let Some(pos) = codesep_pos {
                         Script::from_bytes(script_code.as_bytes()[pos..].to_vec())
@@ -561,7 +560,7 @@ impl ScriptEngine {
                         script_code.clone()
                     };
 
-                    let hash = sighash_legacy(tx, input_index, &sc, sighash_type);
+                    let hash = sighash_legacy_with_u32(tx, input_index, &sc, sighash_u32);
                     let ok = if sig.is_empty() {
                         false
                     } else {
@@ -618,9 +617,8 @@ impl ScriptEngine {
                     while sig_idx < sigs.len() && all_ok {
                         let sig = &sigs[sig_idx];
                         if sig.is_empty() { sig_idx += 1; continue; }
-                        let sighash_type = SighashType::from_u32(*sig.last().unwrap() as u32)
-                            .unwrap_or(SighashType::All);
-                        let hash = sighash_legacy(tx, input_index, &sc, sighash_type);
+                        let sighash_u32 = *sig.last().unwrap() as u32;
+                        let hash = sighash_legacy_with_u32(tx, input_index, &sc, sighash_u32);
 
                         let mut matched = false;
                         while key_idx < pubkeys.len() && !matched {
