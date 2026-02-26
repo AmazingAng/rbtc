@@ -13,7 +13,7 @@ use crate::{
     difficulty::{bits_to_work, is_adjustment_height, next_bits},
     error::ConsensusError,
     tx_verify::MedianTimeProvider,
-    utxo::{UtxoLookup, UtxoSet},
+    utxo::UtxoSet,
 };
 
 /// Status of a block in the block index
@@ -218,17 +218,6 @@ impl ChainState {
             tx.encode_legacy(&mut buf).ok();
             sha256d(&buf)
         }).collect();
-
-        // BIP30: forbid adding a tx whose txid already has unspent outputs,
-        // except for the two historical mainnet exception heights.
-        let bip30_exception = self.network == Network::Mainnet && (height == 91_842 || height == 91_880);
-        if !bip30_exception {
-            for txid in txids.iter().skip(1) {
-                if self.utxos.has_unspent_txid(txid) {
-                    return Err(ConsensusError::Bip30Conflict(txid.to_hex()));
-                }
-            }
-        }
 
         // Update UTXO set
         self.utxos.connect_block(&txids, &block.transactions, height);

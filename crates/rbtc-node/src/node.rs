@@ -35,16 +35,19 @@ use crate::{
 const LOCAL_PEER_ID: u64 = 0;
 
 struct MtpSnapshot {
-    mtp_by_height: Vec<u32>,
+    times_by_height: Vec<u32>,
 }
 
 impl MedianTimeProvider for MtpSnapshot {
     fn median_time_past_at_height(&self, height: u32) -> u32 {
-        self.mtp_by_height
-            .get(height as usize)
-            .copied()
-            .or_else(|| self.mtp_by_height.last().copied())
-            .unwrap_or(0)
+        if self.times_by_height.is_empty() {
+            return 0;
+        }
+        let clamped = (height as usize).min(self.times_by_height.len() - 1);
+        let start = clamped.saturating_sub(10);
+        let mut times: Vec<u32> = self.times_by_height[start..=clamped].to_vec();
+        times.sort_unstable();
+        times[times.len() / 2]
     }
 }
 
@@ -1098,15 +1101,16 @@ impl Node {
             let mtp = chain.median_time_past(height.saturating_sub(1));
             let network = chain.network;
 
-            // Build a per-height MTP snapshot so verification does not hold
-            // the chain RwLock across expensive script/UTXO checks.
-            let tip = chain.height();
-            let mut mtp_by_height = Vec::with_capacity(tip as usize + 1);
-            for h in 0..=tip {
-                mtp_by_height.push(chain.median_time_past(h));
+            // Snapshot per-height block times so MTP can be computed on demand
+            // during verification without holding the chain RwLock.
+            let mut times_by_height = Vec::with_capacity(chain.active_chain.len());
+            for hash in &chain.active_chain {
+                if let Some(index) = chain.block_index.get(hash) {
+                    times_by_height.push(index.header.time);
+                }
             }
 
-            (expected_bits, mtp, network, MtpSnapshot { mtp_by_height })
+            (expected_bits, mtp, network, MtpSnapshot { times_by_height })
         };
 
         let network_time = std::time::SystemTime::now()

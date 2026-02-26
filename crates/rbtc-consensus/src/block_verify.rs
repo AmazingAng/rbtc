@@ -284,6 +284,11 @@ fn enforce_bip30(
     network: Network,
     utxos: &impl UtxoLookup,
 ) -> Result<(), ConsensusError> {
+    // After BIP34 activation, duplicate-coinbase style collisions are prevented.
+    // Keep BIP30 checks only for pre-BIP34 historical range.
+    if height >= network.consensus_params().bip34_height {
+        return Ok(());
+    }
     // Mainnet historical exceptions (pre-BIP34 duplicate-coinbase blocks).
     if network == Network::Mainnet && (height == 91_842 || height == 91_880) {
         return Ok(());
@@ -618,7 +623,7 @@ mod tests {
             header: header_with_valid_pow(0x207fffff),
             transactions: vec![coinbase, spend],
         };
-        let r = enforce_bip30(&block, 300_000, Network::Mainnet, &utxos);
+        let r = enforce_bip30(&block, 100_000, Network::Mainnet, &utxos);
         assert!(matches!(r, Err(ConsensusError::Bip30Conflict(_))));
     }
 
@@ -651,7 +656,7 @@ mod tests {
             transactions: vec![coinbase, spend],
         };
         let utxos = UtxoSet::new();
-        assert!(enforce_bip30(&block, 300_000, Network::Mainnet, &utxos).is_ok());
+        assert!(enforce_bip30(&block, 100_000, Network::Mainnet, &utxos).is_ok());
     }
 
     #[test]
