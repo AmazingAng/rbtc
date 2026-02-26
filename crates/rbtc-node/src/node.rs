@@ -7,6 +7,7 @@ use tracing::{debug, error, info, warn};
 use rbtc_consensus::{
     block_verify::{verify_block, BlockValidationContext},
     chain::{BlockIndex, BlockStatus, ChainState, header_hash},
+    tx_verify::MedianTimeProvider,
     script_flags_for_block,
 };
 use rbtc_crypto::sha256d;
@@ -32,6 +33,20 @@ use crate::{
 
 /// Peer ID used when a block is submitted locally (via RPC).
 const LOCAL_PEER_ID: u64 = 0;
+
+struct MtpSnapshot {
+    mtp_by_height: Vec<u32>,
+}
+
+impl MedianTimeProvider for MtpSnapshot {
+    fn median_time_past_at_height(&self, height: u32) -> u32 {
+        self.mtp_by_height
+            .get(height as usize)
+            .copied()
+            .or_else(|| self.mtp_by_height.last().copied())
+            .unwrap_or(0)
+    }
+}
 
 /// The main Bitcoin node
 pub struct Node {
@@ -1077,10 +1092,22 @@ impl Node {
         block: rbtc_primitives::block::Block,
         height: u32,
     ) -> Result<()> {
-        let chain = self.chain.read().await;
-        let expected_bits = chain.next_required_bits();
-        let mtp = chain.median_time_past(height.saturating_sub(1));
-        let network = chain.network;
+        let (expected_bits, mtp, network, mtp_snapshot) = {
+            let chain = self.chain.read().await;
+            let expected_bits = chain.next_required_bits();
+            let mtp = chain.median_time_past(height.saturating_sub(1));
+            let network = chain.network;
+
+            // Build a per-height MTP snapshot so verification does not hold
+            // the chain RwLock across expensive script/UTXO checks.
+            let tip = chain.height();
+            let mut mtp_by_height = Vec::with_capacity(tip as usize + 1);
+            for h in 0..=tip {
+                mtp_by_height.push(chain.median_time_past(h));
+            }
+
+            (expected_bits, mtp, network, MtpSnapshot { mtp_by_height })
+        };
 
         let network_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1100,11 +1127,10 @@ impl Node {
                 expected_bits,
                 flags,
                 network,
-                mtp_provider: &*chain,
+                mtp_provider: &mtp_snapshot,
             };
             verify_block(&ctx, &self.utxo_cache)
         };
-        drop(chain);
 
         match validation_result {
             Ok(fees) => {
