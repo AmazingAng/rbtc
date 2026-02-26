@@ -744,6 +744,7 @@ impl Node {
                         .filter(|h| *h != Hash256::ZERO)
                 })
         };
+        let mut frontier_pending = false;
         if let Some(frontier_hash) = frontier_hash {
             let frontier_connected = {
                 let chain = self.chain.read().await;
@@ -754,6 +755,7 @@ impl Node {
                     .unwrap_or(false)
             };
             if !frontier_connected {
+                frontier_pending = true;
                 // If frontier is already in-flight, only re-issue when it has
                 // been waiting too long.
                 let frontier_inflight_age = self
@@ -800,7 +802,23 @@ impl Node {
             }
         }
 
-        for peer_id in idle_peers {
+        // Keep one peer idle while frontier is still pending so failover can
+        // immediately switch owners instead of waiting for another connection.
+        let range_assign_limit = if frontier_pending && !idle_peers.is_empty() {
+            idle_peers.len().saturating_sub(1)
+        } else {
+            idle_peers.len()
+        };
+
+        if frontier_pending && range_assign_limit < idle_peers.len() {
+            debug!(
+                "IBD: reserving 1 idle peer for frontier failover (idle={}, assignable={})",
+                idle_peers.len(),
+                range_assign_limit
+            );
+        }
+
+        for peer_id in idle_peers.into_iter().take(range_assign_limit) {
             // Always dispatch the smallest-start (frontier-nearest) segment first.
             // `pending_ranges` can be perturbed by stall/release re-queue ordering,
             // so pop_front() may accidentally prioritize farther-ahead ranges.
