@@ -16,12 +16,11 @@ pub fn script_flags_for_block(
 ) -> ScriptFlags {
     let p = network.consensus_params();
 
-    // Match Bitcoin Core's behavior:
-    // - keep P2SH/WITNESS/TAPROOT on by default,
-    // - override only for historical exception blocks.
+    // Keep P2SH on by default (with known exceptions), while witness/taproot
+    // follow activation heights for this implementation.
     let mut verify_p2sh = true;
-    let mut verify_witness = true;
-    let mut verify_taproot = true;
+    let mut verify_witness = p.bip141_height == 0 || height >= p.bip141_height;
+    let mut verify_taproot = p.bip341_height == 0 || height >= p.bip341_height;
 
     let block_hash_hex = block_hash.to_hex();
     if let Some(exception_hash) = p.bip16_exception_hash {
@@ -87,8 +86,8 @@ mod tests {
         assert!(!flags.verify_cleanstack);
         assert!(!flags.verify_checklocktimeverify);
         assert!(!flags.verify_checksequenceverify);
-        assert!(flags.verify_witness);
-        assert!(flags.verify_taproot);
+        assert!(!flags.verify_witness);
+        assert!(!flags.verify_taproot);
         assert!(!flags.verify_dersig);
         assert!(!flags.verify_nulldummy);
     }
@@ -136,7 +135,7 @@ mod tests {
         assert!(flags.verify_dersig);
         assert!(flags.verify_checklocktimeverify);
         assert!(flags.verify_checksequenceverify);
-        assert!(flags.verify_witness);
+        assert!(!flags.verify_witness);
     }
 
     #[test]
@@ -153,7 +152,7 @@ mod tests {
         assert!(flags.verify_checklocktimeverify);
         assert!(flags.verify_checksequenceverify);
         assert!(flags.verify_witness);
-        assert!(flags.verify_taproot);
+        assert!(!flags.verify_taproot);
         assert!(flags.verify_nulldummy);
     }
 
