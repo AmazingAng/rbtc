@@ -616,4 +616,34 @@ mod tests {
         };
         assert!(verify_input(&ctx).is_ok());
     }
+
+    #[test]
+    fn verify_input_legacy_p2sh_find_and_delete_case() {
+        // Real mainnet case (block 290329): redeemScript embeds a signature-like
+        // push, requiring legacy FindAndDelete behavior for BASE CHECKMULTISIG.
+        let spend_hex = "0100000002f9cbafc519425637ba4227f8d0a0b7160b4e65168193d5af39747891de98b5b5000000006b4830450221008dd619c563e527c47d9bd53534a770b102e40faa87f61433580e04e271ef2f960220029886434e18122b53d5decd25f1f4acb2480659fea20aabd856987ba3c3907e0121022b78b756e2258af13779c1a1f37ea6800259716ca4b7f0b87610e0bf3ab52a01ffffffff42e7988254800876b69f24676b3e0205b77be476512ca4d970707dd5c60598ab00000000fd260100483045022015bd0139bcccf990a6af6ec5c1c52ed8222e03a0d51c334df139968525d2fcd20221009f9efe325476eb64c3958e4713e9eefe49bf1d820ed58d2112721b134e2a1a53034930460221008431bdfa72bc67f9d41fe72e94c88fb8f359ffa30b33c72c121c5a877d922e1002210089ef5fc22dd8bfc6bf9ffdb01a9862d27687d424d1fefbab9e9c7176844a187a014c9052483045022015bd0139bcccf990a6af6ec5c1c52ed8222e03a0d51c334df139968525d2fcd20221009f9efe325476eb64c3958e4713e9eefe49bf1d820ed58d2112721b134e2a1a5303210378d430274f8c5ec1321338151e9f27f4c676a008bdf8638d07c0b6be9ab35c71210378d430274f8c5ec1321338151e9f27f4c676a008bdf8638d07c0b6be9ab35c7153aeffffffff01a08601000000000017a914d8dacdadb7462ae15cd906f1878706d0da8660e68700000000";
+        let prev_hex = "01000000016caf76a1d325b9645d8e52f1ef2d33af3d8787531268cfb6b8f43cef0aae05200f0000006b483045022100d67682b1279ac29ce8d60ef3e672f6b6d097df6307398745891a068814e9b48302203c41a2ea49541b8be3baa8d9ae1c74f3afe57c51c964a0f541f731c9b1763f71012103fee179251dff4b8dda512c0b0a515be9d79657328d34009a63f6dc320945c4a4ffffffff02a08601000000000017a914d8dacdadb7462ae15cd906f1878706d0da8660e687e0fd1c00000000001976a914a61f26bca505466527129f75909c06c6d778887088ac00000000";
+
+        let spend = Transaction::decode(&mut Cursor::new(decode_hex(spend_hex))).expect("decode spend");
+        let prev = Transaction::decode(&mut Cursor::new(decode_hex(prev_hex))).expect("decode prev");
+        let prevout = prev.outputs[0].clone();
+        let all_prevouts = vec![prevout.clone(), prev.outputs[1].clone()];
+        let ctx = ScriptContext {
+            tx: &spend,
+            input_index: 1,
+            prevout: &prevout,
+            flags: ScriptFlags {
+                verify_p2sh: true,
+                verify_dersig: false,
+                verify_witness: false,
+                verify_nulldummy: false,
+                verify_cleanstack: false,
+                verify_checklocktimeverify: false,
+                verify_checksequenceverify: false,
+                verify_taproot: false,
+            },
+            all_prevouts: &all_prevouts,
+        };
+        assert!(verify_input(&ctx).is_ok());
+    }
 }

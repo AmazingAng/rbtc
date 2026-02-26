@@ -139,6 +139,44 @@ fn cast_to_bool(bytes: &[u8]) -> bool {
     false
 }
 
+// Legacy FindAndDelete: remove all pushed occurrences of a signature from
+// scriptCode before CHECKSIG/CHECKMULTISIG hashing (Bitcoin Core BASE path).
+fn find_and_delete_script_sig(script: &Script, sig: &[u8]) -> Script {
+    if sig.is_empty() {
+        return script.clone();
+    }
+    let mut pattern = Vec::with_capacity(1 + sig.len());
+    match sig.len() {
+        0..=0x4b => pattern.push(sig.len() as u8),
+        0x4c..=0xff => {
+            pattern.push(0x4c);
+            pattern.push(sig.len() as u8);
+        }
+        0x100..=0xffff => {
+            pattern.push(0x4d);
+            pattern.extend_from_slice(&(sig.len() as u16).to_le_bytes());
+        }
+        _ => {
+            pattern.push(0x4e);
+            pattern.extend_from_slice(&(sig.len() as u32).to_le_bytes());
+        }
+    }
+    pattern.extend_from_slice(sig);
+
+    let bytes = script.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if i + pattern.len() <= bytes.len() && &bytes[i..i + pattern.len()] == pattern.as_slice() {
+            i += pattern.len();
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    Script::from_bytes(out)
+}
+
 /// Core script execution engine
 pub struct ScriptEngine {
     pub flags: ScriptFlags,
@@ -554,11 +592,12 @@ impl ScriptEngine {
                     let sighash_byte = sig.last().copied().unwrap_or(1);
                     let sighash_u32 = sighash_byte as u32;
 
-                    let sc = if let Some(pos) = codesep_pos {
+                    let mut sc = if let Some(pos) = codesep_pos {
                         Script::from_bytes(script_code.as_bytes()[pos..].to_vec())
                     } else {
                         script_code.clone()
                     };
+                    sc = find_and_delete_script_sig(&sc, &sig);
 
                     let hash = sighash_legacy_with_u32(tx, input_index, &sc, sighash_u32);
                     let ok = if sig.is_empty() {
@@ -605,11 +644,17 @@ impl ScriptEngine {
                         ));
                     }
 
-                    let sc = if let Some(pos) = codesep_pos {
+                    let mut sc = if let Some(pos) = codesep_pos {
                         Script::from_bytes(script_code.as_bytes()[pos..].to_vec())
                     } else {
                         script_code.clone()
                     };
+                    for sig in &sigs {
+                        if !sig.is_empty() {
+                            sc = find_and_delete_script_sig(&sc, sig);
+                        }
+                    }
+
                     let mut sig_idx = 0;
                     let mut key_idx = 0;
                     let mut all_ok = true;
