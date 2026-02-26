@@ -60,6 +60,7 @@ pub struct ScriptFlags {
     pub verify_p2sh: bool,
     pub verify_dersig: bool,
     pub verify_witness: bool,
+    pub verify_nulldummy: bool,
     pub verify_cleanstack: bool,
     pub verify_checklocktimeverify: bool,
     pub verify_checksequenceverify: bool,
@@ -72,6 +73,7 @@ impl ScriptFlags {
             verify_p2sh: true,
             verify_dersig: true,
             verify_witness: true,
+            verify_nulldummy: true,
             verify_cleanstack: true,
             verify_checklocktimeverify: true,
             verify_checksequenceverify: true,
@@ -591,8 +593,13 @@ impl ScriptEngine {
                     let mut sigs = Vec::with_capacity(n_sigs);
                     for _ in 0..n_sigs { sigs.push(pop(stack)?); }
 
-                    // BIP147: extra null dummy
-                    let _dummy = pop(stack)?;
+                    // BIP147 NULLDUMMY (activated with segwit).
+                    let dummy = pop(stack)?;
+                    if self.flags.verify_nulldummy && !dummy.is_empty() {
+                        return Err(ScriptError::ScriptFailed(
+                            "CHECKMULTISIG dummy argument must be empty".into(),
+                        ));
+                    }
 
                     let sc = script_code.clone();
                     let mut sig_idx = 0;

@@ -16,6 +16,10 @@ pub struct ConsensusParams {
     pub bip141_height: u32,
     /// BIP341 (Taproot) activation block height.
     pub bip341_height: u32,
+    /// Historical block hash that must bypass P2SH (BIP16 exception).
+    pub bip16_exception_hash: Option<&'static str>,
+    /// Historical block hash that must bypass TAPROOT.
+    pub taproot_exception_hash: Option<&'static str>,
 }
 
 /// Bitcoin network type
@@ -39,6 +43,12 @@ impl Network {
                 bip112_height: 419_328,
                 bip141_height: 481_824,
                 bip341_height: 709_632,
+                bip16_exception_hash: Some(
+                    "00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22",
+                ),
+                taproot_exception_hash: Some(
+                    "0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad",
+                ),
             },
             Network::Testnet4 => ConsensusParams {
                 bip16_time: 1329264000,
@@ -48,6 +58,10 @@ impl Network {
                 bip112_height: 0,
                 bip141_height: 0,
                 bip341_height: 0,
+                bip16_exception_hash: Some(
+                    "00000000dd30457c001f4095d208cc1296b0eed002427aa599874af7a432b105",
+                ),
+                taproot_exception_hash: None,
             },
             Network::Regtest => ConsensusParams {
                 bip16_time: 0,
@@ -57,6 +71,8 @@ impl Network {
                 bip112_height: 0,
                 bip141_height: 0,
                 bip341_height: 0,
+                bip16_exception_hash: None,
+                taproot_exception_hash: None,
             },
             Network::Signet => ConsensusParams {
                 bip16_time: 0,
@@ -66,6 +82,8 @@ impl Network {
                 bip112_height: 0,
                 bip141_height: 0,
                 bip341_height: 0,
+                bip16_exception_hash: None,
+                taproot_exception_hash: None,
             },
         }
     }

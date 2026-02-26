@@ -964,7 +964,7 @@ impl Node {
             .unwrap_or_default()
             .as_secs() as u32;
 
-        let flags = script_flags_for_block(network, height, block.header.time);
+        let flags = script_flags_for_block(network, height, block_hash, block.header.time, mtp);
 
         // Validate block using the UTXO cache (hot layer → RocksDB fallback).
         // `utxo_cache` implements `UtxoLookup` so verify_block accepts it directly.
