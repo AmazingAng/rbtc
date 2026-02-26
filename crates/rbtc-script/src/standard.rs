@@ -466,8 +466,30 @@ fn is_push_only(script: &Script) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rbtc_primitives::codec::Decodable;
     use rbtc_primitives::hash::Hash256;
-    use rbtc_primitives::transaction::{OutPoint, TxIn, TxOut};
+    use rbtc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
+    use std::io::Cursor;
+
+    fn decode_hex(s: &str) -> Vec<u8> {
+        fn nibble(b: u8) -> u8 {
+            match b {
+                b'0'..=b'9' => b - b'0',
+                b'a'..=b'f' => b - b'a' + 10,
+                b'A'..=b'F' => b - b'A' + 10,
+                _ => panic!("invalid hex"),
+            }
+        }
+        let bytes = s.as_bytes();
+        assert!(bytes.len().is_multiple_of(2), "hex length must be even");
+        let mut out = Vec::with_capacity(bytes.len() / 2);
+        let mut i = 0;
+        while i < bytes.len() {
+            out.push((nibble(bytes[i]) << 4) | nibble(bytes[i + 1]));
+            i += 2;
+        }
+        out
+    }
 
     #[test]
     fn verify_input_legacy_true() {
@@ -523,5 +545,39 @@ mod tests {
         let r = verify_input(&ctx);
         assert!(r.is_err());
         assert!(matches!(r.unwrap_err(), crate::engine::ScriptError::CleanStack));
+    }
+
+    #[test]
+    fn verify_input_legacy_multisig_with_codeseparator() {
+        // Real mainnet case from block 163685 that failed in rbtc:
+        // CHECKMULTISIG in scriptSig with OP_CODESEPARATOR must hash from
+        // the last code separator for signature verification.
+        let spend_hex = "01000000024de8b0c4c2582db95fa6b3567a989b664484c7ad6672c85a3da413773e63fdb8000000006b48304502205b282fbc9b064f3bc823a23edcc0048cbb174754e7aa742e3c9f483ebe02911c022100e4b0b3a117d36cab5a67404dddbf43db7bea3c1530e0fe128ebc15621bd69a3b0121035aa98d5f77cd9a2d88710e6fc66212aff820026f0dad8f32d1f7ce87457dde50ffffffff4de8b0c4c2582db95fa6b3567a989b664484c7ad6672c85a3da413773e63fdb8010000006f004730440220276d6dad3defa37b5f81add3992d510d2f44a317fd85e04f93a1e2daea64660202200f862a0da684249322ceb8ed842fb8c859c0cb94c81e1c5308b4868157a428ee01ab51210232abdc893e7f0631364d7fd01cb33d24da45329a00357b3a7886211ab414d55a51aeffffffff02e0fd1c00000000001976a914380cb3c594de4e7e9b8e18db182987bebb5a4f7088acc0c62d000000000017142a9bc5447d664c1d0141392a842d23dba45c4f13b17500000000";
+        let prev_hex = "01000000017ea56cd68c74b4cd1a2f478f361b8a67c15a6629d73d95ef21d96ae213eb5b2d010000006a4730440220228e4deb3bc5b47fc526e2a7f5e9434a52616f8353b55dbc820ccb69d5fbded502206a2874f7f84b20015614694fe25c4d76f10e31571f03c240e3e4bbf1f9985be201210232abdc893e7f0631364d7fd01cb33d24da45329a00357b3a7886211ab414d55affffffff0230c11d00000000001976a914709dcb44da534c550dacf4296f75cba1ba3b317788acc0c62d000000000017142a9bc5447d664c1d0141392a842d23dba45c4f13b17500000000";
+
+        let spend_bytes = decode_hex(spend_hex);
+        let prev_bytes = decode_hex(prev_hex);
+        let spend = Transaction::decode(&mut Cursor::new(spend_bytes)).expect("decode spend tx");
+        let prev = Transaction::decode(&mut Cursor::new(prev_bytes)).expect("decode prev tx");
+
+        let all_prevouts = vec![prev.outputs[0].clone(), prev.outputs[1].clone()];
+        let prevout = prev.outputs[1].clone();
+        let ctx = ScriptContext {
+            tx: &spend,
+            input_index: 1,
+            prevout: &prevout,
+            flags: ScriptFlags {
+                verify_p2sh: true,
+                verify_dersig: false,
+                verify_witness: true,
+                verify_nulldummy: false,
+                verify_cleanstack: true,
+                verify_checklocktimeverify: false,
+                verify_checksequenceverify: false,
+                verify_taproot: true,
+            },
+            all_prevouts: &all_prevouts,
+        };
+        assert!(verify_input(&ctx).is_ok());
     }
 }

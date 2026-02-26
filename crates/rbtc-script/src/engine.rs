@@ -601,7 +601,11 @@ impl ScriptEngine {
                         ));
                     }
 
-                    let sc = script_code.clone();
+                    let sc = if let Some(pos) = codesep_pos {
+                        Script::from_bytes(script_code.as_bytes()[pos..].to_vec())
+                    } else {
+                        script_code.clone()
+                    };
                     let mut sig_idx = 0;
                     let mut key_idx = 0;
                     let mut all_ok = true;
