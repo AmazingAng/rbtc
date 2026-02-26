@@ -18,25 +18,25 @@ pub enum CryptoError {
     Secp256k1(#[from] secp256k1::Error),
 }
 
-/// Verify a DER-encoded ECDSA signature.
+/// Verify an ECDSA signature.
 /// `pubkey` – 33-byte compressed or 65-byte uncompressed public key.
-/// `sig_der` – DER-encoded, with sighash type byte appended.
+/// `sig_der` – DER-encoded signature bytes (without sighash byte).
 /// `msg`     – 32-byte sighash.
-pub fn verify_ecdsa(pubkey: &[u8], sig_der: &[u8], msg: &[u8; 32]) -> Result<(), CryptoError> {
+/// `strict_der` – when false, accepts legacy lax-DER parsing (pre-BIP66).
+pub fn verify_ecdsa_with_policy(
+    pubkey: &[u8],
+    sig_der: &[u8],
+    msg: &[u8; 32],
+    strict_der: bool,
+) -> Result<(), CryptoError> {
     let secp = Secp256k1::verification_only();
     let pk = PublicKey::from_slice(pubkey).map_err(|_| CryptoError::InvalidPublicKey)?;
 
-    // Strip sighash type byte if present
-    let sig_bytes = if !sig_der.is_empty() && is_der_signature(sig_der) {
-        sig_der
-    } else if sig_der.len() > 1 {
-        let stripped = &sig_der[..sig_der.len() - 1];
-        if is_der_signature(stripped) { stripped } else { sig_der }
+    let mut sig = if strict_der {
+        EcdsaSig::from_der(sig_der).map_err(|_| CryptoError::InvalidSignature)?
     } else {
-        sig_der
+        EcdsaSig::from_der_lax(sig_der).map_err(|_| CryptoError::InvalidSignature)?
     };
-
-    let mut sig = EcdsaSig::from_der(sig_bytes).map_err(|_| CryptoError::InvalidSignature)?;
     // Normalize S to low-S: the secp256k1 C library's verify requires low-S.
     // Pre-BIP66 Bitcoin transactions may use high-S signatures; both (r,s) and
     // (r, n-s) are mathematically equivalent for verification purposes.
@@ -45,6 +45,11 @@ pub fn verify_ecdsa(pubkey: &[u8], sig_der: &[u8], msg: &[u8; 32]) -> Result<(),
 
     secp.verify_ecdsa(message, &sig, &pk)
         .map_err(|_| CryptoError::VerificationFailed)
+}
+
+/// Verify a strict-DER ECDSA signature (BIP66 behavior).
+pub fn verify_ecdsa(pubkey: &[u8], sig_der: &[u8], msg: &[u8; 32]) -> Result<(), CryptoError> {
+    verify_ecdsa_with_policy(pubkey, sig_der, msg, true)
 }
 
 /// Verify a 64-byte Schnorr signature (BIP340 / Taproot).
@@ -71,10 +76,6 @@ pub fn verify_schnorr(pubkey: &[u8], sig: &[u8], msg: &[u8; 32]) -> Result<(), C
 
     secp.verify_schnorr(&schnorr_sig, msg, &xonly)
         .map_err(|_| CryptoError::VerificationFailed)
-}
-
-fn is_der_signature(bytes: &[u8]) -> bool {
-    bytes.len() >= 8 && bytes[0] == 0x30
 }
 
 #[cfg(test)]

@@ -4,7 +4,7 @@ use rbtc_primitives::{
 };
 use rbtc_crypto::{
     digest::{hash160, sha256d, tagged_hash},
-    sig::{verify_ecdsa, verify_schnorr},
+    sig::{verify_ecdsa_with_policy, verify_schnorr},
     sighash::{sighash_segwit_v0, sighash_taproot, SighashType},
 };
 
@@ -107,7 +107,7 @@ fn verify_p2wpkh(ctx: &ScriptContext<'_>, pubkey_hash: &[u8; 20]) -> Result<(), 
         .unwrap_or(SighashType::All);
     let hash = sighash_segwit_v0(ctx.tx, ctx.input_index, &script_code, ctx.prevout.value, sighash_type);
 
-    verify_ecdsa(pubkey, &sig[..sig.len()-1], &hash.0)
+    verify_ecdsa_with_policy(pubkey, &sig[..sig.len() - 1], &hash.0, ctx.flags.verify_dersig)
         .map_err(|_| ScriptError::SigCheckFailed)
 }
 

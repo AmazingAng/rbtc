@@ -5,7 +5,7 @@ use rbtc_primitives::{
 };
 use rbtc_crypto::{
     digest::{hash160, sha256, sha256d},
-    sig::verify_ecdsa,
+    sig::verify_ecdsa_with_policy,
     sighash::{sighash_legacy, SighashType},
 };
 use thiserror::Error;
@@ -58,6 +58,7 @@ type Stack = Vec<Vec<u8>>;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ScriptFlags {
     pub verify_p2sh: bool,
+    pub verify_dersig: bool,
     pub verify_witness: bool,
     pub verify_cleanstack: bool,
     pub verify_checklocktimeverify: bool,
@@ -69,6 +70,7 @@ impl ScriptFlags {
     pub fn standard() -> Self {
         Self {
             verify_p2sh: true,
+            verify_dersig: true,
             verify_witness: true,
             verify_cleanstack: true,
             verify_checklocktimeverify: true,
@@ -556,7 +558,13 @@ impl ScriptEngine {
                     let ok = if sig.is_empty() {
                         false
                     } else {
-                        verify_ecdsa(&pubkey, &sig[..sig.len()-1], &hash.0).is_ok()
+                        verify_ecdsa_with_policy(
+                            &pubkey,
+                            &sig[..sig.len() - 1],
+                            &hash.0,
+                            self.flags.verify_dersig,
+                        )
+                        .is_ok()
                     };
 
                     if op == Opcode::OpCheckSigVerify {
@@ -600,7 +608,14 @@ impl ScriptEngine {
 
                         let mut matched = false;
                         while key_idx < pubkeys.len() && !matched {
-                            if verify_ecdsa(&pubkeys[key_idx], &sig[..sig.len()-1], &hash.0).is_ok() {
+                            if verify_ecdsa_with_policy(
+                                &pubkeys[key_idx],
+                                &sig[..sig.len() - 1],
+                                &hash.0,
+                                self.flags.verify_dersig,
+                            )
+                            .is_ok()
+                            {
                                 matched = true;
                             }
                             key_idx += 1;
@@ -748,6 +763,7 @@ mod tests {
     fn script_flags_standard() {
         let f = ScriptFlags::standard();
         assert!(f.verify_p2sh);
+        assert!(f.verify_dersig);
         assert!(f.verify_witness);
     }
 

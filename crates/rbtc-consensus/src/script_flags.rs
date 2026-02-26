@@ -10,6 +10,7 @@ pub fn script_flags_for_block(network: Network, height: u32, block_time: u32) ->
     let p = network.consensus_params();
 
     let verify_p2sh = block_time >= p.bip16_time;
+    let verify_dersig = p.bip66_height == 0 || height >= p.bip66_height;
     let verify_checklocktimeverify = height >= p.bip65_height;
     let verify_checksequenceverify = p.bip112_height == 0 || height >= p.bip112_height;
     let verify_witness = p.bip141_height == 0 || height >= p.bip141_height;
@@ -17,6 +18,7 @@ pub fn script_flags_for_block(network: Network, height: u32, block_time: u32) ->
 
     ScriptFlags {
         verify_p2sh,
+        verify_dersig,
         verify_witness,
         verify_cleanstack: true,
         verify_checklocktimeverify,
@@ -39,12 +41,14 @@ mod tests {
         assert!(!flags.verify_checksequenceverify);
         assert!(!flags.verify_witness);
         assert!(!flags.verify_taproot);
+        assert!(!flags.verify_dersig);
     }
 
     #[test]
     fn mainnet_after_bip16_before_bip65() {
         let flags = script_flags_for_block(Network::Mainnet, 250_000, 1333238400);
         assert!(flags.verify_p2sh);
+        assert!(!flags.verify_dersig);
         assert!(!flags.verify_checklocktimeverify);
         assert!(!flags.verify_checksequenceverify);
     }
@@ -53,6 +57,7 @@ mod tests {
     fn mainnet_after_bip65_before_csv() {
         let flags = script_flags_for_block(Network::Mainnet, 400_000, 1333238400);
         assert!(flags.verify_p2sh);
+        assert!(flags.verify_dersig);
         assert!(flags.verify_checklocktimeverify);
         assert!(!flags.verify_checksequenceverify);
     }
@@ -61,6 +66,7 @@ mod tests {
     fn mainnet_after_csv_before_segwit() {
         let flags = script_flags_for_block(Network::Mainnet, 450_000, 1333238400);
         assert!(flags.verify_p2sh);
+        assert!(flags.verify_dersig);
         assert!(flags.verify_checklocktimeverify);
         assert!(flags.verify_checksequenceverify);
         assert!(!flags.verify_witness);
@@ -70,6 +76,7 @@ mod tests {
     fn mainnet_after_segwit_before_taproot() {
         let flags = script_flags_for_block(Network::Mainnet, 600_000, 1333238400);
         assert!(flags.verify_p2sh);
+        assert!(flags.verify_dersig);
         assert!(flags.verify_checklocktimeverify);
         assert!(flags.verify_checksequenceverify);
         assert!(flags.verify_witness);
@@ -80,6 +87,7 @@ mod tests {
     fn mainnet_after_taproot_has_all() {
         let flags = script_flags_for_block(Network::Mainnet, 750_000, 1333238400);
         assert!(flags.verify_p2sh);
+        assert!(flags.verify_dersig);
         assert!(flags.verify_witness);
         assert!(flags.verify_taproot);
     }
@@ -93,9 +101,18 @@ mod tests {
     }
 
     #[test]
+    fn mainnet_bip66_height_boundary() {
+        let before = script_flags_for_block(Network::Mainnet, 363_724, 1333238400);
+        let after = script_flags_for_block(Network::Mainnet, 363_725, 1333238400);
+        assert!(!before.verify_dersig);
+        assert!(after.verify_dersig);
+    }
+
+    #[test]
     fn regtest_all_enabled() {
         let flags = script_flags_for_block(Network::Regtest, 0, 0);
         assert!(flags.verify_p2sh);
+        assert!(flags.verify_dersig);
         assert!(flags.verify_cleanstack);
         assert!(flags.verify_checklocktimeverify);
         assert!(flags.verify_checksequenceverify);
