@@ -1,8 +1,10 @@
 use rbtc_primitives::{
     constants::{COIN, COINBASE_MATURITY, INITIAL_SUBSIDY, SUBSIDY_HALVING_INTERVAL},
+    hash::Hash256,
     transaction::Transaction,
     Network,
 };
+use rbtc_crypto::sha256d;
 use rbtc_script::{ScriptContext, ScriptFlags, verify_input};
 
 use crate::{error::ConsensusError, utxo::{Utxo, UtxoLookup}};
@@ -27,6 +29,8 @@ pub fn verify_transaction(
     current_height: u32,
     flags: ScriptFlags,
 ) -> Result<u64, ConsensusError> {
+    let txid = compute_txid(tx);
+
     if tx.inputs.is_empty() {
         return Err(ConsensusError::NoInputs);
     }
@@ -92,10 +96,76 @@ pub fn verify_transaction(
             flags,
             all_prevouts: &prevouts,
         };
-        verify_input(&ctx).map_err(|e| ConsensusError::ScriptError(e.to_string()))?;
+        verify_input(&ctx).map_err(|e| {
+            let script_kind = classify_script(&prevout.script_pubkey);
+            let spk_preview = preview_script_bytes(prevout.script_pubkey.as_bytes(), 24);
+            ConsensusError::ScriptError(format!(
+                "txid={} vin={} prevout={}:{} kind={} spk_len={} spk={} flags=[{}]: {}",
+                txid.to_hex(),
+                i,
+                tx.inputs[i].previous_output.txid.to_hex(),
+                tx.inputs[i].previous_output.vout,
+                script_kind,
+                prevout.script_pubkey.len(),
+                spk_preview,
+                format_flags(flags),
+                e
+            ))
+        })?;
     }
 
     Ok(fee)
+}
+
+fn compute_txid(tx: &Transaction) -> Hash256 {
+    let mut buf = Vec::new();
+    tx.encode_legacy(&mut buf).ok();
+    sha256d(&buf)
+}
+
+fn classify_script(script: &rbtc_primitives::script::Script) -> &'static str {
+    if script.is_p2pkh() {
+        "p2pkh"
+    } else if script.is_p2sh() {
+        "p2sh"
+    } else if script.is_p2wpkh() {
+        "p2wpkh"
+    } else if script.is_p2wsh() {
+        "p2wsh"
+    } else if script.is_p2tr() {
+        "p2tr"
+    } else if script.is_op_return() {
+        "op_return"
+    } else {
+        "nonstandard/legacy"
+    }
+}
+
+fn preview_script_bytes(bytes: &[u8], max: usize) -> String {
+    let mut s = String::new();
+    let take = bytes.len().min(max);
+    for b in &bytes[..take] {
+        use std::fmt::Write as _;
+        let _ = write!(&mut s, "{:02x}", b);
+    }
+    if bytes.len() > max {
+        s.push_str("...");
+    }
+    s
+}
+
+fn format_flags(flags: ScriptFlags) -> String {
+    format!(
+        "p2sh={} dersig={} witness={} nulldummy={} cltv={} csv={} taproot={} cleanstack={}",
+        flags.verify_p2sh,
+        flags.verify_dersig,
+        flags.verify_witness,
+        flags.verify_nulldummy,
+        flags.verify_checklocktimeverify,
+        flags.verify_checksequenceverify,
+        flags.verify_taproot,
+        flags.verify_cleanstack
+    )
 }
 
 /// Verify a coinbase transaction structure
