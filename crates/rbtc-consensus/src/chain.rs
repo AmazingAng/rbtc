@@ -12,7 +12,8 @@ use rbtc_primitives::codec::Encodable;
 use crate::{
     difficulty::{bits_to_work, is_adjustment_height, next_bits},
     error::ConsensusError,
-    utxo::UtxoSet,
+    tx_verify::MedianTimeProvider,
+    utxo::{UtxoLookup, UtxoSet},
 };
 
 /// Status of a block in the block index
@@ -218,6 +219,17 @@ impl ChainState {
             sha256d(&buf)
         }).collect();
 
+        // BIP30: forbid adding a tx whose txid already has unspent outputs,
+        // except for the two historical mainnet exception heights.
+        let bip30_exception = self.network == Network::Mainnet && (height == 91_842 || height == 91_880);
+        if !bip30_exception {
+            for txid in txids.iter().skip(1) {
+                if self.utxos.has_unspent_txid(txid) {
+                    return Err(ConsensusError::Bip30Conflict(txid.to_hex()));
+                }
+            }
+        }
+
         // Update UTXO set
         self.utxos.connect_block(&txids, &block.transactions, height);
 
@@ -290,6 +302,12 @@ impl ChainState {
         self.best_tip = Some(prev_hash);
 
         Ok(())
+    }
+}
+
+impl MedianTimeProvider for ChainState {
+    fn median_time_past_at_height(&self, height: u32) -> u32 {
+        self.median_time_past(height)
     }
 }
 

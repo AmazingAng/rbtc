@@ -11,7 +11,7 @@ use rbtc_script::ScriptFlags;
 
 use crate::{
     error::ConsensusError,
-    tx_verify::{block_subsidy, verify_coinbase, verify_transaction},
+    tx_verify::{block_subsidy, verify_coinbase, verify_transaction_with_lock_rules, MedianTimeProvider},
     utxo::{Utxo, UtxoLookup},
 };
 
@@ -27,6 +27,10 @@ struct BlockUtxoView<'a, U: UtxoLookup> {
 impl<U: UtxoLookup> UtxoLookup for BlockUtxoView<'_, U> {
     fn get_utxo(&self, outpoint: &rbtc_primitives::transaction::OutPoint) -> Option<Utxo> {
         self.in_block.get(outpoint).cloned().or_else(|| self.base.get_utxo(outpoint))
+    }
+
+    fn has_unspent_txid(&self, txid: &rbtc_primitives::hash::TxId) -> bool {
+        self.in_block.keys().any(|outpoint| &outpoint.txid == txid) || self.base.has_unspent_txid(txid)
     }
 }
 
@@ -46,6 +50,8 @@ pub struct BlockValidationContext<'a> {
     pub flags: ScriptFlags,
     /// Network (for BIP34 and other consensus params)
     pub network: Network,
+    /// Chain MTP lookup by height (used by BIP68 relative time locks).
+    pub mtp_provider: &'a dyn MedianTimeProvider,
 }
 
 /// Verify a complete block against the UTXO set.
@@ -93,6 +99,9 @@ pub fn verify_block(
         verify_witness_commitment(block)?;
     }
 
+    // ── BIP30 duplicate-txid check ────────────────────────────────────────
+    enforce_bip30(block, ctx.height, ctx.network, utxos)?;
+
     // ── Transaction verification + sigops + fees ─────────────────────────
     let subsidy = block_subsidy(ctx.height);
 
@@ -113,7 +122,20 @@ pub fn verify_block(
     let mut non_coinbase_sigops: u64 = 0;
 
     for tx in non_coinbase {
-        let fee = verify_transaction(tx, &block_view, ctx.height, ctx.flags)?;
+        let lock_time_cutoff = if ctx.flags.verify_checksequenceverify {
+            ctx.median_time_past
+        } else {
+            block.header.time
+        };
+        let fee = verify_transaction_with_lock_rules(
+            tx,
+            &block_view,
+            ctx.height,
+            ctx.flags,
+            lock_time_cutoff,
+            ctx.mtp_provider,
+            true,
+        )?;
         total_fees = total_fees
             .checked_add(fee)
             .ok_or(ConsensusError::InputValueOverflow)?;
@@ -256,6 +278,25 @@ fn compute_txid(tx: &rbtc_primitives::transaction::Transaction) -> Hash256 {
     sha256d(&buf)
 }
 
+fn enforce_bip30(
+    block: &Block,
+    height: u32,
+    network: Network,
+    utxos: &impl UtxoLookup,
+) -> Result<(), ConsensusError> {
+    // Mainnet historical exceptions (pre-BIP34 duplicate-coinbase blocks).
+    if network == Network::Mainnet && (height == 91_842 || height == 91_880) {
+        return Ok(());
+    }
+    for tx in block.transactions.iter().skip(1) {
+        let txid = compute_txid(tx);
+        if utxos.has_unspent_txid(&txid) {
+            return Err(ConsensusError::Bip30Conflict(txid.to_hex()));
+        }
+    }
+    Ok(())
+}
+
 pub fn encode_block_header(header: &rbtc_primitives::block::BlockHeader) -> Vec<u8> {
     let mut buf = Vec::with_capacity(80);
     header.version.encode(&mut buf).ok();
@@ -277,6 +318,13 @@ mod tests {
     use rbtc_primitives::Network;
     use rbtc_script::ScriptFlags;
     use crate::utxo::UtxoSet;
+
+    struct TestMtpProvider;
+    impl MedianTimeProvider for TestMtpProvider {
+        fn median_time_past_at_height(&self, _height: u32) -> u32 {
+            0
+        }
+    }
 
     fn header_with_bits(bits: u32) -> BlockHeader {
         BlockHeader {
@@ -323,6 +371,7 @@ mod tests {
             expected_bits: 0x207fffff,
             flags: ScriptFlags::default(),
             network: Network::Regtest,
+            mtp_provider: &TestMtpProvider,
         };
         let r = verify_block(&ctx, &UtxoSet::new());
         assert!(r.is_err());
@@ -353,6 +402,7 @@ mod tests {
             expected_bits: 0x207fffff,
             flags: ScriptFlags::default(),
             network: Network::Regtest,
+            mtp_provider: &TestMtpProvider,
         };
         let r = verify_block(&ctx, &UtxoSet::new());
         assert!(r.is_err());
@@ -382,6 +432,7 @@ mod tests {
             expected_bits: 0x207fffff,
             flags: ScriptFlags::default(),
             network: Network::Regtest,
+            mtp_provider: &TestMtpProvider,
         };
         let r = verify_block(&ctx, &UtxoSet::new());
         assert!(r.is_err());
@@ -412,6 +463,7 @@ mod tests {
             expected_bits: 0x207fffff,
             flags: ScriptFlags::default(),
             network: Network::Regtest,
+            mtp_provider: &TestMtpProvider,
         };
         let r = verify_block(&ctx, &UtxoSet::new());
         assert!(r.is_err());
@@ -454,6 +506,7 @@ mod tests {
             expected_bits: 0x207fffff,
             flags: ScriptFlags::default(),
             network: Network::Regtest,
+            mtp_provider: &TestMtpProvider,
         };
         let r = verify_block(&ctx, &UtxoSet::new());
         assert!(r.is_err());
@@ -497,6 +550,7 @@ mod tests {
             expected_bits: 0x207fffff,
             flags: ScriptFlags::default(),
             network: Network::Regtest,
+            mtp_provider: &TestMtpProvider,
         };
         let fees = verify_block(&ctx, &UtxoSet::new()).unwrap();
         assert_eq!(fees, 0);
@@ -524,6 +578,80 @@ mod tests {
         let r = verify_block_header(&h, h.bits, 100001, 200000);
         assert!(r.is_err());
         assert!(matches!(r.unwrap_err(), ConsensusError::TimestampTooOld));
+    }
+
+    #[test]
+    fn bip30_rejects_when_unspent_duplicate_txid_exists() {
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: Script::from_bytes(vec![2, 0, 0]),
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            lock_time: 0,
+        };
+        let spend = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: Hash256([3; 32]), vout: 0 },
+                script_sig: Script::new(),
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 1_000, script_pubkey: Script::new() }],
+            lock_time: 0,
+        };
+        let txid = compute_txid(&spend);
+        let mut utxos = UtxoSet::new();
+        utxos.insert(
+            OutPoint { txid, vout: 0 },
+            Utxo {
+                txout: TxOut { value: 123, script_pubkey: Script::new() },
+                is_coinbase: false,
+                height: 1,
+            },
+        );
+        let block = Block {
+            header: header_with_valid_pow(0x207fffff),
+            transactions: vec![coinbase, spend],
+        };
+        let r = enforce_bip30(&block, 300_000, Network::Mainnet, &utxos);
+        assert!(matches!(r, Err(ConsensusError::Bip30Conflict(_))));
+    }
+
+    #[test]
+    fn bip30_allows_when_no_unspent_duplicate_txid_exists() {
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: Script::from_bytes(vec![2, 0, 0]),
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            lock_time: 0,
+        };
+        let spend = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: Hash256([4; 32]), vout: 0 },
+                script_sig: Script::new(),
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 1_000, script_pubkey: Script::new() }],
+            lock_time: 0,
+        };
+        let block = Block {
+            header: header_with_valid_pow(0x207fffff),
+            transactions: vec![coinbase, spend],
+        };
+        let utxos = UtxoSet::new();
+        assert!(enforce_bip30(&block, 300_000, Network::Mainnet, &utxos).is_ok());
     }
 
     #[test]

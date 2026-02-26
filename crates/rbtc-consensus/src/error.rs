@@ -49,6 +49,10 @@ pub enum ConsensusError {
     ScriptError(String),
     #[error("nLockTime not satisfied")]
     LockTimeNotSatisfied,
+    #[error("BIP68 sequence lock not satisfied")]
+    SequenceLockNotSatisfied,
+    #[error("BIP30 conflict: txid {0} has unspent outputs")]
+    Bip30Conflict(String),
     #[error("invalid transaction: {0}")]
     InvalidTx(String),
 

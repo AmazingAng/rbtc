@@ -13,6 +13,8 @@ use rbtc_primitives::{
 pub trait UtxoLookup: Sync {
     /// Return the UTXO for `outpoint`, or `None` if it does not exist / is spent.
     fn get_utxo(&self, outpoint: &OutPoint) -> Option<Utxo>;
+    /// Return true if any unspent output exists for `txid`.
+    fn has_unspent_txid(&self, txid: &TxId) -> bool;
 }
 
 /// A single UTXO entry
@@ -34,6 +36,10 @@ pub struct UtxoSet {
 impl UtxoLookup for UtxoSet {
     fn get_utxo(&self, outpoint: &OutPoint) -> Option<Utxo> {
         self.coins.get(outpoint).cloned()
+    }
+
+    fn has_unspent_txid(&self, txid: &TxId) -> bool {
+        self.coins.keys().any(|outpoint| &outpoint.txid == txid)
     }
 }
 

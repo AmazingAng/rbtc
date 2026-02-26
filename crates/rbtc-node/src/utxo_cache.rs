@@ -208,6 +208,47 @@ impl UtxoLookup for CachedUtxoSet {
             .flatten()
             .map(|s| stored_to_utxo(&s))
     }
+
+    fn has_unspent_txid(&self, txid: &TxId) -> bool {
+        if self
+            .dirty
+            .iter()
+            .any(|(op, maybe)| &op.txid == txid && maybe.is_some())
+        {
+            return true;
+        }
+
+        for op in self.hot.keys() {
+            if &op.txid != txid {
+                continue;
+            }
+            if let Some(maybe) = self.dirty.get(op) {
+                if maybe.is_none() {
+                    continue;
+                }
+            }
+            return true;
+        }
+
+        let rows = self
+            .db
+            .iter_cf_prefix(rbtc_storage::db::CF_UTXO, &txid.0)
+            .unwrap_or_default();
+        for (k, _) in rows {
+            if k.len() != 36 {
+                continue;
+            }
+            let vout = u32::from_le_bytes([k[32], k[33], k[34], k[35]]);
+            let outpoint = OutPoint { txid: *txid, vout };
+            if let Some(maybe) = self.dirty.get(&outpoint) {
+                if maybe.is_none() {
+                    continue;
+                }
+            }
+            return true;
+        }
+        false
+    }
 }
 
 // SAFETY: `CachedUtxoSet` contains `HashMap` (not `Sync` by default due to

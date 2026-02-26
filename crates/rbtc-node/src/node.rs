@@ -1077,14 +1077,10 @@ impl Node {
         block: rbtc_primitives::block::Block,
         height: u32,
     ) -> Result<()> {
-        let (expected_bits, mtp, network) = {
-            let chain = self.chain.read().await;
-            (
-                chain.next_required_bits(),
-                chain.median_time_past(height.saturating_sub(1)),
-                chain.network,
-            )
-        };
+        let chain = self.chain.read().await;
+        let expected_bits = chain.next_required_bits();
+        let mtp = chain.median_time_past(height.saturating_sub(1));
+        let network = chain.network;
 
         let network_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1104,9 +1100,11 @@ impl Node {
                 expected_bits,
                 flags,
                 network,
+                mtp_provider: &*chain,
             };
             verify_block(&ctx, &self.utxo_cache)
         };
+        drop(chain);
 
         match validation_result {
             Ok(fees) => {

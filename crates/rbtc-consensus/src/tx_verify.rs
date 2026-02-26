@@ -9,6 +9,11 @@ use rbtc_script::{ScriptContext, ScriptFlags, verify_input};
 
 use crate::{error::ConsensusError, utxo::{Utxo, UtxoLookup}};
 
+/// Provides MedianTimePast lookups for a given block height.
+pub trait MedianTimeProvider {
+    fn median_time_past_at_height(&self, height: u32) -> u32;
+}
+
 /// Compute the block subsidy for a given height
 pub fn block_subsidy(height: u32) -> u64 {
     let halvings = height as u64 / SUBSIDY_HALVING_INTERVAL;
@@ -28,6 +33,30 @@ pub fn verify_transaction(
     utxos: &impl UtxoLookup,
     current_height: u32,
     flags: ScriptFlags,
+) -> Result<u64, ConsensusError> {
+    struct NoopMtp;
+    impl MedianTimeProvider for NoopMtp {
+        fn median_time_past_at_height(&self, _height: u32) -> u32 { 0 }
+    }
+    verify_transaction_with_lock_rules(
+        tx,
+        utxos,
+        current_height,
+        flags,
+        u32::MAX,
+        &NoopMtp,
+        false,
+    )
+}
+
+pub fn verify_transaction_with_lock_rules(
+    tx: &Transaction,
+    utxos: &impl UtxoLookup,
+    current_height: u32,
+    flags: ScriptFlags,
+    lock_time_cutoff: u32,
+    mtp_provider: &dyn MedianTimeProvider,
+    enforce_lock_rules: bool,
 ) -> Result<u64, ConsensusError> {
     let txid = compute_txid(tx);
 
@@ -52,9 +81,15 @@ pub fn verify_transaction(
         }
     }
 
+    // BIP113 finality (MTP-based locktime cutoff after CSV deployment).
+    if enforce_lock_rules && !is_final_tx(tx, current_height, lock_time_cutoff) {
+        return Err(ConsensusError::LockTimeNotSatisfied);
+    }
+
     // Gather inputs from UTXO set
     let mut input_sum: u64 = 0;
     let mut prevouts = Vec::with_capacity(tx.inputs.len());
+    let mut input_heights = Vec::with_capacity(tx.inputs.len());
 
     for input in &tx.inputs {
         let utxo: Utxo = utxos.get_utxo(&input.previous_output).ok_or_else(|| {
@@ -80,6 +115,15 @@ pub fn verify_transaction(
             .checked_add(val)
             .ok_or(ConsensusError::InputValueOverflow)?;
         prevouts.push(utxo.txout.clone());
+        input_heights.push(utxo.height);
+    }
+
+    // BIP68 relative lock-times (enabled with CSV deployment).
+    if enforce_lock_rules
+        && flags.verify_checksequenceverify
+        && !sequence_locks_satisfied(tx, &input_heights, current_height, lock_time_cutoff, mtp_provider)
+    {
+        return Err(ConsensusError::SequenceLockNotSatisfied);
     }
 
     if input_sum < output_sum {
@@ -115,6 +159,65 @@ pub fn verify_transaction(
     }
 
     Ok(fee)
+}
+
+fn is_final_tx(tx: &Transaction, block_height: u32, lock_time_cutoff: u32) -> bool {
+    if tx.lock_time == 0 {
+        return true;
+    }
+    let lock_time_threshold = 500_000_000u32;
+    let cmp_target = if tx.lock_time < lock_time_threshold {
+        block_height
+    } else {
+        lock_time_cutoff
+    };
+    if tx.lock_time < cmp_target {
+        return true;
+    }
+    tx.inputs.iter().all(|input| input.sequence == 0xffff_ffff)
+}
+
+fn sequence_locks_satisfied(
+    tx: &Transaction,
+    input_heights: &[u32],
+    block_height: u32,
+    prev_block_mtp: u32,
+    mtp_provider: &dyn MedianTimeProvider,
+) -> bool {
+    if tx.version < 2 || tx.is_coinbase() {
+        return true;
+    }
+    if input_heights.len() != tx.inputs.len() {
+        return false;
+    }
+
+    const SEQUENCE_LOCKTIME_GRANULARITY: i64 = 9;
+    const SEQUENCE_LOCKTIME_DISABLE_FLAG: u32 = 1 << 31;
+    const SEQUENCE_LOCKTIME_TYPE_FLAG: u32 = 1 << 22;
+    const SEQUENCE_LOCKTIME_MASK: u32 = 0x0000ffff;
+
+    let mut min_height: i64 = -1;
+    let mut min_time: i64 = -1;
+
+    for (input, &coin_height_u32) in tx.inputs.iter().zip(input_heights.iter()) {
+        let seq = input.sequence;
+        if (seq & SEQUENCE_LOCKTIME_DISABLE_FLAG) != 0 {
+            continue;
+        }
+        let coin_height = i64::from(coin_height_u32);
+        let relative = i64::from(seq & SEQUENCE_LOCKTIME_MASK);
+        if (seq & SEQUENCE_LOCKTIME_TYPE_FLAG) != 0 {
+            let base_height = coin_height_u32.saturating_sub(1);
+            let coin_mtp = i64::from(mtp_provider.median_time_past_at_height(base_height));
+            let required = coin_mtp + (relative << SEQUENCE_LOCKTIME_GRANULARITY) - 1;
+            min_time = min_time.max(required);
+        } else {
+            let required = coin_height + relative - 1;
+            min_height = min_height.max(required);
+        }
+    }
+
+    min_height < i64::from(block_height) && min_time < i64::from(prev_block_mtp)
 }
 
 fn compute_txid(tx: &Transaction) -> Hash256 {
@@ -236,6 +339,20 @@ mod tests {
     use rbtc_script::ScriptFlags;
     use crate::utxo::UtxoSet;
 
+    struct TestMtpProvider;
+    impl MedianTimeProvider for TestMtpProvider {
+        fn median_time_past_at_height(&self, _height: u32) -> u32 {
+            0
+        }
+    }
+
+    struct LinearMtpProvider;
+    impl MedianTimeProvider for LinearMtpProvider {
+        fn median_time_past_at_height(&self, height: u32) -> u32 {
+            height.saturating_mul(1000)
+        }
+    }
+
     #[test]
     fn block_subsidy_halvings() {
         assert_eq!(block_subsidy(0), 50_0000_0000);
@@ -333,5 +450,106 @@ mod tests {
             lock_time: 0,
         };
         assert!(verify_coinbase(&tx, 0, 50_0000_0000, Network::Regtest).is_ok());
+    }
+
+    #[test]
+    fn verify_transaction_bip113_locktime_not_satisfied() {
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: Hash256([9; 32]), vout: 0 },
+                script_sig: Script::new(),
+                sequence: 0,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 1000, script_pubkey: Script::new() }],
+            lock_time: 100,
+        };
+        let utxos = UtxoSet::new();
+        let r = verify_transaction_with_lock_rules(
+            &tx,
+            &utxos,
+            1,
+            ScriptFlags::default(),
+            100,
+            &TestMtpProvider,
+            true,
+        );
+        assert!(matches!(r, Err(ConsensusError::LockTimeNotSatisfied)));
+    }
+
+    #[test]
+    fn verify_transaction_bip68_height_lock_not_satisfied() {
+        let txid = Hash256([7; 32]);
+        let mut utxos = UtxoSet::new();
+        utxos.insert(
+            OutPoint { txid, vout: 0 },
+            Utxo {
+                txout: TxOut { value: 2_000, script_pubkey: Script::new() },
+                is_coinbase: false,
+                height: 100,
+            },
+        );
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid, vout: 0 },
+                script_sig: Script::new(),
+                sequence: 1,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 1_000, script_pubkey: Script::new() }],
+            lock_time: 0,
+        };
+        let mut flags = ScriptFlags::default();
+        flags.verify_checksequenceverify = true;
+        let r = verify_transaction_with_lock_rules(
+            &tx,
+            &utxos,
+            100,
+            flags,
+            1000,
+            &LinearMtpProvider,
+            true,
+        );
+        assert!(matches!(r, Err(ConsensusError::SequenceLockNotSatisfied)));
+    }
+
+    #[test]
+    fn verify_transaction_bip68_time_lock_not_satisfied() {
+        let txid = Hash256([8; 32]);
+        let mut utxos = UtxoSet::new();
+        utxos.insert(
+            OutPoint { txid, vout: 0 },
+            Utxo {
+                txout: TxOut { value: 2_000, script_pubkey: Script::new() },
+                is_coinbase: false,
+                height: 100,
+            },
+        );
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid, vout: 0 },
+                script_sig: Script::new(),
+                sequence: (1 << 22) | 1,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 1_000, script_pubkey: Script::new() }],
+            lock_time: 0,
+        };
+        let mut flags = ScriptFlags::default();
+        flags.verify_checksequenceverify = true;
+        // coin height 100 -> base MTP at 99 = 99000; required min_time = 99000 + 512 - 1 = 99511
+        let r = verify_transaction_with_lock_rules(
+            &tx,
+            &utxos,
+            200,
+            flags,
+            99_511,
+            &LinearMtpProvider,
+            true,
+        );
+        assert!(matches!(r, Err(ConsensusError::SequenceLockNotSatisfied)));
     }
 }
