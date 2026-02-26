@@ -712,6 +712,8 @@ impl Node {
     /// If the frontier block is in-flight longer than this, re-request it from
     /// another idle peer (without waiting for full stall timeout).
     const FRONTIER_RETRY_TIMEOUT: Duration = Duration::from_secs(15);
+    /// Keep up to this many parallel owners for the frontier block.
+    const FRONTIER_REDUNDANT_PEERS: usize = 2;
 
     fn request_peer_disconnect(&mut self, peer_id: u64) {
         self.disconnecting_peers.insert(peer_id);
@@ -760,29 +762,64 @@ impl Node {
             };
             if !frontier_connected {
                 frontier_pending = true;
-                // If frontier is already in-flight, only re-issue when it has
-                // been waiting too long.
-                let frontier_inflight_age = self
+                let frontier_owners: Vec<(u64, Duration)> = self
                     .ibd
                     .peer_downloads
-                    .values()
-                    .find(|dl| dl.hashes.iter().any(|h| h == &frontier_hash))
-                    .map(|dl| dl.requested_at.elapsed());
-                let should_request_frontier = match frontier_inflight_age {
-                    None => true,
-                    Some(age) => age >= Self::FRONTIER_RETRY_TIMEOUT,
+                    .iter()
+                    .filter(|(_, dl)| dl.hashes.iter().any(|h| h == &frontier_hash))
+                    .map(|(peer_id, dl)| (*peer_id, dl.requested_at.elapsed()))
+                    .collect();
+                let stale_owner_exists = frontier_owners
+                    .iter()
+                    .any(|(_, age)| *age >= Self::FRONTIER_RETRY_TIMEOUT);
+                let desired_owners = if stale_owner_exists {
+                    Self::FRONTIER_REDUNDANT_PEERS
+                } else {
+                    Self::FRONTIER_REDUNDANT_PEERS
                 };
-                if should_request_frontier {
-                    if let Some(peer_id) = idle_peers.first().copied() {
-                        info!(
-                            "IBD: assigning frontier height {} (1 block) to peer {}",
-                            frontier, peer_id
-                        );
-                        self.ibd.assigned_ranges.insert(peer_id, (frontier, frontier));
-                        self.ibd.record_peer_request(peer_id, vec![frontier_hash]);
-                        self.peer_manager.request_blocks(peer_id, &[frontier_hash]);
+                let mut owners = frontier_owners.len();
+                while owners < desired_owners {
+                    let Some(peer_id) = idle_peers.first().copied() else {
+                        break;
+                    };
+                    if self.disconnecting_peers.contains(&peer_id) {
                         idle_peers.remove(0);
+                        continue;
                     }
+                    // Avoid duplicate assignment to an owner that already has frontier.
+                    if self
+                        .ibd
+                        .peer_downloads
+                        .get(&peer_id)
+                        .map(|dl| dl.hashes.iter().any(|h| h == &frontier_hash))
+                        .unwrap_or(false)
+                    {
+                        idle_peers.remove(0);
+                        continue;
+                    }
+                    info!(
+                        "IBD: assigning frontier height {} (1 block) to peer {}",
+                        frontier, peer_id
+                    );
+                    self.ibd.assigned_ranges.insert(peer_id, (frontier, frontier));
+                    self.ibd.record_peer_request(peer_id, vec![frontier_hash]);
+                    self.peer_manager.request_blocks(peer_id, &[frontier_hash]);
+                    idle_peers.remove(0);
+                    owners += 1;
+                }
+
+                if owners == 0 {
+                    debug!(
+                        "IBD: no frontier owner available for height {}; waiting for peer availability",
+                        frontier
+                    );
+                } else if owners < Self::FRONTIER_REDUNDANT_PEERS {
+                    debug!(
+                        "IBD: frontier height {} currently has {} owner(s), target {}",
+                        frontier,
+                        owners,
+                        Self::FRONTIER_REDUNDANT_PEERS
+                    );
                 }
 
                 // Remove frontier from pending_ranges so it won't be re-dispatched
@@ -926,15 +963,27 @@ impl Node {
         }
     }
 
-    /// Mark one block as connected and update IBD batch tracking.
-    /// Called only when a block is actually connected to the chain (not when cached).
-    /// Returns true when the peer's entire segment is now connected.
-    async fn ibd_mark_connected(&mut self, peer_id: u64, block_hash: &Hash256) {
-        if !self.ibd.is_complete() {
-            let batch_done = self.ibd.complete_peer_block(peer_id, block_hash);
-            if batch_done {
-                self.assign_blocks_to_peers().await;
+    /// Mark `block_hash` connected for all peers that had it in-flight.
+    /// This is important when frontier is requested from multiple peers.
+    async fn ibd_mark_connected_all(&mut self, block_hash: &Hash256) {
+        if self.ibd.is_complete() {
+            return;
+        }
+        let owners: Vec<u64> = self
+            .ibd
+            .peer_downloads
+            .iter()
+            .filter(|(_, dl)| dl.hashes.iter().any(|h| h == block_hash))
+            .map(|(peer_id, _)| *peer_id)
+            .collect();
+        let mut any_batch_done = false;
+        for peer_id in owners {
+            if self.ibd.complete_peer_block(peer_id, block_hash) {
+                any_batch_done = true;
             }
+        }
+        if any_batch_done {
+            self.assign_blocks_to_peers().await;
         }
     }
 
@@ -946,16 +995,17 @@ impl Node {
         let block_hash = header_hash(&block.header);
 
         // Skip if already connected.
-        {
+        let already_connected = {
             let chain = self.chain.read().await;
-            if chain
+            chain
                 .block_index
                 .get(&block_hash)
                 .map(|bi| bi.status == BlockStatus::InChain)
                 .unwrap_or(false)
-            {
-                return Ok(());
-            }
+        };
+        if already_connected {
+            self.ibd_mark_connected_all(&block_hash).await;
+            return Ok(());
         }
 
         // Determine height; add header to index if not yet known.
@@ -994,13 +1044,14 @@ impl Node {
 
         if height <= chain_height {
             // Stale duplicate or fork block below our tip; nothing to do.
+            self.ibd_mark_connected_all(&block_hash).await;
             return Ok(());
         }
 
         // height == chain_height + 1: validate and connect immediately, then
         // drain any consecutively-pending blocks that are now unblocked.
         self.do_connect_block(peer_id, block_hash, block, height).await?;
-        self.ibd_mark_connected(peer_id, &block_hash).await;
+        self.ibd_mark_connected_all(&block_hash).await;
 
         loop {
             let next_height = self.chain.read().await.height() + 1;
@@ -1011,7 +1062,7 @@ impl Node {
             self.do_connect_block(p_peer, p_hash, p_block, next_height).await?;
             // Mark connected here — not at cache time — so peer batch tracking
             // reflects actual chain progress, not just block delivery.
-            self.ibd_mark_connected(p_peer, &p_hash).await;
+            self.ibd_mark_connected_all(&p_hash).await;
         }
 
         Ok(())
