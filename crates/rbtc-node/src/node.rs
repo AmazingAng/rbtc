@@ -705,6 +705,8 @@ impl Node {
 
     /// Per-peer in-flight request cap (Bitcoin Core defaults to small per-peer windows).
     const PER_PEER_INFLIGHT_BLOCKS: u32 = 16;
+    /// Tighter in-flight cap while frontier is pending, to reduce out-of-order flood.
+    const PER_PEER_INFLIGHT_BLOCKS_FRONTIER_PENDING: u32 = 4;
     /// Global download window ahead of connected tip.
     const GLOBAL_WINDOW_BLOCKS: u32 = 1024;
     /// If the frontier block is in-flight longer than this, re-request it from
@@ -745,7 +747,9 @@ impl Node {
                 })
         };
         let mut frontier_pending = false;
+        let mut frontier_hash_for_preemption: Option<Hash256> = None;
         if let Some(frontier_hash) = frontier_hash {
+            frontier_hash_for_preemption = Some(frontier_hash);
             let frontier_connected = {
                 let chain = self.chain.read().await;
                 chain
@@ -802,6 +806,40 @@ impl Node {
             }
         }
 
+        // If frontier is still pending but no idle peer exists, preempt one
+        // far-ahead busy peer so the next assignment cycle can immediately
+        // dedicate capacity to frontier recovery.
+        if frontier_pending && idle_peers.is_empty() {
+            let frontier_hash = frontier_hash_for_preemption;
+            let victim = self
+                .ibd
+                .assigned_ranges
+                .iter()
+                .filter(|(peer_id, _)| !self.disconnecting_peers.contains(peer_id))
+                .filter(|(peer_id, _)| {
+                    // Do not preempt the current frontier owner (if any).
+                    if let Some(frontier_hash) = frontier_hash {
+                        if let Some(dl) = self.ibd.peer_downloads.get(peer_id) {
+                            return !dl.hashes.iter().any(|h| h == &frontier_hash);
+                        }
+                    }
+                    true
+                })
+                .max_by_key(|(_, (_, end))| *end)
+                .map(|(peer_id, _)| *peer_id);
+            if let Some(victim_peer) = victim {
+                warn!(
+                    "IBD: preempting peer {} to free slot for frontier height {}",
+                    victim_peer,
+                    frontier
+                );
+                self.ibd.release_peer(victim_peer);
+                self.request_peer_disconnect(victim_peer);
+                // Wait for disconnect event to avoid immediate re-assignment races.
+                return;
+            }
+        }
+
         // Keep one peer idle while frontier is still pending so failover can
         // immediately switch owners instead of waiting for another connection.
         let range_assign_limit = if frontier_pending && !idle_peers.is_empty() {
@@ -817,6 +855,12 @@ impl Node {
                 range_assign_limit
             );
         }
+
+        let per_peer_cap = if frontier_pending {
+            Self::PER_PEER_INFLIGHT_BLOCKS_FRONTIER_PENDING
+        } else {
+            Self::PER_PEER_INFLIGHT_BLOCKS
+        };
 
         for peer_id in idle_peers.into_iter().take(range_assign_limit) {
             // Always dispatch the smallest-start (frontier-nearest) segment first.
@@ -835,7 +879,7 @@ impl Node {
             let (start, end) = range;
 
             // Per-peer inflight cap: split large segments into smaller requests.
-            let capped_end = end.min(start.saturating_add(Self::PER_PEER_INFLIGHT_BLOCKS - 1));
+            let capped_end = end.min(start.saturating_add(per_peer_cap - 1));
 
             let hashes = self.hashes_for_range(start, capped_end).await;
             if hashes.is_empty() {
