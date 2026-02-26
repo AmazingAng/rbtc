@@ -56,7 +56,9 @@ pub fn script_flags_for_block(
         verify_dersig,
         verify_witness,
         verify_nulldummy,
-        verify_cleanstack: true,
+        // CLEANSTACK is a policy/standardness rule, not a legacy block
+        // consensus flag in Bitcoin Core's GetBlockScriptFlags path.
+        verify_cleanstack: false,
         verify_checklocktimeverify,
         verify_checksequenceverify,
         verify_taproot,
@@ -82,7 +84,7 @@ mod tests {
             1320000000,
         );
         assert!(flags.verify_p2sh);
-        assert!(flags.verify_cleanstack);
+        assert!(!flags.verify_cleanstack);
         assert!(!flags.verify_checklocktimeverify);
         assert!(!flags.verify_checksequenceverify);
         assert!(flags.verify_witness);
@@ -225,7 +227,7 @@ mod tests {
         assert!(flags.verify_p2sh);
         assert!(flags.verify_dersig);
         assert!(flags.verify_nulldummy);
-        assert!(flags.verify_cleanstack);
+        assert!(!flags.verify_cleanstack);
         assert!(flags.verify_checklocktimeverify);
         assert!(flags.verify_checksequenceverify);
         assert!(flags.verify_witness);
