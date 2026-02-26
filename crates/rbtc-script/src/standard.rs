@@ -3,7 +3,7 @@ use rbtc_primitives::{
     transaction::{Transaction, TxOut},
 };
 use rbtc_crypto::{
-    digest::{hash160, sha256d, tagged_hash},
+    digest::{hash160, sha256, tagged_hash},
     sig::{verify_ecdsa_with_policy, verify_schnorr},
     sighash::{sighash_segwit_v0, sighash_taproot, SighashType},
 };
@@ -119,8 +119,8 @@ fn verify_p2wsh(ctx: &ScriptContext<'_>, script_hash: &[u8; 32]) -> Result<(), S
     }
 
     let witness_script_bytes = witness.last().unwrap();
-    // Verify script hash
-    if sha256d(witness_script_bytes).0 != *script_hash {
+    // BIP141: P2WSH commits to SHA256(witness_script), not SHA256d.
+    if sha256(witness_script_bytes).0 != *script_hash {
         return Err(ScriptError::WitnessProgramMismatch);
     }
 
@@ -354,7 +354,9 @@ fn execute_tapscript(
                     return Err(ScriptError::ScriptFailed("OP_VERIFY failed".into()));
                 }
             }
-            _ => {}
+            _ => {
+                return Err(ScriptError::InvalidOpcode);
+            }
         }
     }
 

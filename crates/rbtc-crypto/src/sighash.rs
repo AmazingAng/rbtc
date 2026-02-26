@@ -295,15 +295,13 @@ pub fn sighash_taproot(
     }
 
     if let Some(annex_data) = annex {
-        let mut annex_with_prefix = Vec::with_capacity(1 + annex_data.len());
-        annex_with_prefix.push(0x50);
-        annex_with_prefix.extend_from_slice(annex_data);
-        // sha256(compact_size + annex_with_prefix)
+        // BIP341 annex hash: SHA256(compact_size || annex), where annex
+        // already includes the 0x50 tag byte in witness data.
+        let mut annex_ser = Vec::new();
+        VarInt(annex_data.len() as u64).encode(&mut annex_ser).unwrap();
+        annex_ser.extend_from_slice(annex_data);
         let mut h = Sha256::new();
-        VarInt(annex_with_prefix.len() as u64)
-            .encode(&mut std::io::sink())
-            .unwrap();
-        h.update(&annex_with_prefix);
+        h.update(&annex_ser);
         buf.extend_from_slice(&h.finalize());
     }
 

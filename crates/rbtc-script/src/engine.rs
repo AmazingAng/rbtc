@@ -686,6 +686,8 @@ impl ScriptEngine {
                         return Err(ScriptError::LockTimeFailed);
                     }
                 }
+                // OP_CHECKSIGADD is tapscript-only (BIP342).
+                Opcode::OpCheckSigAdd => return Err(ScriptError::InvalidOpcode),
 
                 // ── Disabled ops ─────────────────────────────────────────
                 op if op.is_disabled() => return Err(ScriptError::DisabledOpcode),
@@ -898,6 +900,17 @@ mod tests {
         engine.execute(&script, &mut stack, &tx, 0, 0, &script).unwrap();
         assert_eq!(stack.len(), 1);
         assert_eq!(stack[0].len(), 20);
+    }
+
+    #[test]
+    fn execute_op_checksigadd_invalid_in_legacy() {
+        let engine = ScriptEngine::new(ScriptFlags::default());
+        let tx = minimal_tx();
+        let script = Script::from_bytes(vec![0xba]);
+        let mut stack = vec![];
+        let r = engine.execute(&script, &mut stack, &tx, 0, 0, &script);
+        assert!(r.is_err());
+        assert!(matches!(r.unwrap_err(), ScriptError::InvalidOpcode));
     }
 
     #[test]
