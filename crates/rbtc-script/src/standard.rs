@@ -646,4 +646,35 @@ mod tests {
         };
         assert!(verify_input(&ctx).is_ok());
     }
+
+    #[test]
+    fn verify_input_legacy_p2sh_empty_sig_multisig_not_case() {
+        // Real mainnet case (block 299506): redeemScript = OP_CHECKMULTISIG OP_NOT.
+        // Core treats empty sig in CHECKMULTISIG as a failed signature check (not skipped),
+        // then OP_NOT flips it to true.
+        let spend_hex = "01000000019cc2a6fbf645a81cc42317673ca33d500059f34080d64f333bf72379420687b70000000008000051005102ae91ffffffff0150c300000000000002ae9100000000";
+        let prev_hex = "01000000023904cd3644c6d440a6d752c95f07737c46f5e70fb6fbb28f00aa17e281868b7b010000006b483045022100ac455750dc430957942e9766f88aecfe6eb17d4244eb2cb50ca4a25336fd4dd702202640cc943f4fe8f2166b03005bed3bd024f4762767322b60bf471ecf8e3f3ede012102348d4cad0084f88c4c02bdc1bf90cc6c0893a0b97af76ef644daf72e6786b4afffffffffb84057ae61ad22ac17c02635ee1b37d170ef785847ec28efe848a5607331568e020000006b483045022100d7fee595d7a1f9969767098f8582e7a563f08437f461f0a25395f35c1833839302205f565ab12d343478471a78669c4c3476714032f7758a781d7deab19f160784e0012102ea69c47753d8e0228c0c426294a6b4dc926aebbeb8561248d40be37d257d94e0ffffffff01a08601000000000017a91438430c4d1c214bf11d2c0c3dea8e5e9a5d11aab08700000000";
+
+        let spend = Transaction::decode(&mut Cursor::new(decode_hex(spend_hex))).expect("decode spend");
+        let prev = Transaction::decode(&mut Cursor::new(decode_hex(prev_hex))).expect("decode prev");
+        let prevout = prev.outputs[0].clone();
+        let all_prevouts = vec![prevout.clone()];
+        let ctx = ScriptContext {
+            tx: &spend,
+            input_index: 0,
+            prevout: &prevout,
+            flags: ScriptFlags {
+                verify_p2sh: true,
+                verify_dersig: false,
+                verify_witness: false,
+                verify_nulldummy: false,
+                verify_cleanstack: false,
+                verify_checklocktimeverify: false,
+                verify_checksequenceverify: false,
+                verify_taproot: false,
+            },
+            all_prevouts: &all_prevouts,
+        };
+        assert!(verify_input(&ctx).is_ok());
+    }
 }

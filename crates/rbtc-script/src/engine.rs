@@ -142,9 +142,6 @@ fn cast_to_bool(bytes: &[u8]) -> bool {
 // Legacy FindAndDelete: remove all pushed occurrences of a signature from
 // scriptCode before CHECKSIG/CHECKMULTISIG hashing (Bitcoin Core BASE path).
 fn find_and_delete_script_sig(script: &Script, sig: &[u8]) -> Script {
-    if sig.is_empty() {
-        return script.clone();
-    }
     let mut pattern = Vec::with_capacity(1 + sig.len());
     match sig.len() {
         0..=0x4b => pattern.push(sig.len() as u8),
@@ -650,9 +647,7 @@ impl ScriptEngine {
                         script_code.clone()
                     };
                     for sig in &sigs {
-                        if !sig.is_empty() {
-                            sc = find_and_delete_script_sig(&sc, sig);
-                        }
+                        sc = find_and_delete_script_sig(&sc, sig);
                     }
 
                     let mut sig_idx = 0;
@@ -661,16 +656,20 @@ impl ScriptEngine {
 
                     while sig_idx < sigs.len() && all_ok {
                         let sig = &sigs[sig_idx];
-                        if sig.is_empty() { sig_idx += 1; continue; }
-                        let sighash_u32 = *sig.last().unwrap() as u32;
-                        let hash = sighash_legacy_with_u32(tx, input_index, &sc, sighash_u32);
+                        let (sig_der, sighash_bytes): (&[u8], Option<[u8; 32]>) = if sig.is_empty() {
+                            (&[], None)
+                        } else {
+                            let sighash_u32 = *sig.last().unwrap() as u32;
+                            let h = sighash_legacy_with_u32(tx, input_index, &sc, sighash_u32);
+                            (&sig[..sig.len() - 1], Some(h.0))
+                        };
 
                         let mut matched = false;
                         while key_idx < pubkeys.len() && !matched {
-                            if verify_ecdsa_with_policy(
+                            if !sig_der.is_empty() && verify_ecdsa_with_policy(
                                 &pubkeys[key_idx],
-                                &sig[..sig.len() - 1],
-                                &hash.0,
+                                sig_der,
+                                &sighash_bytes.expect("sighash present for non-empty sig"),
                                 self.flags.verify_dersig,
                             )
                             .is_ok()
