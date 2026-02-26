@@ -1,4 +1,4 @@
-use std::{collections::HashMap, net::IpAddr, sync::Arc, time::Duration};
+use std::{collections::{HashMap, HashSet}, net::IpAddr, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use tokio::sync::{mpsc, RwLock};
@@ -67,6 +67,9 @@ pub struct Node {
     pending_blocks: HashMap<u32, (u64, rbtc_primitives::block::Block)>,
     /// Timestamp of last peer address persistence flush
     last_peer_persist: std::time::Instant,
+    /// Peers that have been asked to disconnect but haven't emitted
+    /// `PeerDisconnected` yet. Excluded from new IBD assignments.
+    disconnecting_peers: HashSet<u64>,
 }
 
 impl Node {
@@ -163,6 +166,7 @@ impl Node {
             pending_compact: HashMap::new(),
             pending_blocks: HashMap::new(),
             last_peer_persist: std::time::Instant::now(),
+            disconnecting_peers: HashSet::new(),
         })
     }
 
@@ -288,6 +292,9 @@ impl Node {
     async fn handle_node_event(&mut self, event: NodeEvent) -> Result<()> {
         match event {
             NodeEvent::PeerConnected { peer_id, addr, best_height } => {
+                // If peer IDs are recycled, make sure stale disconnect marks
+                // don't block fresh assignments.
+                self.disconnecting_peers.remove(&peer_id);
                 info!("peer {peer_id} connected from {addr}, height={best_height}");
                 let our_height = self.chain.read().await.height() as i32;
                 if best_height > our_height {
@@ -303,6 +310,7 @@ impl Node {
             }
 
             NodeEvent::PeerDisconnected { peer_id } => {
+                self.disconnecting_peers.remove(&peer_id);
                 info!("peer {peer_id} disconnected");
                 if self.ibd.phase == IbdPhase::Blocks {
                     // Return the peer's unfinished range to the work queue.
@@ -360,11 +368,11 @@ impl Node {
                 );
                 if self.ibd.phase == IbdPhase::Blocks {
                     self.ibd.release_peer(peer_id);
-                    self.peer_manager.disconnect(peer_id);
+                    self.request_peer_disconnect(peer_id);
                     self.assign_blocks_to_peers().await;
                 } else if self.ibd.sync_peer == Some(peer_id) {
                     self.ibd.sync_peer = None;
-                    self.peer_manager.disconnect(peer_id);
+                    self.request_peer_disconnect(peer_id);
                     if let Some(new_peer) = self.peer_manager.best_peer() {
                         self.ibd.sync_peer = Some(new_peer);
                         self.ibd.record_progress();
@@ -703,6 +711,11 @@ impl Node {
     /// another idle peer (without waiting for full stall timeout).
     const FRONTIER_RETRY_TIMEOUT: Duration = Duration::from_secs(15);
 
+    fn request_peer_disconnect(&mut self, peer_id: u64) {
+        self.disconnecting_peers.insert(peer_id);
+        self.peer_manager.disconnect(peer_id);
+    }
+
     /// Assign pending height-range segments to idle peers.
     /// Called whenever a new peer connects, a batch finishes, or after a stall.
     async fn assign_blocks_to_peers(&mut self) {
@@ -714,6 +727,7 @@ impl Node {
             .peer_manager
             .peers_for_ibd(our_height + 1)
             .into_iter()
+            .filter(|id| !self.disconnecting_peers.contains(id))
             .filter(|id| !self.ibd.peer_downloads.contains_key(id))
             .collect();
 
@@ -1389,6 +1403,7 @@ impl Node {
         }
 
         if self.ibd.phase == IbdPhase::Blocks {
+            let mut disconnected_any = false;
             // Frontier-specific fast failover: if the frontier block is still
             // not connected and its in-flight request is stale, recycle that
             // peer immediately instead of waiting for the full stall timeout.
@@ -1429,7 +1444,8 @@ impl Node {
                                 age.as_secs()
                             );
                             self.ibd.release_peer(peer_id);
-                            self.peer_manager.disconnect(peer_id);
+                            self.request_peer_disconnect(peer_id);
+                            disconnected_any = true;
                         }
                     }
                 }
@@ -1444,10 +1460,13 @@ impl Node {
                     STALL_TIMEOUT.as_secs()
                 );
                 self.ibd.release_peer(peer_id);
-                self.peer_manager.disconnect(peer_id);
+                self.request_peer_disconnect(peer_id);
+                disconnected_any = true;
             }
             // Fill any idle peers with pending segments.
-            self.assign_blocks_to_peers().await;
+            if !disconnected_any {
+                self.assign_blocks_to_peers().await;
+            }
         } else {
             // Headers phase: single-peer stall detection.
             if self.ibd.is_stalled() {
@@ -1456,7 +1475,7 @@ impl Node {
                     "IBD stall: peer {stale} made no header progress for {}s; switching",
                     STALL_TIMEOUT.as_secs()
                 );
-                self.peer_manager.disconnect(stale);
+                self.request_peer_disconnect(stale);
             }
 
             if self.ibd.sync_peer.is_none() {
