@@ -723,6 +723,44 @@ impl Node {
             .filter(|id| !self.ibd.peer_downloads.contains_key(id))
             .collect();
 
+        // Hard frontier gating: while the frontier block (height+1) is not yet
+        // connected, only request that single block. This prevents out-of-order
+        // bulk delivery from starving chain progress.
+        let frontier = our_height.saturating_add(1);
+        let frontier_hash = {
+            let chain = self.chain.read().await;
+            chain
+                .get_ancestor_hash(frontier)
+                .or_else(|| {
+                    self.canonical_header_chain
+                        .get(frontier as usize)
+                        .copied()
+                        .filter(|h| *h != Hash256::ZERO)
+                })
+        };
+        if let Some(frontier_hash) = frontier_hash {
+            let frontier_connected = {
+                let chain = self.chain.read().await;
+                chain
+                    .block_index
+                    .get(&frontier_hash)
+                    .map(|bi| bi.status == BlockStatus::InChain)
+                    .unwrap_or(false)
+            };
+            if !frontier_connected {
+                if let Some(peer_id) = idle_peers.first().copied() {
+                    info!(
+                        "IBD: assigning frontier height {} (1 block) to peer {}",
+                        frontier, peer_id
+                    );
+                    self.ibd.assigned_ranges.insert(peer_id, (frontier, frontier));
+                    self.ibd.record_peer_request(peer_id, vec![frontier_hash]);
+                    self.peer_manager.request_blocks(peer_id, &[frontier_hash]);
+                }
+                return;
+            }
+        }
+
         for peer_id in idle_peers {
             // Always dispatch the smallest-start (frontier-nearest) segment first.
             // `pending_ranges` can be perturbed by stall/release re-queue ordering,
