@@ -115,6 +115,11 @@ impl IbdState {
         false
     }
 
+    /// Returns true if any peer currently has `hash` in flight.
+    pub fn is_hash_inflight(&self, hash: &BlockHash) -> bool {
+        self.peer_downloads.values().any(|dl| dl.hashes.iter().any(|h| h == hash))
+    }
+
     /// Return the IDs of all peers whose in-flight request is older than `timeout`.
     pub fn stalled_peers(&self, timeout: Duration) -> Vec<u64> {
         self.peer_downloads

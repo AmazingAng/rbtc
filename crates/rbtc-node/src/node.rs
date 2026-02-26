@@ -695,37 +695,26 @@ impl Node {
         hashes
     }
 
-    /// Maximum number of segments that may be in-flight ahead of the connected
-    /// frontier.  Prevents peer assignments from racing arbitrarily far ahead
-    /// while the frontier is stalled, which would fill pending_blocks with
-    /// blocks that can never be validated (wrong expected_bits etc.).
-    // Conservative mode: only assign the frontier segment (height+1 bucket).
-    // This avoids long stalls caused by receiving far-ahead segments before
-    // predecessors, at the cost of less parallelism.
-    const MAX_AHEAD_SEGMENTS: u32 = 0;
+    /// Per-peer in-flight request cap (Bitcoin Core defaults to small per-peer windows).
+    const PER_PEER_INFLIGHT_BLOCKS: u32 = 16;
+    /// Global download window ahead of connected tip.
+    const GLOBAL_WINDOW_BLOCKS: u32 = 1024;
 
     /// Assign pending height-range segments to idle peers.
     /// Called whenever a new peer connects, a batch finishes, or after a stall.
     async fn assign_blocks_to_peers(&mut self) {
         // Collect peers that are not currently handling a batch.
         let our_height = self.chain.read().await.height();
-        // Hard ceiling: don't assign segments whose start is more than
-        // MAX_AHEAD_SEGMENTS×SEGMENT_SIZE above the *frontier* (height+1).
-        // Note: frontier itself must always be assignable.
-        let frontier_start = our_height.saturating_add(1);
-        let max_ahead_height =
-            frontier_start.saturating_add(Self::MAX_AHEAD_SEGMENTS * SEGMENT_SIZE as u32);
+        let max_assignable_height = our_height.saturating_add(Self::GLOBAL_WINDOW_BLOCKS);
 
-        let idle_peers: Vec<u64> = self
+        let mut idle_peers: Vec<u64> = self
             .peer_manager
             .peers_for_ibd(our_height + 1)
             .into_iter()
             .filter(|id| !self.ibd.peer_downloads.contains_key(id))
             .collect();
 
-        // Hard frontier gating: while the frontier block (height+1) is not yet
-        // connected, only request that single block. This prevents out-of-order
-        // bulk delivery from starving chain progress.
+        // Frontier guard: ensure height+1 is always actively in-flight.
         let frontier = our_height.saturating_add(1);
         let frontier_hash = {
             let chain = self.chain.read().await;
@@ -747,7 +736,7 @@ impl Node {
                     .map(|bi| bi.status == BlockStatus::InChain)
                     .unwrap_or(false)
             };
-            if !frontier_connected {
+            if !frontier_connected && !self.ibd.is_hash_inflight(&frontier_hash) {
                 if let Some(peer_id) = idle_peers.first().copied() {
                     info!(
                         "IBD: assigning frontier height {} (1 block) to peer {}",
@@ -756,8 +745,8 @@ impl Node {
                     self.ibd.assigned_ranges.insert(peer_id, (frontier, frontier));
                     self.ibd.record_peer_request(peer_id, vec![frontier_hash]);
                     self.peer_manager.request_blocks(peer_id, &[frontier_hash]);
+                    idle_peers.remove(0);
                 }
-                return;
             }
         }
 
@@ -768,7 +757,7 @@ impl Node {
             let mut best_idx: Option<usize> = None;
             let mut best_start = u32::MAX;
             for (idx, (start, _)) in self.ibd.pending_ranges.iter().enumerate() {
-                if *start <= max_ahead_height && *start < best_start {
+                if *start <= max_assignable_height && *start < best_start {
                     best_start = *start;
                     best_idx = Some(idx);
                 }
@@ -777,7 +766,10 @@ impl Node {
             let Some(range) = self.ibd.pending_ranges.remove(best_idx) else { continue };
             let (start, end) = range;
 
-            let hashes = self.hashes_for_range(start, end).await;
+            // Per-peer inflight cap: split large segments into smaller requests.
+            let capped_end = end.min(start.saturating_add(Self::PER_PEER_INFLIGHT_BLOCKS - 1));
+
+            let hashes = self.hashes_for_range(start, capped_end).await;
             if hashes.is_empty() {
                 // If this segment is already behind our connected height, it's done.
                 // Otherwise we likely hit a header gap; re-queue this range and stop
@@ -789,14 +781,21 @@ impl Node {
                 }
                 continue;
             }
+            let requested_end = start.saturating_add(hashes.len() as u32).saturating_sub(1);
+            if requested_end < end {
+                self.ibd
+                    .pending_ranges
+                    .push_front((requested_end.saturating_add(1), end));
+            }
+
             info!(
                 "IBD: assigning heights {}..={} ({} blocks) to peer {}",
                 start,
-                end,
+                requested_end,
                 hashes.len(),
                 peer_id
             );
-            self.ibd.assigned_ranges.insert(peer_id, range);
+            self.ibd.assigned_ranges.insert(peer_id, (start, requested_end));
             self.ibd.record_peer_request(peer_id, hashes.clone());
             self.peer_manager.request_blocks(peer_id, &hashes);
         }
