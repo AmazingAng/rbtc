@@ -526,6 +526,11 @@ impl ScriptEngine {
                     let data = pop(stack)?;
                     stack.push(Ripemd160::digest(&data).to_vec());
                 }
+                Opcode::OpSha1 => {
+                    use sha1::{Digest as _, Sha1};
+                    let data = pop(stack)?;
+                    stack.push(Sha1::digest(&data).to_vec());
+                }
                 Opcode::OpSha256 => {
                     let data = pop(stack)?;
                     stack.push(sha256(&data).0.to_vec());
@@ -878,6 +883,17 @@ mod tests {
         let engine = ScriptEngine::new(ScriptFlags::default());
         let tx = minimal_tx();
         let script = Script::from_bytes(vec![0x01, 0x61, 0xa9]);
+        let mut stack = vec![];
+        engine.execute(&script, &mut stack, &tx, 0, 0, &script).unwrap();
+        assert_eq!(stack.len(), 1);
+        assert_eq!(stack[0].len(), 20);
+    }
+
+    #[test]
+    fn execute_op_sha1() {
+        let engine = ScriptEngine::new(ScriptFlags::default());
+        let tx = minimal_tx();
+        let script = Script::from_bytes(vec![0x01, 0x61, 0xa7]);
         let mut stack = vec![];
         engine.execute(&script, &mut stack, &tx, 0, 0, &script).unwrap();
         assert_eq!(stack.len(), 1);
