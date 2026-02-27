@@ -343,7 +343,7 @@ fn witness_program_sigops(version: u8, program: &[u8], witness: &[Vec<u8>]) -> u
         let ws = rbtc_primitives::script::Script::from_bytes(
             witness.last().cloned().unwrap_or_default(),
         );
-        return ws.count_sigops();
+        return ws.count_sigops_accurate(true);
     }
     0
 }

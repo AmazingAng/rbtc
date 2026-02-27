@@ -105,18 +105,42 @@ impl Script {
         }
     }
 
-    /// Count sigops in this script (not segwit-aware)
+    /// Count sigops in this script using legacy (non-accurate) rules.
     pub fn count_sigops(&self) -> usize {
+        self.count_sigops_accurate(false)
+    }
+
+    /// Count sigops in this script.
+    ///
+    /// When `accurate` is true, CHECKMULTISIG counts as OP_N (1..16) when
+    /// immediately preceded by OP_1..OP_16, matching Core's accurate counting
+    /// used by P2SH/P2WSH paths.
+    pub fn count_sigops_accurate(&self, accurate: bool) -> usize {
         let mut count = 0usize;
         let mut i = 0;
         let bytes = &self.0;
+        let mut last_opcode: Option<u8> = None;
         while i < bytes.len() {
             let op = bytes[i];
             match op {
                 // OP_CHECKSIG / OP_CHECKSIGVERIFY
                 0xac | 0xad => count += 1,
                 // OP_CHECKMULTISIG / OP_CHECKMULTISIGVERIFY
-                0xae | 0xaf => count += 20,
+                0xae | 0xaf => {
+                    if accurate {
+                        if let Some(prev) = last_opcode {
+                            if (0x51..=0x60).contains(&prev) {
+                                count += (prev - 0x50) as usize;
+                            } else {
+                                count += 20;
+                            }
+                        } else {
+                            count += 20;
+                        }
+                    } else {
+                        count += 20;
+                    }
+                }
                 // data push opcodes – skip the data
                 0x01..=0x4b => i += op as usize,
                 0x4c => {
@@ -141,6 +165,7 @@ impl Script {
                 }
                 _ => {}
             }
+            last_opcode = Some(op);
             i += 1;
         }
         count
@@ -284,6 +309,10 @@ mod tests {
         assert_eq!(s.count_sigops(), 20);
         let s = Script::from_bytes(vec![0x01, 0x00, 0xac]);
         assert_eq!(s.count_sigops(), 1);
+        let s = Script::from_bytes(vec![0x52, 0xae]);
+        assert_eq!(s.count_sigops_accurate(true), 2);
+        let s = Script::from_bytes(vec![0xae]);
+        assert_eq!(s.count_sigops_accurate(true), 20);
     }
 
     #[test]
