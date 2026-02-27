@@ -1034,6 +1034,35 @@ mod tests {
     }
 
     #[test]
+    fn verify_input_p2sh_p2wpkh_nonstandard_sighash_mainnet_508011() {
+        // Real mainnet case from block 508011:
+        // witness signature uses sighash byte 0x65 (non-standard but consensus-valid).
+        let spend_hex = "01000000000101447e208868dbc8e930fc6eba4fe0d0abfe0d9dc2db4ba70542e02467f00205c90100000017160014e20c60563894174c253ae937ba59ace46ab9ffb1ffffffff010845f305000000001976a91414ac7fc2a782bde1555b753d75ff4ed146683cae88ac024730440220120003c32cca7eabf07bad5c31125accc09d13c39546fa93833b8b69a2c72ed7022057083dc2ed348156874b8af859ac7a9c16e5ce39353f3f1ac2226b49c2b319af652103f73386ac6e567581f8d0611ad7a8536c3cd0253e535f6fc4707514b2ab54198700000000";
+        let spend = Transaction::decode(&mut Cursor::new(decode_hex(spend_hex))).expect("decode spend");
+        let prevout = TxOut {
+            value: 99_830_000,
+            script_pubkey: Script::from_bytes(decode_hex("a914e93f9e95f6d5cb1736a94de992d0d18819072fa587")),
+        };
+        let ctx = ScriptContext {
+            tx: &spend,
+            input_index: 0,
+            prevout: &prevout,
+            flags: ScriptFlags {
+                verify_p2sh: true,
+                verify_dersig: true,
+                verify_witness: true,
+                verify_nulldummy: true,
+                verify_cleanstack: false,
+                verify_checklocktimeverify: true,
+                verify_checksequenceverify: true,
+                verify_taproot: false,
+            },
+            all_prevouts: &[prevout.clone()],
+        };
+        assert!(verify_input(&ctx).is_ok());
+    }
+
+    #[test]
     fn verify_input_legacy_p2sh_find_and_delete_case() {
         // Real mainnet case (block 290329): redeemScript embeds a signature-like
         // push, requiring legacy FindAndDelete behavior for BASE CHECKMULTISIG.

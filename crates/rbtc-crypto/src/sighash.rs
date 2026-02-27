@@ -249,6 +249,8 @@ pub fn sighash_segwit_v0_with_u32(
 ) -> Hash256 {
     let base = sighash_u32 & 0x1f;
     let anyone_can_pay = sighash_u32 & 0x80 != 0;
+    let is_single = base == 3;
+    let is_none = base == 2;
 
     // hash_prevouts
     let hash_prevouts = if !anyone_can_pay {
@@ -262,7 +264,9 @@ pub fn sighash_segwit_v0_with_u32(
     };
 
     // hash_sequence
-    let hash_sequence = if !anyone_can_pay && base == 1 {
+    // Core behavior: all non-NONE/non-SINGLE base types include hashSequence.
+    // This covers non-standard but consensus-valid sighash base values too.
+    let hash_sequence = if !anyone_can_pay && !is_single && !is_none {
         let mut data = Vec::new();
         for input in &tx.inputs {
             input.sequence.encode(&mut data).unwrap();
@@ -273,20 +277,18 @@ pub fn sighash_segwit_v0_with_u32(
     };
 
     // hash_outputs
-    let hash_outputs = match base {
-        1 => {
-            let mut data = Vec::new();
-            for output in &tx.outputs {
-                output.encode(&mut data).unwrap();
-            }
-            sha256d(&data)
+    let hash_outputs = if !is_single && !is_none {
+        let mut data = Vec::new();
+        for output in &tx.outputs {
+            output.encode(&mut data).unwrap();
         }
-        3 if input_index < tx.outputs.len() => {
-            let mut data = Vec::new();
-            tx.outputs[input_index].encode(&mut data).unwrap();
-            sha256d(&data)
-        }
-        _ => Hash256::ZERO,
+        sha256d(&data)
+    } else if is_single && input_index < tx.outputs.len() {
+        let mut data = Vec::new();
+        tx.outputs[input_index].encode(&mut data).unwrap();
+        sha256d(&data)
+    } else {
+        Hash256::ZERO
     };
 
     let mut buf = Vec::new();
