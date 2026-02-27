@@ -6,7 +6,7 @@ use rbtc_primitives::{
 use rbtc_crypto::{
     digest::{hash160, sha256, sha256d},
     sig::verify_ecdsa_with_policy,
-    sighash::sighash_legacy_with_u32,
+    sighash::{sighash_legacy_with_u32, sighash_segwit_v0_with_u32},
 };
 use thiserror::Error;
 
@@ -63,6 +63,12 @@ pub enum ScriptError {
 }
 
 type Stack = Vec<Vec<u8>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SigVersion {
+    Base,
+    WitnessV0,
+}
 
 /// Execution flags
 #[derive(Debug, Clone, Copy, Default)]
@@ -202,8 +208,9 @@ impl ScriptEngine {
         stack: &mut Stack,
         tx: &Transaction,
         input_index: usize,
-        _amount: u64,
+        amount: u64,
         script_code: &Script,
+        sig_version: SigVersion,
     ) -> Result<(), ScriptError> {
         let bytes = script.as_bytes();
         let mut pc = 0usize;
@@ -604,9 +611,14 @@ impl ScriptEngine {
                     } else {
                         script_code.clone()
                     };
-                    sc = find_and_delete_script_sig(&sc, &sig);
-
-                    let hash = sighash_legacy_with_u32(tx, input_index, &sc, sighash_u32);
+                    if sig_version == SigVersion::Base {
+                        sc = find_and_delete_script_sig(&sc, &sig);
+                    }
+                    let hash = if sig_version == SigVersion::WitnessV0 {
+                        sighash_segwit_v0_with_u32(tx, input_index, &sc, amount, sighash_u32)
+                    } else {
+                        sighash_legacy_with_u32(tx, input_index, &sc, sighash_u32)
+                    };
                     let ok = if sig.is_empty() {
                         false
                     } else {
@@ -656,8 +668,10 @@ impl ScriptEngine {
                     } else {
                         script_code.clone()
                     };
-                    for sig in &sigs {
-                        sc = find_and_delete_script_sig(&sc, sig);
+                    if sig_version == SigVersion::Base {
+                        for sig in &sigs {
+                            sc = find_and_delete_script_sig(&sc, sig);
+                        }
                     }
 
                     let mut sig_idx = 0;
@@ -670,7 +684,11 @@ impl ScriptEngine {
                             (&[], None)
                         } else {
                             let sighash_u32 = *sig.last().unwrap() as u32;
-                            let h = sighash_legacy_with_u32(tx, input_index, &sc, sighash_u32);
+                            let h = if sig_version == SigVersion::WitnessV0 {
+                                sighash_segwit_v0_with_u32(tx, input_index, &sc, amount, sighash_u32)
+                            } else {
+                                sighash_legacy_with_u32(tx, input_index, &sc, sighash_u32)
+                            };
                             (&sig[..sig.len() - 1], Some(h.0))
                         };
 
@@ -843,7 +861,7 @@ mod tests {
         let tx = minimal_tx();
         let script = Script::from_bytes(vec![0x00, 0x51]);
         let mut stack = vec![];
-        engine.execute(&script, &mut stack, &tx, 0, 0, &script).unwrap();
+        engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base).unwrap();
         assert_eq!(stack.len(), 2);
     }
 
@@ -853,7 +871,7 @@ mod tests {
         let tx = minimal_tx();
         let script = Script::from_bytes(vec![0x6a]);
         let mut stack = vec![];
-        let r = engine.execute(&script, &mut stack, &tx, 0, 0, &script);
+        let r = engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base);
         assert!(r.is_err());
         assert!(matches!(r.unwrap_err(), ScriptError::OpReturn));
     }
@@ -864,7 +882,7 @@ mod tests {
         let tx = minimal_tx();
         let script = Script::from_bytes(vec![0x75]);
         let mut stack = vec![];
-        let r = engine.execute(&script, &mut stack, &tx, 0, 0, &script);
+        let r = engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base);
         assert!(r.is_err());
         assert!(matches!(r.unwrap_err(), ScriptError::StackUnderflow));
     }
@@ -875,7 +893,7 @@ mod tests {
         let tx = minimal_tx();
         let script = Script::from_bytes(vec![0x01, 0x01, 0x76, 0x87]);
         let mut stack = vec![];
-        engine.execute(&script, &mut stack, &tx, 0, 0, &script).unwrap();
+        engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base).unwrap();
         assert_eq!(stack.len(), 1);
         assert_eq!(stack[0], vec![1u8]);
     }
@@ -886,7 +904,7 @@ mod tests {
         let tx = minimal_tx();
         let script = Script::from_bytes(vec![0x01, 0x00, 0x01, 0x00, 0x7e]);
         let mut stack = vec![];
-        let r = engine.execute(&script, &mut stack, &tx, 0, 0, &script);
+        let r = engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base);
         assert!(r.is_err());
     }
 
@@ -896,7 +914,7 @@ mod tests {
         let tx = minimal_tx();
         let script = Script::from_bytes(vec![0x62]);
         let mut stack = vec![];
-        let r = engine.execute(&script, &mut stack, &tx, 0, 0, &script);
+        let r = engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base);
         assert!(r.is_err());
         assert!(matches!(r.unwrap_err(), ScriptError::InvalidOpcode));
     }
@@ -907,7 +925,7 @@ mod tests {
         let tx = minimal_tx();
         let script = Script::from_bytes(vec![0x63]);
         let mut stack = vec![vec![1]];
-        let r = engine.execute(&script, &mut stack, &tx, 0, 0, &script);
+        let r = engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base);
         assert!(r.is_err());
         assert!(matches!(r.unwrap_err(), ScriptError::UnbalancedIf));
     }
@@ -918,7 +936,7 @@ mod tests {
         let tx = minimal_tx();
         let script = Script::from_bytes(vec![0x00, 0x69]);
         let mut stack = vec![];
-        let r = engine.execute(&script, &mut stack, &tx, 0, 0, &script);
+        let r = engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base);
         assert!(r.is_err());
     }
 
@@ -928,7 +946,7 @@ mod tests {
         let tx = minimal_tx();
         let script = Script::from_bytes(vec![0x51, 0x63, 0x51, 0x67, 0x00, 0x68]);
         let mut stack = vec![];
-        engine.execute(&script, &mut stack, &tx, 0, 0, &script).unwrap();
+        engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base).unwrap();
         assert_eq!(stack.len(), 1);
     }
 
@@ -938,7 +956,7 @@ mod tests {
         let tx = minimal_tx();
         let script = Script::from_bytes(vec![0x01, 0x61, 0xa9]);
         let mut stack = vec![];
-        engine.execute(&script, &mut stack, &tx, 0, 0, &script).unwrap();
+        engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base).unwrap();
         assert_eq!(stack.len(), 1);
         assert_eq!(stack[0].len(), 20);
     }
@@ -949,7 +967,7 @@ mod tests {
         let tx = minimal_tx();
         let script = Script::from_bytes(vec![0x01, 0x61, 0xa7]);
         let mut stack = vec![];
-        engine.execute(&script, &mut stack, &tx, 0, 0, &script).unwrap();
+        engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base).unwrap();
         assert_eq!(stack.len(), 1);
         assert_eq!(stack[0].len(), 20);
     }
@@ -960,7 +978,7 @@ mod tests {
         let tx = minimal_tx();
         let script = Script::from_bytes(vec![0xba]);
         let mut stack = vec![];
-        let r = engine.execute(&script, &mut stack, &tx, 0, 0, &script);
+        let r = engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base);
         assert!(r.is_err());
         assert!(matches!(r.unwrap_err(), ScriptError::InvalidOpcode));
     }
@@ -971,7 +989,7 @@ mod tests {
         let tx = minimal_tx();
         let script = Script::from_bytes(vec![0x05, 0x00, 0x00]);
         let mut stack = vec![];
-        let r = engine.execute(&script, &mut stack, &tx, 0, 0, &script);
+        let r = engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base);
         assert!(r.is_err());
     }
 
@@ -985,7 +1003,7 @@ mod tests {
         script.push(0xac);
         let script = Script::from_bytes(script);
         let mut stack = vec![];
-        engine.execute(&script, &mut stack, &tx, 0, 0, &script).unwrap();
+        engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base).unwrap();
         assert_eq!(stack.len(), 1);
         assert!(stack[0].is_empty());
     }

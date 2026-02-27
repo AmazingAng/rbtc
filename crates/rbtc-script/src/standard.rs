@@ -9,7 +9,7 @@ use rbtc_crypto::{
     sighash::{sighash_segwit_v0_with_u32, sighash_taproot, SighashType},
 };
 
-use crate::engine::{ScriptEngine, ScriptError, ScriptFlags};
+use crate::engine::{ScriptEngine, ScriptError, ScriptFlags, SigVersion};
 
 /// Context for script verification
 pub struct ScriptContext<'a> {
@@ -50,6 +50,7 @@ pub fn verify_input(ctx: &ScriptContext<'_>) -> Result<(), ScriptError> {
                 ctx.input_index,
                 ctx.prevout.value,
                 &input.script_sig,
+                SigVersion::Base,
             )?;
             engine.execute(
                 script_pubkey,
@@ -58,6 +59,7 @@ pub fn verify_input(ctx: &ScriptContext<'_>) -> Result<(), ScriptError> {
                 ctx.input_index,
                 ctx.prevout.value,
                 script_pubkey,
+                SigVersion::Base,
             )?;
             check_stack_true(&stack)?;
             if ctx.flags.verify_cleanstack && stack.len() != 1 {
@@ -74,6 +76,7 @@ pub fn verify_input(ctx: &ScriptContext<'_>) -> Result<(), ScriptError> {
             ctx.input_index,
             ctx.prevout.value,
             &input.script_sig,
+            SigVersion::Base,
         )?;
         engine.execute(
             script_pubkey,
@@ -82,6 +85,7 @@ pub fn verify_input(ctx: &ScriptContext<'_>) -> Result<(), ScriptError> {
             ctx.input_index,
             ctx.prevout.value,
             script_pubkey,
+            SigVersion::Base,
         )?;
         check_stack_true(&stack)?;
         if ctx.flags.verify_cleanstack && stack.len() != 1 {
@@ -214,6 +218,7 @@ fn verify_p2wsh(ctx: &ScriptContext<'_>, script_hash: &[u8; 32]) -> Result<(), S
         ctx.input_index,
         ctx.prevout.value,
         &witness_script,
+        SigVersion::WitnessV0,
     )?;
 
     check_stack_true(&stack)?;
@@ -478,6 +483,7 @@ fn verify_p2sh(
         ctx.input_index,
         ctx.prevout.value,
         &input.script_sig,
+        SigVersion::Base,
     )?;
 
     // Verify the redeem script hash
@@ -509,6 +515,7 @@ fn verify_p2sh(
         ctx.input_index,
         ctx.prevout.value,
         &redeem_script,
+        SigVersion::Base,
     )?;
 
     check_stack_true(&stack)?;
@@ -996,6 +1003,34 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn verify_input_p2sh_p2wsh_multisig_mainnet_481831() {
+        // Real mainnet case from block 481831 that must pass under SegWit v0 rules.
+        let spend_hex = "020000000001019bbf31fbb9a42002e74df46681d3640d38a226e6e6fbd952c52b39536b37b796000000002322002072ea6fe4c9b3300191453285354759756372db15b2810502adfda44dba6712ebffffffff01f07e0e00000000001976a9148387657820562980220f07eab2f69ba2a5fb9f0788ac040047304402204ca5c77afba63786071312608ba751ffa56dfdc9e0abdcdbfe3cddacddae9baf0220225ec69ce8e65e95a052a7a48d17a89085b095a601e29dd3a2ce960f40a222d1014830450221008d94de6d3477cbbb7086e566aae224287dd4c7d773f9c0f24f63eed257041837022011df8307187f70ff74a1650fe9057ca06d6ab2928dc4d1c66643c5890fa88f1101475221027d37fabfdae7f06bd97cc0c635b1f24d7607c98bf9baf8d09dcfa5722e81772821039edd051cf2d2a1e06efb7ada59f447f3ab04825eed43b9f248fc569681fc25ec52ae00000000";
+        let spend = Transaction::decode(&mut Cursor::new(decode_hex(spend_hex))).expect("decode spend");
+        let prevout = TxOut {
+            value: 1_000_000,
+            script_pubkey: Script::from_bytes(decode_hex("a9144775f70c3d367dd339b920da8ad41b6cef7bf59487")),
+        };
+        let ctx = ScriptContext {
+            tx: &spend,
+            input_index: 0,
+            prevout: &prevout,
+            flags: ScriptFlags {
+                verify_p2sh: true,
+                verify_dersig: true,
+                verify_witness: true,
+                verify_nulldummy: true,
+                verify_cleanstack: false,
+                verify_checklocktimeverify: true,
+                verify_checksequenceverify: true,
+                verify_taproot: false,
+            },
+            all_prevouts: &[prevout.clone()],
+        };
+        assert!(verify_input(&ctx).is_ok());
     }
 
     #[test]
