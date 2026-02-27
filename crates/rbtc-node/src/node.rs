@@ -1,4 +1,4 @@
-use std::{collections::{HashMap, HashSet}, net::IpAddr, sync::Arc, time::Duration};
+use std::{collections::{HashMap, HashSet, VecDeque}, net::IpAddr, sync::Arc, time::{Duration, Instant}};
 
 use anyhow::{Context, Result};
 use tokio::sync::{mpsc, RwLock};
@@ -33,6 +33,21 @@ use crate::{
 
 /// Peer ID used when a block is submitted locally (via RPC).
 const LOCAL_PEER_ID: u64 = 0;
+const INDEX_BATCH_SIZE: usize = 64;
+const INDEX_QUEUE_FILL_CHUNK: u32 = 512;
+const UTXO_EVICT_INTERVAL_BLOCKS: u32 = 16;
+
+#[derive(Clone, Copy)]
+struct IndexTask {
+    height: u32,
+    block_hash: Hash256,
+}
+
+struct IndexBatchOutcome {
+    processed: usize,
+    last_indexed_height: Option<u32>,
+    retry_tasks: Vec<IndexTask>,
+}
 
 struct ChainMtpProvider<'a> {
     chain: &'a ChainState,
@@ -81,6 +96,16 @@ pub struct Node {
     /// Peers that have been asked to disconnect but haven't emitted
     /// `PeerDisconnected` yet. Excluded from new IBD assignments.
     disconnecting_peers: HashSet<u64>,
+    /// Deferred index tasks processed by a background worker.
+    index_queue: VecDeque<IndexTask>,
+    /// Catch-up replay range for deferred indexing after IBD completes.
+    index_catchup_next_height: Option<u32>,
+    index_catchup_target_height: u32,
+    index_catchup_initialized: bool,
+    /// JoinHandle for currently-running background index write task.
+    index_worker: Option<tokio::task::JoinHandle<anyhow::Result<IndexBatchOutcome>>>,
+    /// Throttle hot-cache eviction; evicting every block is expensive at high heights.
+    blocks_since_utxo_evict: u32,
 }
 
 impl Node {
@@ -178,6 +203,12 @@ impl Node {
             pending_blocks: HashMap::new(),
             last_peer_persist: std::time::Instant::now(),
             disconnecting_peers: HashSet::new(),
+            index_queue: VecDeque::new(),
+            index_catchup_next_height: None,
+            index_catchup_target_height: 0,
+            index_catchup_initialized: false,
+            index_worker: None,
+            blocks_since_utxo_evict: 0,
         })
     }
 
@@ -252,6 +283,8 @@ impl Node {
         let mut persist_timer = tokio::time::interval(Duration::from_secs(5 * 60));
         // Retry DNS seeds if we have no peers (e.g. after all connections drop).
         let mut seed_retry_timer = tokio::time::interval(Duration::from_secs(10));
+        // Background index writer ticker.
+        let mut index_timer = tokio::time::interval(Duration::from_millis(500));
         seed_retry_timer.tick().await; // consume the immediate first tick
 
         loop {
@@ -276,8 +309,141 @@ impl Node {
                         self.peer_manager.connect_to_seeds().await;
                     }
                 }
+
+                _ = index_timer.tick() => {
+                    self.tick_index_worker().await;
+                }
             }
         }
+    }
+
+    fn should_defer_indexes(&self) -> bool {
+        self.ibd.phase != IbdPhase::Complete
+    }
+
+    async fn prepare_index_catchup_if_needed(&mut self) {
+        if self.ibd.phase != IbdPhase::Complete || self.index_catchup_initialized {
+            return;
+        }
+        let chain_height = self.chain.read().await.height();
+        let indexed_height = ChainStore::new(&self.db)
+            .get_indexed_height()
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+        if indexed_height >= chain_height {
+            self.index_catchup_initialized = true;
+            return;
+        }
+        self.index_catchup_next_height = Some(indexed_height.saturating_add(1));
+        self.index_catchup_target_height = chain_height;
+        self.index_catchup_initialized = true;
+        info!(
+            "index catch-up scheduled: heights {}..={}",
+            indexed_height.saturating_add(1),
+            chain_height
+        );
+    }
+
+    async fn fill_index_queue_from_catchup(&mut self) {
+        let Some(mut next_height) = self.index_catchup_next_height else {
+            return;
+        };
+        if next_height > self.index_catchup_target_height {
+            self.index_catchup_next_height = None;
+            return;
+        }
+
+        let end = next_height
+            .saturating_add(INDEX_QUEUE_FILL_CHUNK)
+            .saturating_sub(1)
+            .min(self.index_catchup_target_height);
+        let chain = self.chain.read().await;
+        while next_height <= end {
+            if let Some(hash) = chain.get_ancestor_hash(next_height) {
+                self.index_queue.push_back(IndexTask {
+                    height: next_height,
+                    block_hash: hash,
+                });
+            }
+            next_height = next_height.saturating_add(1);
+        }
+        drop(chain);
+        self.index_catchup_next_height = if next_height > self.index_catchup_target_height {
+            None
+        } else {
+            Some(next_height)
+        };
+    }
+
+    fn enqueue_index_task(&mut self, height: u32, block_hash: Hash256) {
+        self.index_queue.push_back(IndexTask { height, block_hash });
+    }
+
+    async fn tick_index_worker(&mut self) {
+        self.prepare_index_catchup_if_needed().await;
+        if self.index_queue.len() < INDEX_BATCH_SIZE {
+            self.fill_index_queue_from_catchup().await;
+        }
+        self.poll_index_worker().await;
+        self.spawn_index_worker_if_idle();
+    }
+
+    async fn poll_index_worker(&mut self) {
+        let finished = self
+            .index_worker
+            .as_ref()
+            .map(|h| h.is_finished())
+            .unwrap_or(false);
+        if !finished {
+            return;
+        }
+        let handle = self.index_worker.take().expect("index_worker exists");
+        match handle.await {
+            Ok(Ok(outcome)) => {
+                if let Some(last) = outcome.last_indexed_height {
+                    debug!(
+                        "index worker: processed={} last_height={} queue_remaining={}",
+                        outcome.processed,
+                        last,
+                        self.index_queue.len()
+                    );
+                }
+                if !outcome.retry_tasks.is_empty() {
+                    warn!(
+                        "index worker paused; re-queueing {} task(s)",
+                        outcome.retry_tasks.len()
+                    );
+                    for task in outcome.retry_tasks.into_iter().rev() {
+                        self.index_queue.push_front(task);
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                warn!("index worker failed: {e}");
+            }
+            Err(e) => {
+                warn!("index worker join error: {e}");
+            }
+        }
+    }
+
+    fn spawn_index_worker_if_idle(&mut self) {
+        if self.should_defer_indexes() || self.index_worker.is_some() || self.index_queue.is_empty() {
+            return;
+        }
+        let mut tasks = Vec::new();
+        while tasks.len() < INDEX_BATCH_SIZE {
+            let Some(task) = self.index_queue.pop_front() else {
+                break;
+            };
+            tasks.push(task);
+        }
+        if tasks.is_empty() {
+            return;
+        }
+        let db = Arc::clone(&self.db);
+        self.index_worker = Some(tokio::task::spawn_blocking(move || write_index_batch(db, tasks)));
     }
 
     async fn process_pending_events(&mut self) {
@@ -1088,12 +1254,14 @@ impl Node {
         block: rbtc_primitives::block::Block,
         height: u32,
     ) -> Result<()> {
+        let connect_started = Instant::now();
         let network_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as u32;
 
         // Core-style: query MTP from block index on demand during verification.
+        let verify_started = Instant::now();
         let validation_result = {
             let chain = self.chain.read().await;
             let expected_bits = chain.next_required_bits();
@@ -1114,6 +1282,7 @@ impl Node {
             };
             verify_block(&ctx, &self.utxo_cache)
         };
+        let verify_elapsed = verify_started.elapsed();
 
         match validation_result {
             Ok(fees) => {
@@ -1190,8 +1359,8 @@ impl Node {
                 self.utxo_cache.connect_block(&txids, &block.transactions, height);
 
                 // Persist everything to RocksDB in one atomic WriteBatch:
-                // block metadata, UTXO changes (via cache flush), tx_index,
-                // addr_index, and chain tip.
+                // block metadata, UTXO changes (via cache flush), and chain tip.
+                let write_started = Instant::now();
                 {
                     let chainwork = self.chain.read().await.block_index[&block_hash].chainwork;
 
@@ -1216,28 +1385,30 @@ impl Node {
                     // Write dirty UTXO changes and promote them to the hot cache.
                     self.utxo_cache.flush_dirty(&mut batch);
 
-                    let tx_idx = TxIndexStore::new(&self.db);
-                    let addr_idx = AddrIndexStore::new(&self.db);
-                    for (offset, (tx, txid)) in block.transactions.iter().zip(txids.iter()).enumerate() {
-                        tx_idx.batch_put(&mut batch, txid, &block_hash, offset as u32).ok();
-                        for output in &tx.outputs {
-                            addr_idx.batch_put(
-                                &mut batch,
-                                &output.script_pubkey.0,
-                                height,
-                                offset as u32,
-                                txid,
-                            ).ok();
-                        }
-                    }
-
                     let chain_store = ChainStore::new(&self.db);
                     chain_store.update_tip_batch(&mut batch, &block_hash, height, chainwork).ok();
 
                     self.db.write_batch(batch).ok();
 
-                    // Evict cold entries from the hot cache if over the size limit.
-                    self.utxo_cache.evict_cold();
+                    // Evicting every block can be expensive at high heights; throttle it.
+                    self.blocks_since_utxo_evict = self.blocks_since_utxo_evict.saturating_add(1);
+                    if self.blocks_since_utxo_evict >= UTXO_EVICT_INTERVAL_BLOCKS {
+                        self.utxo_cache.evict_cold();
+                        self.blocks_since_utxo_evict = 0;
+                    }
+                }
+                let write_elapsed = write_started.elapsed();
+
+                // Index writes are deferred during IBD and handled asynchronously once synced.
+                if self.should_defer_indexes() {
+                    debug!(
+                        "index defer: height={} hash={} (IBD phase={:?})",
+                        height,
+                        block_hash.to_hex(),
+                        self.ibd.phase
+                    );
+                } else {
+                    self.enqueue_index_task(height, block_hash);
                 }
 
                 // Remove confirmed transactions from the mempool
@@ -1263,6 +1434,13 @@ impl Node {
 
                 // Prune old block data if requested
                 self.maybe_prune(height).await;
+                debug!(
+                    "connect timing: height={} verify_ms={} write_ms={} total_ms={}",
+                    height,
+                    verify_elapsed.as_millis(),
+                    write_elapsed.as_millis(),
+                    connect_started.elapsed().as_millis()
+                );
             }
             Err(e) => {
                 warn!("block {} rejected from peer {peer_id}: {e}", block_hash.to_hex());
@@ -1729,6 +1907,70 @@ fn load_wallet(args: &Args, db: Arc<Database>) -> Option<Arc<RwLock<Wallet>>> {
 }
 
 // ── Chain rebuild from persistent storage ────────────────────────────────────
+
+fn write_index_batch(
+    db: Arc<Database>,
+    tasks: Vec<IndexTask>,
+) -> anyhow::Result<IndexBatchOutcome> {
+    if tasks.is_empty() {
+        return Ok(IndexBatchOutcome {
+            processed: 0,
+            last_indexed_height: None,
+            retry_tasks: Vec::new(),
+        });
+    }
+
+    let block_store = BlockStore::new(&db);
+    let tx_idx = TxIndexStore::new(&db);
+    let addr_idx = AddrIndexStore::new(&db);
+    let chain_store = ChainStore::new(&db);
+    let mut batch = db.new_batch();
+    let mut processed = 0usize;
+    let mut last_indexed_height = None;
+    let mut retry_tasks: Vec<IndexTask> = Vec::new();
+
+    for (idx, task) in tasks.iter().enumerate() {
+        let Some(block) = block_store.get_block(&task.block_hash).ok().flatten() else {
+            retry_tasks.extend_from_slice(&tasks[idx..]);
+            break;
+        };
+        let txids: Vec<_> = block
+            .transactions
+            .iter()
+            .map(|tx| {
+                let mut buf = Vec::new();
+                tx.encode_legacy(&mut buf).ok();
+                sha256d(&buf)
+            })
+            .collect();
+        for (offset, (tx, txid)) in block.transactions.iter().zip(txids.iter()).enumerate() {
+            tx_idx.batch_put(&mut batch, txid, &task.block_hash, offset as u32).ok();
+            for output in &tx.outputs {
+                addr_idx.batch_put(
+                    &mut batch,
+                    &output.script_pubkey.0,
+                    task.height,
+                    offset as u32,
+                    txid,
+                )
+                .ok();
+            }
+        }
+        last_indexed_height = Some(task.height);
+        processed += 1;
+    }
+
+    if let Some(h) = last_indexed_height {
+        chain_store.update_indexed_height_batch(&mut batch, h).ok();
+    }
+    db.write_batch(batch).ok();
+
+    Ok(IndexBatchOutcome {
+        processed,
+        last_indexed_height,
+        retry_tasks,
+    })
+}
 
 fn load_chain_state(chain: &mut ChainState, db: &Database) -> Result<()> {
     let block_store = BlockStore::new(db);

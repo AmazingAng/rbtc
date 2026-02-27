@@ -10,6 +10,7 @@ const KEY_BEST_BLOCK: &[u8] = b"best_block";
 const KEY_BEST_HEIGHT: &[u8] = b"best_height";
 const KEY_CHAINWORK: &[u8] = b"chainwork";
 const KEY_NETWORK: &[u8] = b"network";
+const KEY_INDEXED_HEIGHT: &[u8] = b"indexed_height";
 
 /// Persists chain state metadata (tip, height, chainwork)
 pub struct ChainStore<'db> {
@@ -84,6 +85,31 @@ impl<'db> ChainStore<'db> {
 
     pub fn set_network_magic(&self, magic: &[u8; 4]) -> Result<()> {
         self.db.put_cf(CF_CHAIN_STATE, KEY_NETWORK, magic)
+    }
+
+    pub fn get_indexed_height(&self) -> Result<Option<u32>> {
+        match self.db.get_cf(CF_CHAIN_STATE, KEY_INDEXED_HEIGHT)? {
+            Some(bytes) => {
+                let h = u32::decode_from_slice(&bytes)
+                    .map_err(|e| StorageError::Decode(e.to_string()))?;
+                Ok(Some(h))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub fn set_indexed_height(&self, height: u32) -> Result<()> {
+        self.db
+            .put_cf(CF_CHAIN_STATE, KEY_INDEXED_HEIGHT, &height.encode_to_vec())
+    }
+
+    pub fn update_indexed_height_batch(
+        &self,
+        batch: &mut WriteBatch,
+        height: u32,
+    ) -> Result<()> {
+        self.db
+            .batch_put_cf(batch, CF_CHAIN_STATE, KEY_INDEXED_HEIGHT, &height.encode_to_vec())
     }
 
     /// Atomically update tip + height + chainwork (self-contained batch).
@@ -190,5 +216,15 @@ mod tests {
         let r = store.get_network_magic();
         assert!(r.is_err());
         assert!(r.unwrap_err().to_string().contains("invalid network magic"));
+    }
+
+    #[test]
+    fn chain_store_indexed_height_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        let store = ChainStore::new(&db);
+        assert_eq!(store.get_indexed_height().unwrap(), None);
+        store.set_indexed_height(42).unwrap();
+        assert_eq!(store.get_indexed_height().unwrap(), Some(42));
     }
 }
