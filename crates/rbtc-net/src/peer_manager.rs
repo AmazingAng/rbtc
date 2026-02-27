@@ -108,6 +108,9 @@ pub struct PeerManager {
     /// Channel for registering new peer cmd senders (outbound + inbound)
     cmd_reg_tx: mpsc::UnboundedSender<CmdRegistration>,
     cmd_reg_rx: mpsc::UnboundedReceiver<CmdRegistration>,
+    /// Reports outbound connect attempt failures so we can clear in-progress markers.
+    connect_fail_tx: mpsc::UnboundedSender<SocketAddr>,
+    connect_fail_rx: mpsc::UnboundedReceiver<SocketAddr>,
     event_tx: mpsc::UnboundedSender<PeerEvent>,
     event_rx: mpsc::UnboundedReceiver<PeerEvent>,
     node_event_tx: mpsc::UnboundedSender<NodeEvent>,
@@ -135,12 +138,15 @@ impl PeerManager {
     ) -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (cmd_reg_tx, cmd_reg_rx) = mpsc::unbounded_channel();
+        let (connect_fail_tx, connect_fail_rx) = mpsc::unbounded_channel();
         Self {
             config,
             peers: HashMap::new(),
             pending_cmd_txs: HashMap::new(),
             cmd_reg_tx,
             cmd_reg_rx,
+            connect_fail_tx,
+            connect_fail_rx,
             event_tx,
             event_rx,
             node_event_tx,
@@ -214,7 +220,7 @@ impl PeerManager {
     pub async fn connect(&mut self, addr: &str) {
         let Ok(socket_addr) = addr.parse::<SocketAddr>() else {
             // Try async DNS resolution later; for now skip malformed addresses
-            self.connect_raw(addr).await;
+            self.connect_raw(addr, None).await;
             return;
         };
         if self.connecting_addrs.contains(&socket_addr)
@@ -227,15 +233,16 @@ impl PeerManager {
             return;
         }
         self.connecting_addrs.insert(socket_addr);
-        self.connect_raw(addr).await;
+        self.connect_raw(addr, Some(socket_addr)).await;
     }
 
-    async fn connect_raw(&self, addr: &str) {
+    async fn connect_raw(&self, addr: &str, tracked_addr: Option<SocketAddr>) {
         let peer_id = NEXT_PEER_ID.fetch_add(1, Ordering::Relaxed);
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<PeerCommand>();
 
         let event_tx = self.event_tx.clone();
         let cmd_reg_tx = self.cmd_reg_tx.clone();
+        let connect_fail_tx = self.connect_fail_tx.clone();
         let config = self.config.clone();
         let best_height = self.best_height;
         let addr_str = addr.to_string();
@@ -246,6 +253,7 @@ impl PeerManager {
                 TcpStream::connect(&addr_str),
             )
             .await;
+            let success = matches!(&result, Ok(Ok(_)));
 
             match result {
                 Ok(Ok(stream)) => {
@@ -269,6 +277,12 @@ impl PeerManager {
                 }
                 Ok(Err(e)) => warn!("failed to connect to {addr_str}: {e}"),
                 Err(_) => warn!("connection timeout to {addr_str}"),
+            }
+
+            if !success {
+                if let Some(addr) = tracked_addr {
+                    let _ = connect_fail_tx.send(addr);
+                }
             }
         });
     }
@@ -412,6 +426,12 @@ impl PeerManager {
 
     /// Process all pending peer events (non-blocking, call from event loop)
     pub async fn process_events(&mut self) {
+        while let Ok(addr) = self.connect_fail_rx.try_recv() {
+            self.connecting_addrs.remove(&addr);
+            // Keep failed candidates retryable instead of losing them permanently.
+            self.add_candidate_addr(addr);
+        }
+
         // Drain command registrations first (must happen before Ready arrives)
         while let Ok((peer_id, addr, cmd_tx, inbound)) = self.cmd_reg_rx.try_recv() {
             self.pending_cmd_txs.insert(peer_id, (addr, cmd_tx, inbound));
@@ -491,11 +511,12 @@ impl PeerManager {
 
         // ── Connection manager: attempt to fill outbound slots ────────────────
         let now = std::time::Instant::now();
+        let in_progress_outbound = self.outbound_count + self.connecting_addrs.len();
         if now.duration_since(self.last_reconnect) >= Duration::from_secs(30)
-            && self.outbound_count < self.config.max_outbound
+            && in_progress_outbound < self.config.max_outbound
         {
             self.last_reconnect = now;
-            while self.outbound_count < self.config.max_outbound {
+            while self.outbound_count + self.connecting_addrs.len() < self.config.max_outbound {
                 let Some(candidate) = self.candidate_addrs.pop_front() else { break };
                 if self.connecting_addrs.contains(&candidate)
                     || self.connected_addrs.contains(&candidate)
@@ -506,9 +527,7 @@ impl PeerManager {
                 info!("conn-mgr: connecting to candidate {candidate}");
                 let addr_str = candidate.to_string();
                 self.connecting_addrs.insert(candidate);
-                self.connect_raw(&addr_str).await;
-                // Increment speculatively; will be corrected when Ready fires
-                self.outbound_count += 1;
+                self.connect_raw(&addr_str, Some(candidate)).await;
             }
         }
     }
