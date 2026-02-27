@@ -34,20 +34,13 @@ use crate::{
 /// Peer ID used when a block is submitted locally (via RPC).
 const LOCAL_PEER_ID: u64 = 0;
 
-struct MtpSnapshot {
-    times_by_height: Vec<u32>,
+struct ChainMtpProvider<'a> {
+    chain: &'a ChainState,
 }
 
-impl MedianTimeProvider for MtpSnapshot {
+impl MedianTimeProvider for ChainMtpProvider<'_> {
     fn median_time_past_at_height(&self, height: u32) -> u32 {
-        if self.times_by_height.is_empty() {
-            return 0;
-        }
-        let clamped = (height as usize).min(self.times_by_height.len() - 1);
-        let start = clamped.saturating_sub(10);
-        let mut times: Vec<u32> = self.times_by_height[start..=clamped].to_vec();
-        times.sort_unstable();
-        times[times.len() / 2]
+        self.chain.median_time_past(height)
     }
 }
 
@@ -1095,34 +1088,20 @@ impl Node {
         block: rbtc_primitives::block::Block,
         height: u32,
     ) -> Result<()> {
-        let (expected_bits, mtp, network, mtp_snapshot) = {
-            let chain = self.chain.read().await;
-            let expected_bits = chain.next_required_bits();
-            let mtp = chain.median_time_past(height.saturating_sub(1));
-            let network = chain.network;
-
-            // Snapshot per-height block times so MTP can be computed on demand
-            // during verification without holding the chain RwLock.
-            let mut times_by_height = Vec::with_capacity(chain.active_chain.len());
-            for hash in &chain.active_chain {
-                if let Some(index) = chain.block_index.get(hash) {
-                    times_by_height.push(index.header.time);
-                }
-            }
-
-            (expected_bits, mtp, network, MtpSnapshot { times_by_height })
-        };
-
         let network_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as u32;
 
-        let flags = script_flags_for_block(network, height, block_hash, block.header.time, mtp);
-
-        // Validate block using the UTXO cache (hot layer → RocksDB fallback).
-        // `utxo_cache` implements `UtxoLookup` so verify_block accepts it directly.
+        // Core-style: query MTP from block index on demand during verification.
         let validation_result = {
+            let chain = self.chain.read().await;
+            let expected_bits = chain.next_required_bits();
+            let mtp = chain.median_time_past(height.saturating_sub(1));
+            let network = chain.network;
+            let flags = script_flags_for_block(network, height, block_hash, block.header.time, mtp);
+            let mtp_provider = ChainMtpProvider { chain: &chain };
+
             let ctx = BlockValidationContext {
                 block: &block,
                 height,
@@ -1131,7 +1110,7 @@ impl Node {
                 expected_bits,
                 flags,
                 network,
-                mtp_provider: &mtp_snapshot,
+                mtp_provider: &mtp_provider,
             };
             verify_block(&ctx, &self.utxo_cache)
         };
