@@ -1,11 +1,13 @@
 use rbtc_primitives::{
     constants::{COIN, COINBASE_MATURITY, INITIAL_SUBSIDY, SUBSIDY_HALVING_INTERVAL},
     hash::Hash256,
-    transaction::Transaction,
+    transaction::{Transaction, TxOut},
     Network,
 };
 use rbtc_crypto::sha256d;
 use rbtc_script::{ScriptContext, ScriptFlags, verify_input};
+#[cfg(feature = "experimental-input-parallel")]
+use rayon::prelude::*;
 
 use crate::{error::ConsensusError, utxo::{Utxo, UtxoLookup}};
 
@@ -58,8 +60,6 @@ pub fn verify_transaction_with_lock_rules(
     mtp_provider: &dyn MedianTimeProvider,
     enforce_lock_rules: bool,
 ) -> Result<u64, ConsensusError> {
-    let txid = compute_txid(tx);
-
     if tx.inputs.is_empty() {
         return Err(ConsensusError::NoInputs);
     }
@@ -132,33 +132,85 @@ pub fn verify_transaction_with_lock_rules(
     let fee = input_sum - output_sum;
 
     // Script verification for each input
+    verify_transaction_scripts_with_prevouts(tx, &prevouts, flags)?;
+
+    Ok(fee)
+}
+
+pub fn verify_transaction_scripts_with_prevouts(
+    tx: &Transaction,
+    prevouts: &[TxOut],
+    flags: ScriptFlags,
+) -> Result<(), ConsensusError> {
+    let txid = compute_txid(tx);
     for (i, prevout) in prevouts.iter().enumerate() {
         let ctx = ScriptContext {
             tx,
             input_index: i,
             prevout,
             flags,
-            all_prevouts: &prevouts,
+            all_prevouts: prevouts,
         };
-        verify_input(&ctx).map_err(|e| {
-            let script_kind = classify_script(&prevout.script_pubkey);
-            let spk_preview = preview_script_bytes(prevout.script_pubkey.as_bytes(), 24);
-            ConsensusError::ScriptError(format!(
-                "txid={} vin={} prevout={}:{} kind={} spk_len={} spk={} flags=[{}]: {}",
-                txid.to_hex(),
-                i,
-                tx.inputs[i].previous_output.txid.to_hex(),
-                tx.inputs[i].previous_output.vout,
-                script_kind,
-                prevout.script_pubkey.len(),
-                spk_preview,
-                format_flags(flags),
-                e
-            ))
-        })?;
+        verify_input(&ctx).map_err(|e| script_error_for_input(tx, &txid, i, prevout, flags, &e.to_string()))?;
     }
+    Ok(())
+}
 
-    Ok(fee)
+pub fn verify_transaction_scripts_only(
+    tx: &Transaction,
+    utxos: &impl UtxoLookup,
+    flags: ScriptFlags,
+) -> Result<(), ConsensusError> {
+    let mut prevouts = Vec::with_capacity(tx.inputs.len());
+    for input in &tx.inputs {
+        let utxo = utxos.get_utxo(&input.previous_output).ok_or_else(|| {
+            ConsensusError::MissingUtxo(
+                input.previous_output.txid.to_hex(),
+                input.previous_output.vout,
+            )
+        })?;
+        prevouts.push(utxo.txout);
+    }
+    verify_transaction_scripts_with_prevouts(tx, &prevouts, flags)
+}
+
+#[cfg(feature = "experimental-input-parallel")]
+pub fn verify_transaction_scripts_parallel_inputs(
+    tx: &Transaction,
+    utxos: &impl UtxoLookup,
+    flags: ScriptFlags,
+) -> Result<(), ConsensusError> {
+    let mut prevouts = Vec::with_capacity(tx.inputs.len());
+    for input in &tx.inputs {
+        let utxo = utxos.get_utxo(&input.previous_output).ok_or_else(|| {
+            ConsensusError::MissingUtxo(
+                input.previous_output.txid.to_hex(),
+                input.previous_output.vout,
+            )
+        })?;
+        prevouts.push(utxo.txout);
+    }
+    let txid = compute_txid(tx);
+    let errors: Vec<ConsensusError> = prevouts
+        .par_iter()
+        .enumerate()
+        .filter_map(|(i, prevout)| {
+            let ctx = ScriptContext {
+                tx,
+                input_index: i,
+                prevout,
+                flags,
+                all_prevouts: &prevouts,
+            };
+            verify_input(&ctx)
+                .err()
+                .map(|e| script_error_for_input(tx, &txid, i, prevout, flags, &e.to_string()))
+        })
+        .collect();
+    if let Some(first) = errors.into_iter().next() {
+        return Err(first);
+    }
+    Ok(())
 }
 
 fn is_final_tx(tx: &Transaction, block_height: u32, lock_time_cutoff: u32) -> bool {
@@ -269,6 +321,30 @@ fn format_flags(flags: ScriptFlags) -> String {
         flags.verify_taproot,
         flags.verify_cleanstack
     )
+}
+
+fn script_error_for_input(
+    tx: &Transaction,
+    txid: &Hash256,
+    input_index: usize,
+    prevout: &TxOut,
+    flags: ScriptFlags,
+    err_msg: &str,
+) -> ConsensusError {
+    let script_kind = classify_script(&prevout.script_pubkey);
+    let spk_preview = preview_script_bytes(prevout.script_pubkey.as_bytes(), 24);
+    ConsensusError::ScriptError(format!(
+        "txid={} vin={} prevout={}:{} kind={} spk_len={} spk={} flags=[{}]: {}",
+        txid.to_hex(),
+        input_index,
+        tx.inputs[input_index].previous_output.txid.to_hex(),
+        tx.inputs[input_index].previous_output.vout,
+        script_kind,
+        prevout.script_pubkey.len(),
+        spk_preview,
+        format_flags(flags),
+        err_msg
+    ))
 }
 
 /// Verify a coinbase transaction structure

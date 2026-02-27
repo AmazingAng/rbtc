@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::Instant;
 use rbtc_primitives::{
     block::Block,
     codec::Encodable,
@@ -8,10 +9,18 @@ use rbtc_primitives::{
 };
 use rbtc_crypto::{merkle_root, sha256d};
 use rbtc_script::ScriptFlags;
+use rayon::prelude::*;
+use tracing::debug;
 
 use crate::{
     error::ConsensusError,
-    tx_verify::{block_subsidy, verify_coinbase, verify_transaction_with_lock_rules, MedianTimeProvider},
+    tx_verify::{
+        block_subsidy,
+        verify_coinbase,
+        verify_transaction_scripts_only,
+        verify_transaction_with_lock_rules,
+        MedianTimeProvider,
+    },
     utxo::{Utxo, UtxoLookup},
 };
 
@@ -60,6 +69,7 @@ pub fn verify_block(
     ctx: &BlockValidationContext<'_>,
     utxos: &impl UtxoLookup,
 ) -> Result<u64, ConsensusError> {
+    let verify_started = Instant::now();
     let block = ctx.block;
     let header = &block.header;
 
@@ -116,10 +126,48 @@ pub fn verify_block(
     // `BlockUtxoView` that layers newly-verified outputs on top of the
     // persistent UTXO set so that later transactions can see them.
     let non_coinbase = &block.transactions[1..];
+    let txids_by_index: Vec<Hash256> = block.transactions.iter().map(compute_txid).collect();
+    let non_coinbase_txids = &txids_by_index[1..];
+
+    // Stage A: conservative parallel precheck (script + base UTXO presence only).
+    // Skip txs that spend outputs from earlier txs in the same block, because those
+    // require the in-block layered view and are validated in Stage B.
+    let precheck_started = Instant::now();
+    let mut in_block_txid_pos: HashMap<Hash256, usize> = HashMap::new();
+    for (pos, txid) in non_coinbase_txids.iter().enumerate() {
+        in_block_txid_pos.insert(*txid, pos);
+    }
+    let precheck_candidates: Vec<&rbtc_primitives::transaction::Transaction> = non_coinbase
+        .iter()
+        .enumerate()
+        .filter_map(|(pos, tx)| {
+            let spends_earlier_in_block = tx.inputs.iter().any(|input| {
+                in_block_txid_pos
+                    .get(&input.previous_output.txid)
+                    .map(|earlier_pos| *earlier_pos < pos)
+                    .unwrap_or(false)
+            });
+            if spends_earlier_in_block {
+                None
+            } else {
+                Some(tx)
+            }
+        })
+        .collect();
+    let flags = ctx.flags;
+    if let Some(err) = precheck_candidates
+        .par_iter()
+        .filter_map(|tx| verify_transaction_scripts_only(tx, utxos, flags).err())
+        .find_any(|_| true)
+    {
+        return Err(err);
+    }
+    let precheck_elapsed = precheck_started.elapsed();
 
     let mut block_view = BlockUtxoView { in_block: HashMap::new(), base: utxos };
     let mut total_fees: u64 = 0;
     let mut non_coinbase_sigops: u64 = 0;
+    let serial_started = Instant::now();
 
     for tx in non_coinbase {
         let lock_time_cutoff = if ctx.flags.verify_checksequenceverify {
@@ -166,6 +214,16 @@ pub fn verify_block(
     if coinbase_out > max_allowed {
         return Err(ConsensusError::BadCoinbaseAmount(coinbase_out, max_allowed));
     }
+
+    let serial_elapsed = serial_started.elapsed();
+    debug!(
+        "verify timing: height={} txs={} script_precheck_ms={} script_serial_ms={} verify_total_ms={}",
+        ctx.height,
+        block.transactions.len(),
+        precheck_elapsed.as_millis(),
+        serial_elapsed.as_millis(),
+        verify_started.elapsed().as_millis()
+    );
 
     Ok(total_fees)
 }
@@ -881,5 +939,92 @@ mod tests {
         let h = header_with_bits(0);
         let buf = encode_block_header(&h);
         assert_eq!(buf.len(), 80);
+    }
+
+    #[test]
+    fn verify_block_handles_intra_block_dependency_with_parallel_precheck() {
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: Script::from_bytes(vec![1, 1]),
+                sequence: 0xffff_ffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            lock_time: 0,
+        };
+
+        let funding_txid = Hash256([0x11; 32]);
+        let tx1 = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: funding_txid, vout: 0 },
+                script_sig: Script::new(),
+                sequence: 0xffff_ffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value: 4_000,
+                script_pubkey: Script::from_bytes(vec![0x51]), // OP_TRUE
+            }],
+            lock_time: 0,
+        };
+        let tx1id = compute_txid(&tx1);
+        let tx2 = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: tx1id, vout: 0 },
+                script_sig: Script::new(),
+                sequence: 0xffff_ffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value: 3_000,
+                script_pubkey: Script::from_bytes(vec![0x51]), // OP_TRUE
+            }],
+            lock_time: 0,
+        };
+
+        let txids = vec![compute_txid(&coinbase), tx1id, compute_txid(&tx2)];
+        let merkle = rbtc_crypto::merkle_root(&txids).unwrap();
+        let mut h = header_with_bits(0x207fffff);
+        h.merkle_root = merkle;
+        for nonce in 0..=0x10000u32 {
+            h.nonce = nonce;
+            let enc = encode_block_header(&h);
+            let hash = sha256d(&enc);
+            if h.meets_target(&hash) {
+                break;
+            }
+        }
+        let block = Block {
+            header: h,
+            transactions: vec![coinbase, tx1, tx2],
+        };
+
+        let mut utxos = UtxoSet::new();
+        utxos.insert(
+            OutPoint { txid: funding_txid, vout: 0 },
+            Utxo {
+                txout: TxOut { value: 5_000, script_pubkey: Script::from_bytes(vec![0x51]) },
+                is_coinbase: false,
+                height: 0,
+            },
+        );
+
+        let ctx = BlockValidationContext {
+            block: &block,
+            height: 1,
+            median_time_past: 0,
+            network_time: 200000,
+            expected_bits: 0x207fffff,
+            flags: ScriptFlags::default(),
+            network: Network::Regtest,
+            mtp_provider: &TestMtpProvider,
+        };
+
+        let fees = verify_block(&ctx, &utxos).unwrap();
+        assert_eq!(fees, 2_000);
     }
 }
