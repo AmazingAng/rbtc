@@ -8,6 +8,83 @@ use sha2::{Digest, Sha256};
 
 use crate::digest::{sha256d, tagged_hash};
 
+fn strip_codeseparators(script: &Script) -> Script {
+    let bytes = script.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let op = bytes[i];
+        i += 1;
+        match op {
+            0x01..=0x4b => {
+                let len = op as usize;
+                out.push(op);
+                if i + len > bytes.len() {
+                    out.extend_from_slice(&bytes[i..]);
+                    break;
+                }
+                out.extend_from_slice(&bytes[i..i + len]);
+                i += len;
+            }
+            0x4c => {
+                out.push(op);
+                if i >= bytes.len() {
+                    break;
+                }
+                let len = bytes[i] as usize;
+                out.push(bytes[i]);
+                i += 1;
+                if i + len > bytes.len() {
+                    out.extend_from_slice(&bytes[i..]);
+                    break;
+                }
+                out.extend_from_slice(&bytes[i..i + len]);
+                i += len;
+            }
+            0x4d => {
+                out.push(op);
+                if i + 1 >= bytes.len() {
+                    out.extend_from_slice(&bytes[i..]);
+                    break;
+                }
+                let len = u16::from_le_bytes([bytes[i], bytes[i + 1]]) as usize;
+                out.push(bytes[i]);
+                out.push(bytes[i + 1]);
+                i += 2;
+                if i + len > bytes.len() {
+                    out.extend_from_slice(&bytes[i..]);
+                    break;
+                }
+                out.extend_from_slice(&bytes[i..i + len]);
+                i += len;
+            }
+            0x4e => {
+                out.push(op);
+                if i + 3 >= bytes.len() {
+                    out.extend_from_slice(&bytes[i..]);
+                    break;
+                }
+                let len = u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]) as usize;
+                out.push(bytes[i]);
+                out.push(bytes[i + 1]);
+                out.push(bytes[i + 2]);
+                out.push(bytes[i + 3]);
+                i += 4;
+                if i + len > bytes.len() {
+                    out.extend_from_slice(&bytes[i..]);
+                    break;
+                }
+                out.extend_from_slice(&bytes[i..i + len]);
+                i += len;
+            }
+            // Bitcoin Core legacy sighash serializes scriptCode with OP_CODESEPARATOR removed.
+            0xab => {}
+            _ => out.push(op),
+        }
+    }
+    Script::from_bytes(out)
+}
+
 /// Bitcoin sighash types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SighashType {
@@ -65,6 +142,7 @@ pub fn sighash_legacy_with_u32(
 ) -> Hash256 {
     let base = sighash_u32 & 0x1f;
     let anyone_can_pay = sighash_u32 & 0x80 != 0;
+    let cleaned_script_code = strip_codeseparators(script_code);
 
     // SIGHASH_SINGLE edge case: if input_index >= outputs.len(), return 1
     if base == 3 && input_index >= tx.outputs.len() {
@@ -93,7 +171,7 @@ pub fn sighash_legacy_with_u32(
 
         // Only the current input gets the script_code
         if i == input_index {
-            script_code.encode(&mut buf).unwrap();
+            cleaned_script_code.encode(&mut buf).unwrap();
         } else {
             Script::new().encode(&mut buf).unwrap(); // empty script
         }
@@ -415,6 +493,16 @@ mod tests {
         let tx = sample_tx();
         let h = sighash_legacy(&tx, 0, &Script::new(), SighashType::AllAnyoneCanPay);
         assert_eq!(h.0.len(), 32);
+    }
+
+    #[test]
+    fn sighash_legacy_ignores_codeseparator() {
+        let tx = sample_tx();
+        let with_sep = Script::from_bytes(vec![0x51, 0xab, 0x52, 0xab, 0x53, 0xac]);
+        let without_sep = Script::from_bytes(vec![0x51, 0x52, 0x53, 0xac]);
+        let h_with = sighash_legacy(&tx, 0, &with_sep, SighashType::All);
+        let h_without = sighash_legacy(&tx, 0, &without_sep, SighashType::All);
+        assert_eq!(h_with, h_without);
     }
 
     #[test]
