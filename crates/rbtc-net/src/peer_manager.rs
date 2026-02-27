@@ -515,6 +515,14 @@ impl PeerManager {
         if now.duration_since(self.last_reconnect) >= Duration::from_secs(30)
             && in_progress_outbound < self.config.max_outbound
         {
+            debug!(
+                "conn-mgr: refill tick outbound={} connecting={} connected={} candidates={} max_outbound={}",
+                self.outbound_count,
+                self.connecting_addrs.len(),
+                self.connected_addrs.len(),
+                self.candidate_addrs.len(),
+                self.config.max_outbound
+            );
             self.last_reconnect = now;
             while self.outbound_count + self.connecting_addrs.len() < self.config.max_outbound {
                 let Some(candidate) = self.candidate_addrs.pop_front() else { break };
