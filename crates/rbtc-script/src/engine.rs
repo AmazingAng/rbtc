@@ -66,6 +66,13 @@ pub enum ScriptError {
 
 type Stack = Vec<Vec<u8>>;
 
+#[derive(Clone, Copy)]
+pub struct TaprootExecutionData<'a> {
+    pub all_prevouts: &'a [TxOut],
+    pub leaf_hash: &'a [u8; 32],
+    pub annex: Option<&'a [u8]>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SigVersion {
     Base,
@@ -214,6 +221,7 @@ impl ScriptEngine {
         amount: u64,
         script_code: &Script,
         sig_version: SigVersion,
+        taproot_data: Option<TaprootExecutionData<'_>>,
     ) -> Result<(), ScriptError> {
         let bytes = script.as_bytes();
         let mut pc = 0usize;
@@ -221,11 +229,18 @@ impl ScriptEngine {
         let mut exec_stack: Vec<bool> = Vec::new(); // for OP_IF
         let mut op_count = 0usize;
         let mut codesep_pos: Option<usize> = None;
+        let mut taproot_codesep_pos: Option<u32> = None;
 
         while pc < bytes.len() {
             let executing = exec_stack.iter().all(|&b| b);
+            let op_pos = pc;
             let opcode_byte = bytes[pc];
             pc += 1;
+
+            // BIP342: OP_SUCCESSx in tapscript causes immediate success.
+            if sig_version == SigVersion::Taproot && is_op_successx(opcode_byte) {
+                return Ok(());
+            }
 
             // Handle data push opcodes (0x01–0x4b)
             let op = if opcode_byte >= 0x01 && opcode_byte <= 0x4b {
@@ -599,39 +614,65 @@ impl ScriptEngine {
                     stack.push(sha256d(&data).0.to_vec());
                 }
                 Opcode::OpCodeSeparator => {
-                    codesep_pos = Some(pc);
+                    if sig_version == SigVersion::Taproot {
+                        taproot_codesep_pos = Some(op_pos as u32);
+                    } else {
+                        // Legacy/v0 uses scriptCode truncated after last OP_CODESEPARATOR.
+                        codesep_pos = Some(pc);
+                    }
                 }
 
                 Opcode::OpCheckSig | Opcode::OpCheckSigVerify => {
                     let pubkey = pop(stack)?;
                     let sig = pop(stack)?;
+                    let ok = if sig_version == SigVersion::Taproot {
+                        if sig.is_empty() {
+                            false
+                        } else {
+                            let tap = taproot_data.ok_or_else(|| {
+                                ScriptError::Taproot("missing tapscript execution context".into())
+                            })?;
+                            let (sig_bytes, sighash_type) = parse_taproot_sig_and_hashtype(&sig)?;
+                            let hash = sighash_taproot(
+                                tx,
+                                input_index,
+                                tap.all_prevouts,
+                                sighash_type,
+                                Some(tap.leaf_hash),
+                                tap.annex,
+                                0,
+                                taproot_codesep_pos.unwrap_or(u32::MAX),
+                            );
+                            verify_schnorr(&pubkey, sig_bytes, &hash.0).is_ok()
+                        }
+                    } else {
+                        let sighash_byte = sig.last().copied().unwrap_or(1);
+                        let sighash_u32 = sighash_byte as u32;
 
-                    let sighash_byte = sig.last().copied().unwrap_or(1);
-                    let sighash_u32 = sighash_byte as u32;
-
-                    let mut sc = if let Some(pos) = codesep_pos {
-                        Script::from_bytes(script_code.as_bytes()[pos..].to_vec())
-                    } else {
-                        script_code.clone()
-                    };
-                    if sig_version == SigVersion::Base {
-                        sc = find_and_delete_script_sig(&sc, &sig);
-                    }
-                    let hash = if sig_version == SigVersion::WitnessV0 {
-                        sighash_segwit_v0_with_u32(tx, input_index, &sc, amount, sighash_u32)
-                    } else {
-                        sighash_legacy_with_u32(tx, input_index, &sc, sighash_u32)
-                    };
-                    let ok = if sig.is_empty() {
-                        false
-                    } else {
-                        verify_ecdsa_with_policy(
-                            &pubkey,
-                            &sig[..sig.len() - 1],
-                            &hash.0,
-                            self.flags.verify_dersig,
-                        )
-                        .is_ok()
+                        let mut sc = if let Some(pos) = codesep_pos {
+                            Script::from_bytes(script_code.as_bytes()[pos..].to_vec())
+                        } else {
+                            script_code.clone()
+                        };
+                        if sig_version == SigVersion::Base {
+                            sc = find_and_delete_script_sig(&sc, &sig);
+                        }
+                        let hash = if sig_version == SigVersion::WitnessV0 {
+                            sighash_segwit_v0_with_u32(tx, input_index, &sc, amount, sighash_u32)
+                        } else {
+                            sighash_legacy_with_u32(tx, input_index, &sc, sighash_u32)
+                        };
+                        if sig.is_empty() {
+                            false
+                        } else {
+                            verify_ecdsa_with_policy(
+                                &pubkey,
+                                &sig[..sig.len() - 1],
+                                &hash.0,
+                                self.flags.verify_dersig,
+                            )
+                            .is_ok()
+                        }
                     };
 
                     if op == Opcode::OpCheckSigVerify {
@@ -642,6 +683,9 @@ impl ScriptEngine {
                 }
 
                 Opcode::OpCheckMultiSig | Opcode::OpCheckMultiSigVerify => {
+                    if sig_version == SigVersion::Taproot {
+                        return Err(ScriptError::InvalidOpcode);
+                    }
                     let n_keys = decode_script_int(&pop(stack)?, 4)? as usize;
                     if n_keys > MAX_PUBKEYS_PER_MULTISIG {
                         return Err(ScriptError::MultisigPubkeyCount);
@@ -760,7 +804,39 @@ impl ScriptEngine {
                     }
                 }
                 // OP_CHECKSIGADD is tapscript-only (BIP342).
-                Opcode::OpCheckSigAdd => return Err(ScriptError::InvalidOpcode),
+                Opcode::OpCheckSigAdd => {
+                    if sig_version != SigVersion::Taproot {
+                        return Err(ScriptError::InvalidOpcode);
+                    }
+                    if stack.len() < 3 {
+                        return Err(ScriptError::StackUnderflow);
+                    }
+                    let pubkey = stack.pop().unwrap();
+                    let n_bytes = stack.pop().unwrap();
+                    let sig = stack.pop().unwrap();
+                    let n = decode_script_int(&n_bytes, 8)?;
+                    let tap = taproot_data.ok_or_else(|| {
+                        ScriptError::Taproot("missing tapscript execution context".into())
+                    })?;
+
+                    let ok = if sig.is_empty() {
+                        false
+                    } else {
+                        let (sig_bytes, sighash_type) = parse_taproot_sig_and_hashtype(&sig)?;
+                        let hash = sighash_taproot(
+                            tx,
+                            input_index,
+                            tap.all_prevouts,
+                            sighash_type,
+                            Some(tap.leaf_hash),
+                            tap.annex,
+                            0,
+                            taproot_codesep_pos.unwrap_or(u32::MAX),
+                        );
+                        verify_schnorr(&pubkey, sig_bytes, &hash.0).is_ok()
+                    };
+                    stack.push(encode_script_int(n + if ok { 1 } else { 0 }));
+                }
 
                 // ── Disabled ops ─────────────────────────────────────────
                 op if op.is_disabled() => return Err(ScriptError::DisabledOpcode),
@@ -798,114 +874,22 @@ impl ScriptEngine {
         leaf_hash: &[u8; 32],
         annex: Option<&[u8]>,
     ) -> Result<(), ScriptError> {
+        // Preserve BIP342 OP_SUCCESSx behavior: as soon as an OP_SUCCESSx opcode
+        // is encountered during parsing, script evaluation succeeds immediately.
         let bytes = script.as_bytes();
         let mut pc = 0usize;
-        let mut codesep_pos = u32::MAX;
-
         while pc < bytes.len() {
-            let op_pos = pc;
             let op = bytes[pc];
             pc += 1;
-
-            // BIP342: OP_SUCCESSx causes immediate successful validation.
             if is_op_successx(op) {
                 return Ok(());
             }
-
             match op {
-                // OP_CHECKSIGADD
-                0xba => {
-                    if stack.len() < 3 {
-                        return Err(ScriptError::StackUnderflow);
-                    }
-                    let pubkey = stack.pop().unwrap();
-                    let n_bytes = stack.pop().unwrap();
-                    let sig = stack.pop().unwrap();
-                    let n = decode_script_int(&n_bytes, 8)?;
-
-                    if sig.is_empty() {
-                        stack.push(encode_script_int(n));
-                        continue;
-                    }
-
-                    let (sig_bytes, sighash_type) = parse_taproot_sig_and_hashtype(&sig)?;
-                    let hash = sighash_taproot(
-                        tx,
-                        input_index,
-                        all_prevouts,
-                        sighash_type,
-                        Some(leaf_hash),
-                        annex,
-                        0,
-                        codesep_pos,
-                    );
-                    let ok = verify_schnorr(&pubkey, sig_bytes, &hash.0).is_ok();
-                    stack.push(encode_script_int(n + if ok { 1 } else { 0 }));
-                }
-                // OP_CHECKSIG
-                0xac => {
-                    if stack.len() < 2 {
-                        return Err(ScriptError::StackUnderflow);
-                    }
-                    let pubkey = stack.pop().unwrap();
-                    let sig = stack.pop().unwrap();
-
-                    if sig.is_empty() {
-                        stack.push(Vec::new());
-                        continue;
-                    }
-
-                    let (sig_bytes, sighash_type) = parse_taproot_sig_and_hashtype(&sig)?;
-                    let hash = sighash_taproot(
-                        tx,
-                        input_index,
-                        all_prevouts,
-                        sighash_type,
-                        Some(leaf_hash),
-                        annex,
-                        0,
-                        codesep_pos,
-                    );
-                    let ok = verify_schnorr(&pubkey, sig_bytes, &hash.0).is_ok();
-                    stack.push(if ok { vec![1u8] } else { Vec::new() });
-                }
-                // OP_CHECKSIGVERIFY
-                0xad => {
-                    if stack.len() < 2 {
-                        return Err(ScriptError::StackUnderflow);
-                    }
-                    let pubkey = stack.pop().unwrap();
-                    let sig = stack.pop().unwrap();
-                    let ok = if sig.is_empty() {
-                        false
-                    } else {
-                        let (sig_bytes, sighash_type) = parse_taproot_sig_and_hashtype(&sig)?;
-                        let hash = sighash_taproot(
-                            tx,
-                            input_index,
-                            all_prevouts,
-                            sighash_type,
-                            Some(leaf_hash),
-                            annex,
-                            0,
-                            codesep_pos,
-                        );
-                        verify_schnorr(&pubkey, sig_bytes, &hash.0).is_ok()
-                    };
-                    if !ok {
-                        return Err(ScriptError::SigCheckFailed);
-                    }
-                }
-                0xab => {
-                    codesep_pos = op_pos as u32;
-                }
-                // pushdata
                 0x01..=0x4b => {
                     let len = op as usize;
                     if pc + len > bytes.len() {
                         return Err(ScriptError::ScriptFailed("truncated pushdata".into()));
                     }
-                    stack.push(bytes[pc..pc + len].to_vec());
                     pc += len;
                 }
                 0x4c => {
@@ -917,24 +901,53 @@ impl ScriptEngine {
                     if pc + len > bytes.len() {
                         return Err(ScriptError::ScriptFailed("truncated pushdata1 body".into()));
                     }
-                    stack.push(bytes[pc..pc + len].to_vec());
                     pc += len;
                 }
-                0x00 => stack.push(Vec::new()),
-                0x61 => {}
-                0x69 => {
-                    let top = pop(stack)?;
-                    if !cast_to_bool(&top) {
-                        return Err(ScriptError::ScriptFailed("OP_VERIFY failed".into()));
+                0x4d => {
+                    if pc + 1 >= bytes.len() {
+                        return Err(ScriptError::ScriptFailed("truncated pushdata2".into()));
                     }
+                    let len = u16::from_le_bytes([bytes[pc], bytes[pc + 1]]) as usize;
+                    pc += 2;
+                    if pc + len > bytes.len() {
+                        return Err(ScriptError::ScriptFailed("truncated pushdata2 body".into()));
+                    }
+                    pc += len;
                 }
-                _ => return Err(ScriptError::InvalidOpcode),
-            }
-
-            if stack.len() > MAX_STACK_SIZE {
-                return Err(ScriptError::StackOverflow);
+                0x4e => {
+                    if pc + 3 >= bytes.len() {
+                        return Err(ScriptError::ScriptFailed("truncated pushdata4".into()));
+                    }
+                    let len = u32::from_le_bytes([
+                        bytes[pc],
+                        bytes[pc + 1],
+                        bytes[pc + 2],
+                        bytes[pc + 3],
+                    ]) as usize;
+                    pc += 4;
+                    if pc + len > bytes.len() {
+                        return Err(ScriptError::ScriptFailed("truncated pushdata4 body".into()));
+                    }
+                    pc += len;
+                }
+                _ => {}
             }
         }
+
+        self.execute(
+            script,
+            stack,
+            tx,
+            input_index,
+            all_prevouts[input_index].value,
+            script,
+            SigVersion::Taproot,
+            Some(TaprootExecutionData {
+                all_prevouts,
+                leaf_hash,
+                annex,
+            }),
+        )?;
 
         match stack.last() {
             None => Err(ScriptError::ScriptFailed("empty stack".into())),
@@ -1049,7 +1062,7 @@ mod tests {
         let tx = minimal_tx();
         let script = Script::from_bytes(vec![0x00, 0x51]);
         let mut stack = vec![];
-        engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base).unwrap();
+        engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base, None).unwrap();
         assert_eq!(stack.len(), 2);
     }
 
@@ -1059,7 +1072,7 @@ mod tests {
         let tx = minimal_tx();
         let script = Script::from_bytes(vec![0x6a]);
         let mut stack = vec![];
-        let r = engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base);
+        let r = engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base, None);
         assert!(r.is_err());
         assert!(matches!(r.unwrap_err(), ScriptError::OpReturn));
     }
@@ -1070,7 +1083,7 @@ mod tests {
         let tx = minimal_tx();
         let script = Script::from_bytes(vec![0x75]);
         let mut stack = vec![];
-        let r = engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base);
+        let r = engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base, None);
         assert!(r.is_err());
         assert!(matches!(r.unwrap_err(), ScriptError::StackUnderflow));
     }
@@ -1081,7 +1094,7 @@ mod tests {
         let tx = minimal_tx();
         let script = Script::from_bytes(vec![0x01, 0x01, 0x76, 0x87]);
         let mut stack = vec![];
-        engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base).unwrap();
+        engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base, None).unwrap();
         assert_eq!(stack.len(), 1);
         assert_eq!(stack[0], vec![1u8]);
     }
@@ -1092,7 +1105,7 @@ mod tests {
         let tx = minimal_tx();
         let script = Script::from_bytes(vec![0x01, 0x00, 0x01, 0x00, 0x7e]);
         let mut stack = vec![];
-        let r = engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base);
+        let r = engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base, None);
         assert!(r.is_err());
     }
 
@@ -1102,7 +1115,7 @@ mod tests {
         let tx = minimal_tx();
         let script = Script::from_bytes(vec![0x62]);
         let mut stack = vec![];
-        let r = engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base);
+        let r = engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base, None);
         assert!(r.is_err());
         assert!(matches!(r.unwrap_err(), ScriptError::InvalidOpcode));
     }
@@ -1113,7 +1126,7 @@ mod tests {
         let tx = minimal_tx();
         let script = Script::from_bytes(vec![0x63]);
         let mut stack = vec![vec![1]];
-        let r = engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base);
+        let r = engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base, None);
         assert!(r.is_err());
         assert!(matches!(r.unwrap_err(), ScriptError::UnbalancedIf));
     }
@@ -1124,7 +1137,7 @@ mod tests {
         let tx = minimal_tx();
         let script = Script::from_bytes(vec![0x00, 0x69]);
         let mut stack = vec![];
-        let r = engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base);
+        let r = engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base, None);
         assert!(r.is_err());
     }
 
@@ -1134,7 +1147,7 @@ mod tests {
         let tx = minimal_tx();
         let script = Script::from_bytes(vec![0x51, 0x63, 0x51, 0x67, 0x00, 0x68]);
         let mut stack = vec![];
-        engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base).unwrap();
+        engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base, None).unwrap();
         assert_eq!(stack.len(), 1);
     }
 
@@ -1144,7 +1157,7 @@ mod tests {
         let tx = minimal_tx();
         let script = Script::from_bytes(vec![0x01, 0x61, 0xa9]);
         let mut stack = vec![];
-        engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base).unwrap();
+        engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base, None).unwrap();
         assert_eq!(stack.len(), 1);
         assert_eq!(stack[0].len(), 20);
     }
@@ -1155,7 +1168,7 @@ mod tests {
         let tx = minimal_tx();
         let script = Script::from_bytes(vec![0x01, 0x61, 0xa7]);
         let mut stack = vec![];
-        engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base).unwrap();
+        engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base, None).unwrap();
         assert_eq!(stack.len(), 1);
         assert_eq!(stack[0].len(), 20);
     }
@@ -1166,7 +1179,7 @@ mod tests {
         let tx = minimal_tx();
         let script = Script::from_bytes(vec![0xba]);
         let mut stack = vec![];
-        let r = engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base);
+        let r = engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base, None);
         assert!(r.is_err());
         assert!(matches!(r.unwrap_err(), ScriptError::InvalidOpcode));
     }
@@ -1177,7 +1190,7 @@ mod tests {
         let tx = minimal_tx();
         let script = Script::from_bytes(vec![0x05, 0x00, 0x00]);
         let mut stack = vec![];
-        let r = engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base);
+        let r = engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base, None);
         assert!(r.is_err());
     }
 
@@ -1191,7 +1204,7 @@ mod tests {
         script.push(0xac);
         let script = Script::from_bytes(script);
         let mut stack = vec![];
-        engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base).unwrap();
+        engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base, None).unwrap();
         assert_eq!(stack.len(), 1);
         assert!(stack[0].is_empty());
     }

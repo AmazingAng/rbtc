@@ -51,6 +51,7 @@ pub fn verify_input(ctx: &ScriptContext<'_>) -> Result<(), ScriptError> {
                 ctx.prevout.value,
                 &input.script_sig,
                 SigVersion::Base,
+                None,
             )?;
             engine.execute(
                 script_pubkey,
@@ -60,6 +61,7 @@ pub fn verify_input(ctx: &ScriptContext<'_>) -> Result<(), ScriptError> {
                 ctx.prevout.value,
                 script_pubkey,
                 SigVersion::Base,
+                None,
             )?;
             check_stack_true(&stack)?;
             if ctx.flags.verify_cleanstack && stack.len() != 1 {
@@ -77,6 +79,7 @@ pub fn verify_input(ctx: &ScriptContext<'_>) -> Result<(), ScriptError> {
             ctx.prevout.value,
             &input.script_sig,
             SigVersion::Base,
+            None,
         )?;
         engine.execute(
             script_pubkey,
@@ -86,6 +89,7 @@ pub fn verify_input(ctx: &ScriptContext<'_>) -> Result<(), ScriptError> {
             ctx.prevout.value,
             script_pubkey,
             SigVersion::Base,
+            None,
         )?;
         check_stack_true(&stack)?;
         if ctx.flags.verify_cleanstack && stack.len() != 1 {
@@ -219,6 +223,7 @@ fn verify_p2wsh(ctx: &ScriptContext<'_>, script_hash: &[u8; 32]) -> Result<(), S
         ctx.prevout.value,
         &witness_script,
         SigVersion::WitnessV0,
+        None,
     )?;
 
     check_stack_true(&stack)?;
@@ -409,6 +414,7 @@ fn verify_p2sh(
         ctx.prevout.value,
         &input.script_sig,
         SigVersion::Base,
+        None,
     )?;
 
     // Verify the redeem script hash
@@ -441,6 +447,7 @@ fn verify_p2sh(
         ctx.prevout.value,
         &redeem_script,
         SigVersion::Base,
+        None,
     )?;
 
     check_stack_true(&stack)?;
