@@ -6,7 +6,7 @@ use rbtc_primitives::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::digest::{sha256d, tagged_hash};
+use crate::digest::{sha256, sha256d, tagged_hash};
 
 fn strip_codeseparators(script: &Script) -> Script {
     let bytes = script.as_bytes();
@@ -342,28 +342,32 @@ pub fn sighash_taproot(
         for input in &tx.inputs {
             input.previous_output.encode(&mut data).unwrap();
         }
-        buf.extend_from_slice(&sha256d(&data).0);
+        let h = sha256(&data);
+        buf.extend_from_slice(&h.0);
 
         // hash_amounts
         let mut data = Vec::new();
         for prevout in prevouts {
             prevout.value.encode(&mut data).unwrap();
         }
-        buf.extend_from_slice(&sha256d(&data).0);
+        let h = sha256(&data);
+        buf.extend_from_slice(&h.0);
 
         // hash_scriptpubkeys
         let mut data = Vec::new();
         for prevout in prevouts {
             prevout.script_pubkey.encode(&mut data).unwrap();
         }
-        buf.extend_from_slice(&sha256d(&data).0);
+        let h = sha256(&data);
+        buf.extend_from_slice(&h.0);
 
         // hash_sequences
         let mut data = Vec::new();
         for input in &tx.inputs {
             input.sequence.encode(&mut data).unwrap();
         }
-        buf.extend_from_slice(&sha256d(&data).0);
+        let h = sha256(&data);
+        buf.extend_from_slice(&h.0);
     }
 
     if base == 1 {
@@ -372,12 +376,14 @@ pub fn sighash_taproot(
         for output in &tx.outputs {
             output.encode(&mut data).unwrap();
         }
-        buf.extend_from_slice(&sha256d(&data).0);
+        let h = sha256(&data);
+        buf.extend_from_slice(&h.0);
     } else if base == 3 && input_index < tx.outputs.len() {
         // hash_outputs (SINGLE)
         let mut data = Vec::new();
         tx.outputs[input_index].encode(&mut data).unwrap();
-        buf.extend_from_slice(&sha256d(&data).0);
+        let h = sha256(&data);
+        buf.extend_from_slice(&h.0);
     }
 
     // spend_type
@@ -643,5 +649,88 @@ mod tests {
             42,
         );
         assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn sighash_taproot_uses_single_sha256_subhashes() {
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![
+                TxIn {
+                    previous_output: OutPoint { txid: Hash256([1; 32]), vout: 1 },
+                    script_sig: Script::new(),
+                    sequence: 0x11223344,
+                    witness: vec![],
+                },
+                TxIn {
+                    previous_output: OutPoint { txid: Hash256([2; 32]), vout: 2 },
+                    script_sig: Script::new(),
+                    sequence: 0x55667788,
+                    witness: vec![],
+                },
+            ],
+            outputs: vec![
+                TxOut { value: 111, script_pubkey: Script::from_bytes(vec![0x51]) },
+                TxOut { value: 222, script_pubkey: Script::from_bytes(vec![0x51, 0x51]) },
+            ],
+            lock_time: 3,
+        };
+        let prevouts = vec![
+            TxOut { value: 777, script_pubkey: Script::from_bytes(vec![0x51, 0x21]) },
+            TxOut { value: 888, script_pubkey: Script::from_bytes(vec![0x51, 0x22, 0x23]) },
+        ];
+
+        let got = sighash_taproot(
+            &tx,
+            1,
+            &prevouts,
+            SighashType::All,
+            None,
+            None,
+            0,
+            u32::MAX,
+        );
+
+        let mut msg = Vec::new();
+        msg.push(0u8); // epoch
+        msg.push(SighashType::All as u8);
+        tx.version.encode(&mut msg).unwrap();
+        tx.lock_time.encode(&mut msg).unwrap();
+
+        let mut prevouts_ser = Vec::new();
+        for input in &tx.inputs {
+            input.previous_output.encode(&mut prevouts_ser).unwrap();
+        }
+        msg.extend_from_slice(&sha256(&prevouts_ser).0);
+
+        let mut amounts_ser = Vec::new();
+        for prevout in &prevouts {
+            prevout.value.encode(&mut amounts_ser).unwrap();
+        }
+        msg.extend_from_slice(&sha256(&amounts_ser).0);
+
+        let mut spk_ser = Vec::new();
+        for prevout in &prevouts {
+            prevout.script_pubkey.encode(&mut spk_ser).unwrap();
+        }
+        msg.extend_from_slice(&sha256(&spk_ser).0);
+
+        let mut seq_ser = Vec::new();
+        for input in &tx.inputs {
+            input.sequence.encode(&mut seq_ser).unwrap();
+        }
+        msg.extend_from_slice(&sha256(&seq_ser).0);
+
+        let mut outputs_ser = Vec::new();
+        for output in &tx.outputs {
+            output.encode(&mut outputs_ser).unwrap();
+        }
+        msg.extend_from_slice(&sha256(&outputs_ser).0);
+
+        msg.push(0u8); // spend_type: key path, no annex
+        (1u32).encode(&mut msg).unwrap(); // input_index
+
+        let expected = tagged_hash(b"TapSighash", &msg);
+        assert_eq!(got, expected);
     }
 }
