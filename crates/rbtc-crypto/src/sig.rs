@@ -2,6 +2,9 @@ use secp256k1::{
     ecdsa::Signature as EcdsaSig, schnorr::Signature as SchnorrSig, Message, PublicKey,
     Secp256k1, XOnlyPublicKey,
 };
+use std::collections::{HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
+use std::sync::{Mutex, OnceLock};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -18,6 +21,75 @@ pub enum CryptoError {
     Secp256k1(#[from] secp256k1::Error),
 }
 
+const DEFAULT_SIG_CACHE_CAPACITY: usize = 100_000;
+
+struct SigCache {
+    entries: HashSet<u64>,
+    order: VecDeque<u64>,
+    capacity: usize,
+}
+
+impl SigCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: HashSet::with_capacity(capacity),
+            order: VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    fn contains(&self, key: u64) -> bool {
+        self.entries.contains(&key)
+    }
+
+    fn insert(&mut self, key: u64) {
+        if !self.entries.insert(key) {
+            return;
+        }
+        self.order.push_back(key);
+        if self.order.len() > self.capacity {
+            if let Some(old) = self.order.pop_front() {
+                self.entries.remove(&old);
+            }
+        }
+    }
+}
+
+static SIG_CACHE: OnceLock<Mutex<SigCache>> = OnceLock::new();
+
+fn sig_cache() -> &'static Mutex<SigCache> {
+    SIG_CACHE.get_or_init(|| Mutex::new(SigCache::new(DEFAULT_SIG_CACHE_CAPACITY)))
+}
+
+fn make_sig_cache_key(
+    algo_tag: u8,
+    strict_der: bool,
+    pubkey: &[u8],
+    sig: &[u8],
+    msg: &[u8; 32],
+) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    algo_tag.hash(&mut hasher);
+    strict_der.hash(&mut hasher);
+    pubkey.hash(&mut hasher);
+    sig.hash(&mut hasher);
+    msg.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn cache_contains(key: u64) -> bool {
+    match sig_cache().lock() {
+        Ok(cache) => cache.contains(key),
+        Err(_) => false,
+    }
+}
+
+fn cache_insert(key: u64) {
+    if let Ok(mut cache) = sig_cache().lock() {
+        cache.insert(key);
+    }
+}
+
 /// Verify an ECDSA signature.
 /// `pubkey` – 33-byte compressed or 65-byte uncompressed public key.
 /// `sig_der` – DER-encoded signature bytes (without sighash byte).
@@ -29,6 +101,11 @@ pub fn verify_ecdsa_with_policy(
     msg: &[u8; 32],
     strict_der: bool,
 ) -> Result<(), CryptoError> {
+    let cache_key = make_sig_cache_key(0, strict_der, pubkey, sig_der, msg);
+    if cache_contains(cache_key) {
+        return Ok(());
+    }
+
     let secp = Secp256k1::verification_only();
     let pk = PublicKey::from_slice(pubkey).map_err(|_| CryptoError::InvalidPublicKey)?;
 
@@ -44,7 +121,9 @@ pub fn verify_ecdsa_with_policy(
     let message = Message::from_digest(*msg);
 
     secp.verify_ecdsa(message, &sig, &pk)
-        .map_err(|_| CryptoError::VerificationFailed)
+        .map_err(|_| CryptoError::VerificationFailed)?;
+    cache_insert(cache_key);
+    Ok(())
 }
 
 /// Verify a strict-DER ECDSA signature (BIP66 behavior).
@@ -57,6 +136,11 @@ pub fn verify_ecdsa(pubkey: &[u8], sig_der: &[u8], msg: &[u8; 32]) -> Result<(),
 /// `sig`    – 64 bytes, or 65 bytes with sighash type appended.
 /// `msg`    – 32-byte tagged sighash.
 pub fn verify_schnorr(pubkey: &[u8], sig: &[u8], msg: &[u8; 32]) -> Result<(), CryptoError> {
+    let cache_key = make_sig_cache_key(1, true, pubkey, sig, msg);
+    if cache_contains(cache_key) {
+        return Ok(());
+    }
+
     if pubkey.len() != 32 {
         return Err(CryptoError::InvalidPublicKey);
     }
@@ -75,7 +159,9 @@ pub fn verify_schnorr(pubkey: &[u8], sig: &[u8], msg: &[u8; 32]) -> Result<(), C
     let schnorr_sig = SchnorrSig::from_byte_array(sig_arr);
 
     secp.verify_schnorr(&schnorr_sig, msg, &xonly)
-        .map_err(|_| CryptoError::VerificationFailed)
+        .map_err(|_| CryptoError::VerificationFailed)?;
+    cache_insert(cache_key);
+    Ok(())
 }
 
 #[cfg(test)]

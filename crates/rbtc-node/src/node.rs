@@ -1,11 +1,11 @@
 use std::{collections::{HashMap, HashSet, VecDeque}, net::IpAddr, sync::Arc, time::{Duration, Instant}};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
 use rbtc_consensus::{
-    block_verify::{verify_block, BlockValidationContext},
+    block_verify::{verify_block_with_options, BlockValidationContext},
     chain::{BlockIndex, BlockStatus, ChainState, header_hash},
     tx_verify::MedianTimeProvider,
     script_flags_for_block,
@@ -106,6 +106,10 @@ pub struct Node {
     index_worker: Option<tokio::task::JoinHandle<anyhow::Result<IndexBatchOutcome>>>,
     /// Throttle hot-cache eviction; evicting every block is expensive at high heights.
     blocks_since_utxo_evict: u32,
+    /// Optional assumevalid block hash (Core-style IBD scriptcheck fast path).
+    assumevalid_hash: Option<Hash256>,
+    /// Log guard to avoid spamming assumevalid activation message.
+    assumevalid_announced: bool,
 }
 
 impl Node {
@@ -186,6 +190,11 @@ impl Node {
             );
         }
 
+        let assumevalid_hash = match args.assumevalid.as_ref() {
+            Some(h) => Some(Hash256::from_hex(h).map_err(|_| anyhow!("invalid --assumevalid hash"))?),
+            None => None,
+        };
+
         Ok(Self {
             args,
             db,
@@ -209,6 +218,8 @@ impl Node {
             index_catchup_initialized: false,
             index_worker: None,
             blocks_since_utxo_evict: 0,
+            assumevalid_hash,
+            assumevalid_announced: false,
         })
     }
 
@@ -1262,6 +1273,7 @@ impl Node {
 
         // Core-style: query MTP from block index on demand during verification.
         let verify_started = Instant::now();
+        let assumevalid_skip_scripts;
         let validation_result = {
             let chain = self.chain.read().await;
             let expected_bits = chain.next_required_bits();
@@ -1269,6 +1281,7 @@ impl Node {
             let network = chain.network;
             let flags = script_flags_for_block(network, height, block_hash, block.header.time, mtp);
             let mtp_provider = ChainMtpProvider { chain: &chain };
+            assumevalid_skip_scripts = self.should_skip_scripts_with_assumevalid(&chain, height, block_hash);
 
             let ctx = BlockValidationContext {
                 block: &block,
@@ -1280,9 +1293,13 @@ impl Node {
                 network,
                 mtp_provider: &mtp_provider,
             };
-            verify_block(&ctx, &self.utxo_cache)
+            verify_block_with_options(&ctx, &self.utxo_cache, assumevalid_skip_scripts)
         };
         let verify_elapsed = verify_started.elapsed();
+        if assumevalid_skip_scripts && !self.assumevalid_announced {
+            self.assumevalid_announced = true;
+            info!("assumevalid active: skipping script checks while connecting historical ancestors");
+        }
 
         match validation_result {
             Ok(fees) => {
@@ -1448,6 +1465,36 @@ impl Node {
         }
 
         Ok(())
+    }
+
+    fn should_skip_scripts_with_assumevalid(
+        &self,
+        chain: &ChainState,
+        height: u32,
+        block_hash: Hash256,
+    ) -> bool {
+        if self.ibd.phase != IbdPhase::Blocks {
+            return false;
+        }
+        let Some(assumevalid_hash) = self.assumevalid_hash else {
+            return false;
+        };
+        let Some(assumevalid_bi) = chain.block_index.get(&assumevalid_hash) else {
+            return false;
+        };
+        if height > assumevalid_bi.height {
+            return false;
+        }
+        let Some(canon_hash) = self.canonical_header_chain.get(height as usize) else {
+            return false;
+        };
+        if *canon_hash != block_hash {
+            return false;
+        }
+        let Some(canon_assumevalid) = self.canonical_header_chain.get(assumevalid_bi.height as usize) else {
+            return false;
+        };
+        *canon_assumevalid == assumevalid_hash
     }
 
     /// Accept an unconfirmed transaction into the mempool and relay it.

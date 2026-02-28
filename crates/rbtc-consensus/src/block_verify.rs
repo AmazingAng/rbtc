@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::time::Instant;
 use rbtc_primitives::{
     block::Block,
@@ -16,9 +17,10 @@ use crate::{
     error::ConsensusError,
     tx_verify::{
         block_subsidy,
+        load_transaction_inputs,
         verify_coinbase,
-        verify_transaction_scripts_only,
-        verify_transaction_with_lock_rules,
+        verify_transaction_scripts_with_prevouts,
+        verify_transaction_with_lock_rules_preloaded,
         MedianTimeProvider,
     },
     utxo::{Utxo, UtxoLookup},
@@ -31,6 +33,29 @@ struct BlockUtxoView<'a, U: UtxoLookup> {
     in_block: HashMap<rbtc_primitives::transaction::OutPoint, Utxo>,
     /// The persistent UTXO set (CachedUtxoSet / UtxoSet).
     base: &'a U,
+}
+
+static SCRIPT_PRECHECK_POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+
+fn precheck_pool() -> Option<&'static rayon::ThreadPool> {
+    SCRIPT_PRECHECK_POOL
+        .get_or_init(|| {
+            let Some(raw) = std::env::var("RBTC_SCRIPT_THREADS").ok() else {
+                return None;
+            };
+            let Ok(n) = raw.parse::<usize>() else {
+                return None;
+            };
+            if n == 0 {
+                return None;
+            }
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(n)
+                .thread_name(|i| format!("rbtc-script-{i}"))
+                .build()
+                .ok()
+        })
+        .as_ref()
 }
 
 impl<U: UtxoLookup> UtxoLookup for BlockUtxoView<'_, U> {
@@ -68,6 +93,14 @@ pub struct BlockValidationContext<'a> {
 pub fn verify_block(
     ctx: &BlockValidationContext<'_>,
     utxos: &impl UtxoLookup,
+) -> Result<u64, ConsensusError> {
+    verify_block_with_options(ctx, utxos, false)
+}
+
+pub fn verify_block_with_options(
+    ctx: &BlockValidationContext<'_>,
+    utxos: &impl UtxoLookup,
+    skip_script_verification: bool,
 ) -> Result<u64, ConsensusError> {
     let verify_started = Instant::now();
     let block = ctx.block;
@@ -137,7 +170,7 @@ pub fn verify_block(
     for (pos, txid) in non_coinbase_txids.iter().enumerate() {
         in_block_txid_pos.insert(*txid, pos);
     }
-    let precheck_candidates: Vec<&rbtc_primitives::transaction::Transaction> = non_coinbase
+    let precheck_candidates: Vec<(usize, &rbtc_primitives::transaction::Transaction)> = non_coinbase
         .iter()
         .enumerate()
         .filter_map(|(pos, tx)| {
@@ -150,17 +183,34 @@ pub fn verify_block(
             if spends_earlier_in_block {
                 None
             } else {
-                Some(tx)
+                Some((pos, tx))
             }
         })
         .collect();
-    let flags = ctx.flags;
-    if let Some(err) = precheck_candidates
-        .par_iter()
-        .filter_map(|tx| verify_transaction_scripts_only(tx, utxos, flags).err())
-        .find_any(|_| true)
-    {
-        return Err(err);
+    let mut prechecked_inputs: HashMap<usize, Vec<Utxo>> = HashMap::new();
+    if !skip_script_verification {
+        let flags = ctx.flags;
+        let run_precheck = || {
+            precheck_candidates
+                .par_iter()
+                .map(|(pos, tx)| {
+                    let loaded = load_transaction_inputs(tx, utxos)?;
+                    let prevouts: Vec<rbtc_primitives::transaction::TxOut> =
+                        loaded.iter().map(|u| u.txout.clone()).collect();
+                    verify_transaction_scripts_with_prevouts(tx, &prevouts, flags)?;
+                    Ok((*pos, loaded))
+                })
+                .collect::<Vec<Result<(usize, Vec<Utxo>), ConsensusError>>>()
+        };
+        let precheck_results: Vec<Result<(usize, Vec<Utxo>), ConsensusError>> = if let Some(pool) = precheck_pool() {
+            pool.install(run_precheck)
+        } else {
+            run_precheck()
+        };
+        for item in precheck_results {
+            let (pos, loaded) = item?;
+            prechecked_inputs.insert(pos, loaded);
+        }
     }
     let precheck_elapsed = precheck_started.elapsed();
 
@@ -169,13 +219,14 @@ pub fn verify_block(
     let mut non_coinbase_sigops: u64 = 0;
     let serial_started = Instant::now();
 
-    for tx in non_coinbase {
+    for (pos, tx) in non_coinbase.iter().enumerate() {
         let lock_time_cutoff = if ctx.flags.verify_checksequenceverify {
             ctx.median_time_past
         } else {
             block.header.time
         };
-        let fee = verify_transaction_with_lock_rules(
+        let preloaded = prechecked_inputs.get(&pos).map(Vec::as_slice);
+        let fee = verify_transaction_with_lock_rules_preloaded(
             tx,
             &block_view,
             ctx.height,
@@ -183,6 +234,8 @@ pub fn verify_block(
             lock_time_cutoff,
             ctx.mtp_provider,
             true,
+            preloaded,
+            skip_script_verification || preloaded.is_some(),
         )?;
         total_fees = total_fees
             .checked_add(fee)

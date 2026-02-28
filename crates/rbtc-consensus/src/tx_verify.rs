@@ -60,6 +60,30 @@ pub fn verify_transaction_with_lock_rules(
     mtp_provider: &dyn MedianTimeProvider,
     enforce_lock_rules: bool,
 ) -> Result<u64, ConsensusError> {
+    verify_transaction_with_lock_rules_preloaded(
+        tx,
+        utxos,
+        current_height,
+        flags,
+        lock_time_cutoff,
+        mtp_provider,
+        enforce_lock_rules,
+        None,
+        false,
+    )
+}
+
+pub fn verify_transaction_with_lock_rules_preloaded(
+    tx: &Transaction,
+    utxos: &impl UtxoLookup,
+    current_height: u32,
+    flags: ScriptFlags,
+    lock_time_cutoff: u32,
+    mtp_provider: &dyn MedianTimeProvider,
+    enforce_lock_rules: bool,
+    preloaded_utxos: Option<&[Utxo]>,
+    skip_script_verification: bool,
+) -> Result<u64, ConsensusError> {
     if tx.inputs.is_empty() {
         return Err(ConsensusError::NoInputs);
     }
@@ -86,18 +110,23 @@ pub fn verify_transaction_with_lock_rules(
         return Err(ConsensusError::LockTimeNotSatisfied);
     }
 
-    // Gather inputs from UTXO set
+    // Gather inputs from UTXO set (or from preloaded entries).
     let mut input_sum: u64 = 0;
     let mut prevouts = Vec::with_capacity(tx.inputs.len());
     let mut input_heights = Vec::with_capacity(tx.inputs.len());
+    let loaded: Vec<Utxo> = match preloaded_utxos {
+        Some(entries) => {
+            if entries.len() != tx.inputs.len() {
+                return Err(ConsensusError::InvalidTx(
+                    "preloaded input count mismatch".into(),
+                ));
+            }
+            entries.to_vec()
+        }
+        None => load_transaction_inputs(tx, utxos)?,
+    };
 
-    for input in &tx.inputs {
-        let utxo: Utxo = utxos.get_utxo(&input.previous_output).ok_or_else(|| {
-            ConsensusError::MissingUtxo(
-                input.previous_output.txid.to_hex(),
-                input.previous_output.vout,
-            )
-        })?;
+    for utxo in &loaded {
 
         // Coinbase maturity check
         if utxo.is_coinbase {
@@ -132,9 +161,28 @@ pub fn verify_transaction_with_lock_rules(
     let fee = input_sum - output_sum;
 
     // Script verification for each input
-    verify_transaction_scripts_with_prevouts(tx, &prevouts, flags)?;
+    if !skip_script_verification {
+        verify_transaction_scripts_with_prevouts(tx, &prevouts, flags)?;
+    }
 
     Ok(fee)
+}
+
+pub fn load_transaction_inputs(
+    tx: &Transaction,
+    utxos: &impl UtxoLookup,
+) -> Result<Vec<Utxo>, ConsensusError> {
+    let mut loaded = Vec::with_capacity(tx.inputs.len());
+    for input in &tx.inputs {
+        let utxo: Utxo = utxos.get_utxo(&input.previous_output).ok_or_else(|| {
+            ConsensusError::MissingUtxo(
+                input.previous_output.txid.to_hex(),
+                input.previous_output.vout,
+            )
+        })?;
+        loaded.push(utxo);
+    }
+    Ok(loaded)
 }
 
 pub fn verify_transaction_scripts_with_prevouts(
@@ -161,16 +209,10 @@ pub fn verify_transaction_scripts_only(
     utxos: &impl UtxoLookup,
     flags: ScriptFlags,
 ) -> Result<(), ConsensusError> {
-    let mut prevouts = Vec::with_capacity(tx.inputs.len());
-    for input in &tx.inputs {
-        let utxo = utxos.get_utxo(&input.previous_output).ok_or_else(|| {
-            ConsensusError::MissingUtxo(
-                input.previous_output.txid.to_hex(),
-                input.previous_output.vout,
-            )
-        })?;
-        prevouts.push(utxo.txout);
-    }
+    let prevouts: Vec<TxOut> = load_transaction_inputs(tx, utxos)?
+        .into_iter()
+        .map(|u| u.txout)
+        .collect();
     verify_transaction_scripts_with_prevouts(tx, &prevouts, flags)
 }
 
@@ -180,16 +222,10 @@ pub fn verify_transaction_scripts_parallel_inputs(
     utxos: &impl UtxoLookup,
     flags: ScriptFlags,
 ) -> Result<(), ConsensusError> {
-    let mut prevouts = Vec::with_capacity(tx.inputs.len());
-    for input in &tx.inputs {
-        let utxo = utxos.get_utxo(&input.previous_output).ok_or_else(|| {
-            ConsensusError::MissingUtxo(
-                input.previous_output.txid.to_hex(),
-                input.previous_output.vout,
-            )
-        })?;
-        prevouts.push(utxo.txout);
-    }
+    let prevouts: Vec<TxOut> = load_transaction_inputs(tx, utxos)?
+        .into_iter()
+        .map(|u| u.txout)
+        .collect();
     let txid = compute_txid(tx);
     let errors: Vec<ConsensusError> = prevouts
         .par_iter()

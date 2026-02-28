@@ -82,6 +82,15 @@ pub struct Args {
     /// older entries are evicted and re-fetched from RocksDB on demand.
     #[arg(long, value_name = "MB", default_value = "0")]
     pub utxo_cache: u64,
+
+    /// Script precheck worker threads (0 = use rayon default).
+    #[arg(long, value_name = "N", default_value = "0")]
+    pub script_threads: usize,
+
+    /// Assumevalid block hash (hex). When set, IBD may skip script verification
+    /// for ancestors of this block on the active header chain.
+    #[arg(long, value_name = "BLOCKHASH")]
+    pub assumevalid: Option<String>,
 }
 
 impl Args {
