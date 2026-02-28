@@ -25,6 +25,7 @@ async fn main() -> Result<()> {
     if args.script_threads > 0 {
         std::env::set_var("RBTC_SCRIPT_THREADS", args.script_threads.to_string());
     }
+    std::env::set_var("RBTC_SCRIPT_CACHE_SIZE", args.script_cache_size.to_string());
     tracing::info!("rbtc starting on {}", args.network);
 
     let node = Node::new(args).await?;

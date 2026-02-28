@@ -36,6 +36,13 @@ const BAN_THRESHOLD: u32 = 100;
 /// Maximum timestamp drift (seconds) for addr entries we relay.
 const ADDR_MAX_DRIFT_SECS: i64 = 10 * 60;
 
+#[derive(Debug, Clone, Copy)]
+pub struct RefillStats {
+    pub outbound: usize,
+    pub connecting: usize,
+    pub candidates: usize,
+}
+
 /// Configuration for the peer manager
 #[derive(Debug, Clone)]
 pub struct PeerManagerConfig {
@@ -163,6 +170,14 @@ impl PeerManager {
 
     pub fn peer_count(&self) -> usize {
         self.peers.len()
+    }
+
+    pub fn refill_stats(&self) -> RefillStats {
+        RefillStats {
+            outbound: self.outbound_count,
+            connecting: self.connecting_addrs.len(),
+            candidates: self.candidate_addrs.len(),
+        }
     }
 
     /// Seed the candidate address pool from persistent storage (call at startup).

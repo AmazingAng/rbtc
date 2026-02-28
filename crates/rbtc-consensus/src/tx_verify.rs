@@ -9,7 +9,11 @@ use rbtc_script::{ScriptContext, ScriptFlags, verify_input};
 #[cfg(feature = "experimental-input-parallel")]
 use rayon::prelude::*;
 
-use crate::{error::ConsensusError, utxo::{Utxo, UtxoLookup}};
+use crate::{
+    error::ConsensusError,
+    script_exec_cache::{cache_contains, cache_insert, make_script_exec_key},
+    utxo::{Utxo, UtxoLookup},
+};
 
 /// Provides MedianTimePast lookups for a given block height.
 pub trait MedianTimeProvider {
@@ -192,6 +196,18 @@ pub fn verify_transaction_scripts_with_prevouts(
 ) -> Result<(), ConsensusError> {
     let txid = compute_txid(tx);
     for (i, prevout) in prevouts.iter().enumerate() {
+        let key = make_script_exec_key(
+            &txid.0,
+            i,
+            script_flags_mask(flags),
+            prevout.value,
+            prevout.script_pubkey.as_bytes(),
+            tx.inputs[i].script_sig.as_bytes(),
+            &tx.inputs[i].witness,
+        );
+        if cache_contains(key) {
+            continue;
+        }
         let ctx = ScriptContext {
             tx,
             input_index: i,
@@ -200,8 +216,22 @@ pub fn verify_transaction_scripts_with_prevouts(
             all_prevouts: prevouts,
         };
         verify_input(&ctx).map_err(|e| script_error_for_input(tx, &txid, i, prevout, flags, &e.to_string()))?;
+        cache_insert(key);
     }
     Ok(())
+}
+
+fn script_flags_mask(flags: ScriptFlags) -> u16 {
+    let mut m = 0u16;
+    if flags.verify_p2sh { m |= 1 << 0; }
+    if flags.verify_dersig { m |= 1 << 1; }
+    if flags.verify_witness { m |= 1 << 2; }
+    if flags.verify_nulldummy { m |= 1 << 3; }
+    if flags.verify_cleanstack { m |= 1 << 4; }
+    if flags.verify_checklocktimeverify { m |= 1 << 5; }
+    if flags.verify_checksequenceverify { m |= 1 << 6; }
+    if flags.verify_taproot { m |= 1 << 7; }
+    m
 }
 
 pub fn verify_transaction_scripts_only(

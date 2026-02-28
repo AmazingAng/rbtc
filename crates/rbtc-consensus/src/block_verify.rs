@@ -15,6 +15,7 @@ use tracing::debug;
 
 use crate::{
     error::ConsensusError,
+    script_exec_cache::metrics_snapshot as script_cache_metrics,
     tx_verify::{
         block_subsidy,
         load_transaction_inputs,
@@ -269,13 +270,24 @@ pub fn verify_block_with_options(
     }
 
     let serial_elapsed = serial_started.elapsed();
+    let cache_metrics = script_cache_metrics();
+    let cache_hit_rate = if cache_metrics.lookups == 0 {
+        0.0
+    } else {
+        (cache_metrics.hits as f64 / cache_metrics.lookups as f64) * 100.0
+    };
     debug!(
-        "verify timing: height={} txs={} script_precheck_ms={} script_serial_ms={} verify_total_ms={}",
+        "verify timing: height={} txs={} script_precheck_ms={} script_serial_ms={} verify_total_ms={} script_cache_lookups={} script_cache_hits={} script_cache_hit_rate={:.2}% script_cache_inserts={} script_cache_evictions={}",
         ctx.height,
         block.transactions.len(),
         precheck_elapsed.as_millis(),
         serial_elapsed.as_millis(),
-        verify_started.elapsed().as_millis()
+        verify_started.elapsed().as_millis(),
+        cache_metrics.lookups,
+        cache_metrics.hits,
+        cache_hit_rate,
+        cache_metrics.inserts,
+        cache_metrics.evictions
     );
 
     Ok(total_fees)

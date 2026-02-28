@@ -2,6 +2,7 @@ pub mod chain;
 pub mod difficulty;
 pub mod error;
 pub mod script_flags;
+pub mod script_exec_cache;
 pub mod tx_verify;
 pub mod block_verify;
 pub mod utxo;

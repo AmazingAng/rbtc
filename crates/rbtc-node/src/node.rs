@@ -36,6 +36,10 @@ const LOCAL_PEER_ID: u64 = 0;
 const INDEX_BATCH_SIZE: usize = 64;
 const INDEX_QUEUE_FILL_CHUNK: u32 = 512;
 const UTXO_EVICT_INTERVAL_BLOCKS: u32 = 16;
+const MIN_DYNAMIC_GLOBAL_WINDOW_BLOCKS: u32 = 256;
+const MAX_DYNAMIC_GLOBAL_WINDOW_BLOCKS: u32 = 4096;
+const ADAPTIVE_TIMEOUT_SOFT: Duration = Duration::from_secs(20);
+const ADAPTIVE_TIMEOUT_HARD: Duration = Duration::from_secs(45);
 
 #[derive(Clone, Copy)]
 struct IndexTask {
@@ -47,6 +51,14 @@ struct IndexBatchOutcome {
     processed: usize,
     last_indexed_height: Option<u32>,
     retry_tasks: Vec<IndexTask>,
+}
+
+#[derive(Default, Clone, Copy)]
+struct PeerIbdStats {
+    delivered_blocks: u64,
+    timeout_strikes: u32,
+    last_delivery_at: Option<Instant>,
+    delivery_interval_ema_ms: f64,
 }
 
 struct ChainMtpProvider<'a> {
@@ -108,8 +120,18 @@ pub struct Node {
     blocks_since_utxo_evict: u32,
     /// Optional assumevalid block hash (Core-style IBD scriptcheck fast path).
     assumevalid_hash: Option<Hash256>,
+    /// Optional minimum cumulative chain work required before assumevalid activates.
+    min_chain_work: Option<u128>,
+    /// Force full script verification even when assumevalid is set.
+    check_all_scripts: bool,
     /// Log guard to avoid spamming assumevalid activation message.
     assumevalid_announced: bool,
+    /// Metrics for assumevalid effectiveness.
+    assumevalid_skipped_blocks: u64,
+    assumevalid_saved_verify_ms: u128,
+    assumevalid_last_height: Option<u32>,
+    /// Per-peer delivery/timeout stats for adaptive IBD scheduling.
+    peer_ibd_stats: HashMap<u64, PeerIbdStats>,
 }
 
 impl Node {
@@ -194,6 +216,8 @@ impl Node {
             Some(h) => Some(Hash256::from_hex(h).map_err(|_| anyhow!("invalid --assumevalid hash"))?),
             None => None,
         };
+        let min_chain_work = args.min_chain_work;
+        let check_all_scripts = args.check_all_scripts;
 
         Ok(Self {
             args,
@@ -219,7 +243,13 @@ impl Node {
             index_worker: None,
             blocks_since_utxo_evict: 0,
             assumevalid_hash,
+            min_chain_work,
+            check_all_scripts,
             assumevalid_announced: false,
+            assumevalid_skipped_blocks: 0,
+            assumevalid_saved_verify_ms: 0,
+            assumevalid_last_height: None,
+            peer_ibd_stats: HashMap::new(),
         })
     }
 
@@ -895,13 +925,94 @@ impl Node {
     const PER_PEER_INFLIGHT_BLOCKS: u32 = 16;
     /// Tighter in-flight cap while frontier is pending, to reduce out-of-order flood.
     const PER_PEER_INFLIGHT_BLOCKS_FRONTIER_PENDING: u32 = 4;
-    /// Global download window ahead of connected tip.
-    const GLOBAL_WINDOW_BLOCKS: u32 = 1024;
     /// If the frontier block is in-flight longer than this, re-request it from
     /// another idle peer (without waiting for full stall timeout).
     const FRONTIER_RETRY_TIMEOUT: Duration = Duration::from_secs(15);
     /// Keep up to this many parallel owners for the frontier block.
     const FRONTIER_REDUNDANT_PEERS: usize = 2;
+
+    fn peer_window_bounds(&self) -> (u32, u32) {
+        let min_w = self.args.ibd_peer_window_min.max(1);
+        let max_w = self.args.ibd_peer_window_max.max(min_w);
+        (min_w, max_w)
+    }
+
+    fn adaptive_per_peer_cap(&self, peer_id: u64, frontier_pending: bool) -> u32 {
+        let (min_w, max_w) = self.peer_window_bounds();
+        let mut base = if frontier_pending {
+            Self::PER_PEER_INFLIGHT_BLOCKS_FRONTIER_PENDING.max(min_w)
+        } else {
+            Self::PER_PEER_INFLIGHT_BLOCKS.max(min_w)
+        };
+        if let Some(stats) = self.peer_ibd_stats.get(&peer_id) {
+            if stats.timeout_strikes >= 3 {
+                return min_w;
+            }
+            // Lower interval EMA means faster delivery rate.
+            if stats.delivery_interval_ema_ms > 0.0 {
+                if stats.delivery_interval_ema_ms < 120.0 && !frontier_pending {
+                    base = base.saturating_add(8);
+                } else if stats.delivery_interval_ema_ms > 500.0 {
+                    base = base.saturating_sub(4).max(min_w);
+                }
+            }
+        }
+        base.min(max_w)
+    }
+
+    fn adaptive_global_window(&self, peer_count: usize) -> u32 {
+        if self.args.ibd_global_window > 0 {
+            return self.args.ibd_global_window;
+        }
+        let mut dynamic = MIN_DYNAMIC_GLOBAL_WINDOW_BLOCKS;
+        // Derive a rough throughput estimate from moving average of connect time.
+        let connect_ema_ms = self
+            .peer_ibd_stats
+            .values()
+            .filter_map(|s| {
+                if s.delivery_interval_ema_ms > 0.0 {
+                    Some(s.delivery_interval_ema_ms)
+                } else {
+                    None
+                }
+            })
+            .fold(None, |acc: Option<f64>, v| match acc {
+                Some(cur) => Some(cur * 0.85 + v * 0.15),
+                None => Some(v),
+            });
+        if let Some(ms) = connect_ema_ms {
+            let approx_blocks_per_sec = (1000.0 / ms).clamp(0.5, 20.0);
+            dynamic = (approx_blocks_per_sec * 25.0) as u32;
+        }
+        let (min_w, max_w) = self.peer_window_bounds();
+        let peer_floor = (peer_count as u32).saturating_mul(max_w.max(min_w)).saturating_mul(2);
+        dynamic
+            .max(peer_floor)
+            .clamp(MIN_DYNAMIC_GLOBAL_WINDOW_BLOCKS, MAX_DYNAMIC_GLOBAL_WINDOW_BLOCKS)
+    }
+
+    fn note_peer_timeout(&mut self, peer_id: u64) {
+        let stats = self.peer_ibd_stats.entry(peer_id).or_default();
+        stats.timeout_strikes = stats.timeout_strikes.saturating_add(1);
+    }
+
+    fn note_peer_delivery(&mut self, peer_id: u64) {
+        let now = Instant::now();
+        let stats = self.peer_ibd_stats.entry(peer_id).or_default();
+        stats.delivered_blocks = stats.delivered_blocks.saturating_add(1);
+        if let Some(prev) = stats.last_delivery_at {
+            let interval_ms = now.duration_since(prev).as_millis() as f64;
+            stats.delivery_interval_ema_ms = if stats.delivery_interval_ema_ms == 0.0 {
+                interval_ms
+            } else {
+                stats.delivery_interval_ema_ms * 0.85 + interval_ms * 0.15
+            };
+        }
+        stats.last_delivery_at = Some(now);
+        if stats.timeout_strikes > 0 {
+            stats.timeout_strikes -= 1;
+        }
+    }
 
     fn request_peer_disconnect(&mut self, peer_id: u64) {
         self.disconnecting_peers.insert(peer_id);
@@ -913,7 +1024,9 @@ impl Node {
     async fn assign_blocks_to_peers(&mut self) {
         // Collect peers that are not currently handling a batch.
         let our_height = self.chain.read().await.height();
-        let max_assignable_height = our_height.saturating_add(Self::GLOBAL_WINDOW_BLOCKS);
+        let ibd_peers = self.peer_manager.peers_for_ibd(our_height + 1);
+        let global_window = self.adaptive_global_window(ibd_peers.len());
+        let max_assignable_height = our_height.saturating_add(global_window);
 
         let mut idle_peers: Vec<u64> = self
             .peer_manager
@@ -1030,6 +1143,25 @@ impl Node {
                 }
             }
         }
+        let refill = self.peer_manager.refill_stats();
+        let inflight = self.ibd.peer_downloads.len();
+        let frontier_owner = frontier_hash_for_preemption.and_then(|fh| {
+            self.ibd
+                .peer_downloads
+                .iter()
+                .find(|(_, dl)| dl.hashes.iter().any(|h| h == &fh))
+                .map(|(peer_id, _)| *peer_id)
+        });
+        debug!(
+            "IBD scheduler: outbound={} connecting={} candidates={} inflight={} global_window={} frontier_pending={} frontier_owner={:?}",
+            refill.outbound,
+            refill.connecting,
+            refill.candidates,
+            inflight,
+            global_window,
+            frontier_pending,
+            frontier_owner
+        );
 
         // If frontier is still pending but no idle peer exists, preempt one
         // far-ahead busy peer so the next assignment cycle can immediately
@@ -1081,13 +1213,8 @@ impl Node {
             );
         }
 
-        let per_peer_cap = if frontier_pending {
-            Self::PER_PEER_INFLIGHT_BLOCKS_FRONTIER_PENDING
-        } else {
-            Self::PER_PEER_INFLIGHT_BLOCKS
-        };
-
         for peer_id in idle_peers.into_iter().take(range_assign_limit) {
+            let per_peer_cap = self.adaptive_per_peer_cap(peer_id, frontier_pending);
             // Always dispatch the smallest-start (frontier-nearest) segment first.
             // `pending_ranges` can be perturbed by stall/release re-queue ordering,
             // so pop_front() may accidentally prioritize farther-ahead ranges.
@@ -1166,6 +1293,7 @@ impl Node {
             .collect();
         let mut any_batch_done = false;
         for peer_id in owners {
+            self.note_peer_delivery(peer_id);
             if self.ibd.complete_peer_block(peer_id, block_hash) {
                 any_batch_done = true;
             }
@@ -1299,6 +1427,13 @@ impl Node {
         if assumevalid_skip_scripts && !self.assumevalid_announced {
             self.assumevalid_announced = true;
             info!("assumevalid active: skipping script checks while connecting historical ancestors");
+        }
+        if assumevalid_skip_scripts {
+            self.assumevalid_skipped_blocks = self.assumevalid_skipped_blocks.saturating_add(1);
+            self.assumevalid_saved_verify_ms = self
+                .assumevalid_saved_verify_ms
+                .saturating_add(verify_elapsed.as_millis());
+            self.assumevalid_last_height = Some(height);
         }
 
         match validation_result {
@@ -1473,6 +1608,9 @@ impl Node {
         height: u32,
         block_hash: Hash256,
     ) -> bool {
+        if self.check_all_scripts {
+            return false;
+        }
         if self.ibd.phase != IbdPhase::Blocks {
             return false;
         }
@@ -1482,6 +1620,24 @@ impl Node {
         let Some(assumevalid_bi) = chain.block_index.get(&assumevalid_hash) else {
             return false;
         };
+        if let Some(min_chain_work) = self.min_chain_work {
+            let best_work = chain
+                .best_tip
+                .and_then(|tip| chain.block_index.get(&tip))
+                .map(|bi| bi.chainwork)
+                .unwrap_or(0);
+            if best_work < min_chain_work {
+                return false;
+            }
+        }
+        if chain
+            .active_chain
+            .get(assumevalid_bi.height as usize)
+            .copied()
+            != Some(assumevalid_hash)
+        {
+            return false;
+        }
         if height > assumevalid_bi.height {
             return false;
         }
@@ -1781,31 +1937,55 @@ impl Node {
                         .find(|(_, dl)| dl.hashes.iter().any(|h| h == &frontier_hash))
                         .map(|(peer_id, dl)| (*peer_id, dl.requested_at.elapsed()));
                     if let Some((peer_id, age)) = frontier_owner {
-                        if age >= Self::FRONTIER_RETRY_TIMEOUT {
+                        if age >= ADAPTIVE_TIMEOUT_SOFT {
+                            self.note_peer_timeout(peer_id);
+                            let strikes = self
+                                .peer_ibd_stats
+                                .get(&peer_id)
+                                .map(|s| s.timeout_strikes)
+                                .unwrap_or(0);
                             warn!(
-                                "IBD frontier timeout: height {} in-flight on peer {} for {}s; failover",
+                                "IBD frontier timeout: height {} in-flight on peer {} for {}s; strikes={}; failover",
                                 frontier,
                                 peer_id,
-                                age.as_secs()
+                                age.as_secs(),
+                                strikes
                             );
                             self.ibd.release_peer(peer_id);
-                            self.request_peer_disconnect(peer_id);
+                            if age >= ADAPTIVE_TIMEOUT_HARD || strikes >= 2 {
+                                self.request_peer_disconnect(peer_id);
+                            }
                             disconnected_any = true;
                         }
                     }
                 }
             }
 
-            // Per-peer stall detection: disconnect stalled peers and re-queue their ranges.
-            let stalled = self.ibd.stalled_peers(STALL_TIMEOUT);
+            // Per-peer adaptive stall detection: soft reassign first, hard disconnect on repeated timeouts.
+            let stalled = self.ibd.stalled_peers(ADAPTIVE_TIMEOUT_SOFT);
             for peer_id in stalled {
+                let age = self
+                    .ibd
+                    .peer_downloads
+                    .get(&peer_id)
+                    .map(|dl| dl.requested_at.elapsed())
+                    .unwrap_or(ADAPTIVE_TIMEOUT_SOFT);
+                self.note_peer_timeout(peer_id);
+                let strikes = self
+                    .peer_ibd_stats
+                    .get(&peer_id)
+                    .map(|s| s.timeout_strikes)
+                    .unwrap_or(0);
                 warn!(
-                    "IBD stall: peer {} made no progress for {}s; re-assigning range",
+                    "IBD stall: peer {} made no progress for {}s; strikes={}; re-assigning range",
                     peer_id,
-                    STALL_TIMEOUT.as_secs()
+                    age.as_secs(),
+                    strikes
                 );
                 self.ibd.release_peer(peer_id);
-                self.request_peer_disconnect(peer_id);
+                if age >= ADAPTIVE_TIMEOUT_HARD || strikes >= 2 {
+                    self.request_peer_disconnect(peer_id);
+                }
                 disconnected_any = true;
             }
             // Fill any idle peers with pending segments.
@@ -1842,7 +2022,10 @@ impl Node {
         let best_peer_height = self.peer_manager.best_peer_height();
         let mp_size = self.mempool.read().await.len();
         info!(
-            "height={height} peers={peers} best_peer={best_peer_height} utxos={utxos} mempool={mp_size}"
+            "height={height} peers={peers} best_peer={best_peer_height} utxos={utxos} mempool={mp_size} assumevalid_skipped_blocks={} assumevalid_saved_verify_ms={} assumevalid_last_height={:?}",
+            self.assumevalid_skipped_blocks,
+            self.assumevalid_saved_verify_ms,
+            self.assumevalid_last_height
         );
     }
 

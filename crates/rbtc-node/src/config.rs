@@ -91,6 +91,31 @@ pub struct Args {
     /// for ancestors of this block on the active header chain.
     #[arg(long, value_name = "BLOCKHASH")]
     pub assumevalid: Option<String>,
+
+    /// Minimum cumulative chainwork required before assumevalid can activate.
+    /// Accepts decimal or 0x-prefixed hex.
+    #[arg(long, value_name = "WORK", value_parser = parse_u128_work)]
+    pub min_chain_work: Option<u128>,
+
+    /// Always verify all scripts (disables assumevalid skip path).
+    #[arg(long, default_value_t = false)]
+    pub check_all_scripts: bool,
+
+    /// Script execution cache size (entries). 0 disables script execution cache.
+    #[arg(long, value_name = "N", default_value = "100000")]
+    pub script_cache_size: usize,
+
+    /// Fixed global IBD window ahead of tip. 0 enables adaptive mode.
+    #[arg(long, value_name = "N", default_value = "0")]
+    pub ibd_global_window: u32,
+
+    /// Per-peer IBD in-flight window minimum.
+    #[arg(long, value_name = "N", default_value = "4")]
+    pub ibd_peer_window_min: u32,
+
+    /// Per-peer IBD in-flight window maximum.
+    #[arg(long, value_name = "N", default_value = "24")]
+    pub ibd_peer_window_max: u32,
 }
 
 impl Args {
@@ -110,6 +135,14 @@ impl Args {
 
 fn parse_network(s: &str) -> Result<Network, String> {
     s.parse::<Network>()
+}
+
+fn parse_u128_work(s: &str) -> Result<u128, String> {
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u128::from_str_radix(hex, 16).map_err(|e| format!("invalid hex work: {e}"))
+    } else {
+        s.parse::<u128>().map_err(|e| format!("invalid work: {e}"))
+    }
 }
 
 fn dirs_home() -> PathBuf {
