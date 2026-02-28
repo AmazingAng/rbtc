@@ -206,6 +206,8 @@ pub fn sign_transaction(
                 SighashType::TaprootDefault,
                 None,
                 None,
+                0,
+                u32::MAX,
             );
 
             let mut aux_rand = [0u8; 32];

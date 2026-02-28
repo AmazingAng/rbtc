@@ -317,6 +317,8 @@ pub fn sighash_taproot(
     sighash_type: SighashType,
     leaf_hash: Option<&[u8; 32]>, // None = key path spend
     annex: Option<&[u8]>,
+    key_version: u8,
+    code_separator_pos: u32,
 ) -> Hash256 {
     let sighash_byte = sighash_type as u8;
     let base = sighash_byte & 0x1f;
@@ -408,8 +410,8 @@ pub fn sighash_taproot(
 
     if let Some(lh) = leaf_hash {
         buf.extend_from_slice(lh);
-        buf.push(0x00); // key_version
-        buf.extend_from_slice(&0xffffffffu32.to_le_bytes()); // code_separator_pos = UINT_MAX
+        buf.push(key_version);
+        buf.extend_from_slice(&code_separator_pos.to_le_bytes());
     }
 
     tagged_hash(b"TapSighash", &buf)
@@ -532,7 +534,16 @@ mod tests {
     fn sighash_taproot_default() {
         let tx = sample_tx();
         let prevouts = vec![TxOut { value: 1000, script_pubkey: Script::new() }];
-        let h = sighash_taproot(&tx, 0, &prevouts, SighashType::TaprootDefault, None, None);
+        let h = sighash_taproot(
+            &tx,
+            0,
+            &prevouts,
+            SighashType::TaprootDefault,
+            None,
+            None,
+            0,
+            u32::MAX,
+        );
         assert_eq!(h.0.len(), 32);
     }
 
@@ -541,7 +552,16 @@ mod tests {
         let tx = sample_tx();
         let prevouts = vec![TxOut { value: 1000, script_pubkey: Script::new() }];
         let annex = vec![0x50];
-        let h = sighash_taproot(&tx, 0, &prevouts, SighashType::All, None, Some(&annex));
+        let h = sighash_taproot(
+            &tx,
+            0,
+            &prevouts,
+            SighashType::All,
+            None,
+            Some(&annex),
+            0,
+            u32::MAX,
+        );
         assert_eq!(h.0.len(), 32);
     }
 
@@ -550,7 +570,16 @@ mod tests {
         let tx = sample_tx();
         let prevouts = vec![TxOut { value: 1000, script_pubkey: Script::new() }];
         let leaf = [1u8; 32];
-        let h = sighash_taproot(&tx, 0, &prevouts, SighashType::All, Some(&leaf), None);
+        let h = sighash_taproot(
+            &tx,
+            0,
+            &prevouts,
+            SighashType::All,
+            Some(&leaf),
+            None,
+            0,
+            u32::MAX,
+        );
         assert_eq!(h.0.len(), 32);
     }
 
@@ -558,7 +587,16 @@ mod tests {
     fn sighash_taproot_anyone_can_pay() {
         let tx = sample_tx();
         let prevouts = vec![TxOut { value: 1000, script_pubkey: Script::new() }];
-        let h = sighash_taproot(&tx, 0, &prevouts, SighashType::AllAnyoneCanPay, None, None);
+        let h = sighash_taproot(
+            &tx,
+            0,
+            &prevouts,
+            SighashType::AllAnyoneCanPay,
+            None,
+            None,
+            0,
+            u32::MAX,
+        );
         assert_eq!(h.0.len(), 32);
     }
 
@@ -566,7 +604,44 @@ mod tests {
     fn sighash_taproot_single() {
         let tx = sample_tx();
         let prevouts = vec![TxOut { value: 1000, script_pubkey: Script::new() }];
-        let h = sighash_taproot(&tx, 0, &prevouts, SighashType::Single, None, None);
+        let h = sighash_taproot(
+            &tx,
+            0,
+            &prevouts,
+            SighashType::Single,
+            None,
+            None,
+            0,
+            u32::MAX,
+        );
         assert_eq!(h.0.len(), 32);
+    }
+
+    #[test]
+    fn sighash_taproot_scriptpath_codesep_affects_hash() {
+        let tx = sample_tx();
+        let prevouts = vec![TxOut { value: 1000, script_pubkey: Script::new() }];
+        let leaf = [7u8; 32];
+        let h1 = sighash_taproot(
+            &tx,
+            0,
+            &prevouts,
+            SighashType::All,
+            Some(&leaf),
+            None,
+            0,
+            0,
+        );
+        let h2 = sighash_taproot(
+            &tx,
+            0,
+            &prevouts,
+            SighashType::All,
+            Some(&leaf),
+            None,
+            0,
+            42,
+        );
+        assert_ne!(h1, h2);
     }
 }

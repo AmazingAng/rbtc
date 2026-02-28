@@ -1,12 +1,12 @@
 use rbtc_primitives::{
     constants::{MAX_OPS_PER_SCRIPT, MAX_PUBKEYS_PER_MULTISIG, MAX_SCRIPT_ELEMENT_SIZE, MAX_STACK_SIZE},
     script::Script,
-    transaction::Transaction,
+    transaction::{Transaction, TxOut},
 };
 use rbtc_crypto::{
     digest::{hash160, sha256, sha256d},
-    sig::verify_ecdsa_with_policy,
-    sighash::{sighash_legacy_with_u32, sighash_segwit_v0_with_u32},
+    sig::{verify_ecdsa_with_policy, verify_schnorr},
+    sighash::{sighash_legacy_with_u32, sighash_segwit_v0_with_u32, sighash_taproot, SighashType},
 };
 use thiserror::Error;
 
@@ -56,6 +56,8 @@ pub enum ScriptError {
     WitnessUnexpected,
     #[error("taproot validation error: {0}")]
     Taproot(String),
+    #[error("invalid taproot sighash type")]
+    TaprootInvalidSighashType,
     #[error("script too large")]
     ScriptTooLarge,
     #[error("unbalanced if")]
@@ -68,6 +70,7 @@ type Stack = Vec<Vec<u8>>;
 pub enum SigVersion {
     Base,
     WitnessV0,
+    Taproot,
 }
 
 /// Execution flags
@@ -783,6 +786,164 @@ impl ScriptEngine {
 
         Ok(())
     }
+
+    /// Execute tapscript with BIP342 checks and Taproot sighash context.
+    pub fn execute_tapscript(
+        &self,
+        tx: &Transaction,
+        input_index: usize,
+        all_prevouts: &[TxOut],
+        script: &Script,
+        stack: &mut Stack,
+        leaf_hash: &[u8; 32],
+        annex: Option<&[u8]>,
+    ) -> Result<(), ScriptError> {
+        let bytes = script.as_bytes();
+        let mut pc = 0usize;
+        let mut codesep_pos = u32::MAX;
+
+        while pc < bytes.len() {
+            let op_pos = pc;
+            let op = bytes[pc];
+            pc += 1;
+
+            // BIP342: OP_SUCCESSx causes immediate successful validation.
+            if is_op_successx(op) {
+                return Ok(());
+            }
+
+            match op {
+                // OP_CHECKSIGADD
+                0xba => {
+                    if stack.len() < 3 {
+                        return Err(ScriptError::StackUnderflow);
+                    }
+                    let pubkey = stack.pop().unwrap();
+                    let n_bytes = stack.pop().unwrap();
+                    let sig = stack.pop().unwrap();
+                    let n = decode_script_int(&n_bytes, 8)?;
+
+                    if sig.is_empty() {
+                        stack.push(encode_script_int(n));
+                        continue;
+                    }
+
+                    let (sig_bytes, sighash_type) = parse_taproot_sig_and_hashtype(&sig)?;
+                    let hash = sighash_taproot(
+                        tx,
+                        input_index,
+                        all_prevouts,
+                        sighash_type,
+                        Some(leaf_hash),
+                        annex,
+                        0,
+                        codesep_pos,
+                    );
+                    let ok = verify_schnorr(&pubkey, sig_bytes, &hash.0).is_ok();
+                    stack.push(encode_script_int(n + if ok { 1 } else { 0 }));
+                }
+                // OP_CHECKSIG
+                0xac => {
+                    if stack.len() < 2 {
+                        return Err(ScriptError::StackUnderflow);
+                    }
+                    let pubkey = stack.pop().unwrap();
+                    let sig = stack.pop().unwrap();
+
+                    if sig.is_empty() {
+                        stack.push(Vec::new());
+                        continue;
+                    }
+
+                    let (sig_bytes, sighash_type) = parse_taproot_sig_and_hashtype(&sig)?;
+                    let hash = sighash_taproot(
+                        tx,
+                        input_index,
+                        all_prevouts,
+                        sighash_type,
+                        Some(leaf_hash),
+                        annex,
+                        0,
+                        codesep_pos,
+                    );
+                    let ok = verify_schnorr(&pubkey, sig_bytes, &hash.0).is_ok();
+                    stack.push(if ok { vec![1u8] } else { Vec::new() });
+                }
+                // OP_CHECKSIGVERIFY
+                0xad => {
+                    if stack.len() < 2 {
+                        return Err(ScriptError::StackUnderflow);
+                    }
+                    let pubkey = stack.pop().unwrap();
+                    let sig = stack.pop().unwrap();
+                    let ok = if sig.is_empty() {
+                        false
+                    } else {
+                        let (sig_bytes, sighash_type) = parse_taproot_sig_and_hashtype(&sig)?;
+                        let hash = sighash_taproot(
+                            tx,
+                            input_index,
+                            all_prevouts,
+                            sighash_type,
+                            Some(leaf_hash),
+                            annex,
+                            0,
+                            codesep_pos,
+                        );
+                        verify_schnorr(&pubkey, sig_bytes, &hash.0).is_ok()
+                    };
+                    if !ok {
+                        return Err(ScriptError::SigCheckFailed);
+                    }
+                }
+                0xab => {
+                    codesep_pos = op_pos as u32;
+                }
+                // pushdata
+                0x01..=0x4b => {
+                    let len = op as usize;
+                    if pc + len > bytes.len() {
+                        return Err(ScriptError::ScriptFailed("truncated pushdata".into()));
+                    }
+                    stack.push(bytes[pc..pc + len].to_vec());
+                    pc += len;
+                }
+                0x4c => {
+                    if pc >= bytes.len() {
+                        return Err(ScriptError::ScriptFailed("truncated pushdata1".into()));
+                    }
+                    let len = bytes[pc] as usize;
+                    pc += 1;
+                    if pc + len > bytes.len() {
+                        return Err(ScriptError::ScriptFailed("truncated pushdata1 body".into()));
+                    }
+                    stack.push(bytes[pc..pc + len].to_vec());
+                    pc += len;
+                }
+                0x00 => stack.push(Vec::new()),
+                0x61 => {}
+                0x69 => {
+                    let top = pop(stack)?;
+                    if !cast_to_bool(&top) {
+                        return Err(ScriptError::ScriptFailed("OP_VERIFY failed".into()));
+                    }
+                }
+                _ => return Err(ScriptError::InvalidOpcode),
+            }
+
+            if stack.len() > MAX_STACK_SIZE {
+                return Err(ScriptError::StackOverflow);
+            }
+        }
+
+        match stack.last() {
+            None => Err(ScriptError::ScriptFailed("empty stack".into())),
+            Some(top) if !cast_to_bool(top) => {
+                Err(ScriptError::ScriptFailed("top of stack is false".into()))
+            }
+            Some(_) => Ok(()),
+        }
+    }
 }
 
 // ── Helper fns ───────────────────────────────────────────────────────────────
@@ -793,6 +954,33 @@ fn pop(stack: &mut Stack) -> Result<Vec<u8>, ScriptError> {
 
 fn peek(stack: &Stack) -> Result<&Vec<u8>, ScriptError> {
     stack.last().ok_or(ScriptError::StackUnderflow)
+}
+
+fn parse_taproot_sig_and_hashtype(sig: &[u8]) -> Result<(&[u8], SighashType), ScriptError> {
+    match sig.len() {
+        64 => Ok((sig, SighashType::TaprootDefault)),
+        65 => {
+            let hash_type = sig[64] as u32;
+            if hash_type == 0 {
+                return Err(ScriptError::TaprootInvalidSighashType);
+            }
+            let parsed =
+                SighashType::from_u32(hash_type).ok_or(ScriptError::TaprootInvalidSighashType)?;
+            Ok((&sig[..64], parsed))
+        }
+        _ => Err(ScriptError::SigCheckFailed),
+    }
+}
+
+fn is_op_successx(op: u8) -> bool {
+    op == 0x50
+        || op == 0x62
+        || (0x7e..=0x81).contains(&op)
+        || (0x83..=0x86).contains(&op)
+        || (0x89..=0x8a).contains(&op)
+        || (0x8d..=0x8e).contains(&op)
+        || (0x95..=0x99).contains(&op)
+        || (0xbb..=0xfe).contains(&op)
 }
 
 #[cfg(test)]

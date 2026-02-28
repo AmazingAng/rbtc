@@ -248,11 +248,7 @@ fn verify_p2tr(ctx: &ScriptContext<'_>, output_key: &[u8; 32]) -> Result<(), Scr
     // Key path spend: single 64 or 65 byte signature
     if witness_without_annex.len() == 1 {
         let sig = &witness_without_annex[0];
-        let sighash_type = if sig.len() == 65 {
-            SighashType::from_u32(sig[64] as u32).ok_or(ScriptError::SigCheckFailed)?
-        } else {
-            SighashType::TaprootDefault
-        };
+        let (sig_bytes, sighash_type) = parse_taproot_sig_and_hashtype(sig)?;
         let hash = sighash_taproot(
             ctx.tx,
             ctx.input_index,
@@ -260,8 +256,9 @@ fn verify_p2tr(ctx: &ScriptContext<'_>, output_key: &[u8; 32]) -> Result<(), Scr
             sighash_type,
             None,
             annex,
+            0,
+            u32::MAX,
         );
-        let sig_bytes = if sig.len() == 65 { &sig[..64] } else { sig.as_slice() };
         return verify_schnorr(output_key, sig_bytes, &hash.0)
             .map_err(|_| ScriptError::SigCheckFailed);
     }
@@ -338,7 +335,7 @@ fn verify_p2tr(ctx: &ScriptContext<'_>, output_key: &[u8; 32]) -> Result<(), Scr
     let mut stack: Vec<Vec<u8>> = _inputs.to_vec();
 
     // Tapscript execution uses BIP342 rules
-    execute_tapscript(ctx, &tapscript, &mut stack, &leaf_hash.0)
+    execute_tapscript(ctx, &tapscript, &mut stack, &leaf_hash.0, annex)
 }
 
 /// Execute a tapscript (BIP342) – simplified, handles OP_CHECKSIGADD
@@ -347,106 +344,34 @@ fn execute_tapscript(
     script: &Script,
     stack: &mut Vec<Vec<u8>>,
     leaf_hash: &[u8; 32],
+    annex: Option<&[u8]>,
 ) -> Result<(), ScriptError> {
-    let bytes = script.as_bytes();
-    let mut pc = 0;
+    let engine = ScriptEngine::new(ctx.flags);
+    engine.execute_tapscript(
+        ctx.tx,
+        ctx.input_index,
+        ctx.all_prevouts,
+        script,
+        stack,
+        leaf_hash,
+        annex,
+    )
+}
 
-    while pc < bytes.len() {
-        let op = bytes[pc]; pc += 1;
-
-        match op {
-            // OP_CHECKSIGADD (BIP342)
-            0xba => {
-                if stack.len() < 3 { return Err(ScriptError::StackUnderflow); }
-                let pubkey = stack.pop().unwrap();
-                let n_bytes = stack.pop().unwrap();
-                let sig = stack.pop().unwrap();
-
-                let n = crate::engine::decode_script_int(&n_bytes, 8)?;
-
-                if sig.is_empty() {
-                    // empty sig: push n
-                    stack.push(crate::engine::encode_script_int(n));
-                    continue;
-                }
-
-                let sighash_type = if sig.len() == 65 {
-                    SighashType::from_u32(sig[64] as u32).ok_or(ScriptError::SigCheckFailed)?
-                } else {
-                    SighashType::TaprootDefault
-                };
-
-                let hash = sighash_taproot(
-                    ctx.tx,
-                    ctx.input_index,
-                    ctx.all_prevouts,
-                    sighash_type,
-                    Some(leaf_hash),
-                    None,
-                );
-
-                let sig_bytes = if sig.len() == 65 { &sig[..64] } else { &sig[..] };
-                let ok = verify_schnorr(&pubkey, sig_bytes, &hash.0).is_ok();
-                stack.push(crate::engine::encode_script_int(n + if ok { 1 } else { 0 }));
+fn parse_taproot_sig_and_hashtype(sig: &[u8]) -> Result<(&[u8], SighashType), ScriptError> {
+    match sig.len() {
+        64 => Ok((sig, SighashType::TaprootDefault)),
+        65 => {
+            let hash_type = sig[64] as u32;
+            if hash_type == 0 {
+                return Err(ScriptError::TaprootInvalidSighashType);
             }
-            // OP_CHECKSIG in tapscript
-            0xac => {
-                if stack.len() < 2 { return Err(ScriptError::StackUnderflow); }
-                let pubkey = stack.pop().unwrap();
-                let sig = stack.pop().unwrap();
-
-                if sig.is_empty() {
-                    stack.push(Vec::new());
-                    continue;
-                }
-
-                let sighash_type = if sig.len() == 65 {
-                    SighashType::from_u32(sig[64] as u32).ok_or(ScriptError::SigCheckFailed)?
-                } else {
-                    SighashType::TaprootDefault
-                };
-
-                let hash = sighash_taproot(
-                    ctx.tx,
-                    ctx.input_index,
-                    ctx.all_prevouts,
-                    sighash_type,
-                    Some(leaf_hash),
-                    None,
-                );
-
-                let sig_bytes = if sig.len() == 65 { &sig[..64] } else { &sig[..] };
-                let ok = verify_schnorr(&pubkey, sig_bytes, &hash.0).is_ok();
-                stack.push(if ok { vec![1u8] } else { Vec::new() });
-            }
-            // Data pushes
-            0x01..=0x4b => {
-                let len = op as usize;
-                if pc + len > bytes.len() { return Err(ScriptError::ScriptFailed("truncated".into())); }
-                stack.push(bytes[pc..pc+len].to_vec());
-                pc += len;
-            }
-            0x4c => {
-                if pc >= bytes.len() { return Err(ScriptError::ScriptFailed("truncated".into())); }
-                let len = bytes[pc] as usize; pc += 1;
-                stack.push(bytes[pc..pc+len].to_vec()); pc += len;
-            }
-            0x00 => stack.push(Vec::new()),
-            0x61 => {} // OP_NOP
-            0x69 => {
-                // OP_VERIFY
-                let top = stack.pop().ok_or(ScriptError::StackUnderflow)?;
-                if !crate::engine::cast_to_bool_pub(&top) {
-                    return Err(ScriptError::ScriptFailed("OP_VERIFY failed".into()));
-                }
-            }
-            _ => {
-                return Err(ScriptError::InvalidOpcode);
-            }
+            let parsed =
+                SighashType::from_u32(hash_type).ok_or(ScriptError::TaprootInvalidSighashType)?;
+            Ok((&sig[..64], parsed))
         }
+        _ => Err(ScriptError::SigCheckFailed),
     }
-
-    check_stack_true(stack)
 }
 
 fn check_stack_true(stack: &[Vec<u8>]) -> Result<(), ScriptError> {
@@ -581,6 +506,7 @@ fn is_push_only(script: &Script) -> bool {
 mod tests {
     use super::*;
     use serde::Deserialize;
+    use secp256k1::{Parity, Scalar, Secp256k1, XOnlyPublicKey};
     use rbtc_primitives::codec::Decodable;
     use rbtc_primitives::hash::Hash256;
     use rbtc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
@@ -1001,6 +927,151 @@ mod tests {
                     let got = verify_input(&ctx).expect_err(&case.name);
                     assert_eq!(got, expected, "case: {}", case.name);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn verify_input_taproot_vectors() {
+        #[derive(Deserialize)]
+        struct FixtureCase {
+            name: String,
+            mode: String,
+            output_key_hex: Option<String>,
+            internal_key_hex: Option<String>,
+            tapscript_hex: Option<String>,
+            witness_stack_hex: Option<Vec<String>>,
+            annex_hex: Option<String>,
+            sig_hex: Option<String>,
+            tamper_control_block: Option<bool>,
+            expected: String,
+        }
+
+        fn tapleaf_hash(script: &[u8], leaf_version: u8) -> [u8; 32] {
+            let mut leaf_data = vec![leaf_version];
+            if script.len() < 0xfd {
+                leaf_data.push(script.len() as u8);
+            } else {
+                leaf_data.push(0xfd);
+                leaf_data.extend_from_slice(&(script.len() as u16).to_le_bytes());
+            }
+            leaf_data.extend_from_slice(script);
+            tagged_hash(b"TapLeaf", &leaf_data).0
+        }
+
+        fn build_script_path_case(
+            internal_key_hex: &str,
+            tapscript_hex: &str,
+            witness_stack_hex: &[String],
+            annex_hex: Option<&str>,
+            tamper_control_block: bool,
+        ) -> (TxOut, Vec<Vec<u8>>) {
+            let internal_key_bytes = decode_hex(internal_key_hex);
+            let internal_arr: [u8; 32] = internal_key_bytes.try_into().expect("internal key length");
+            let tapscript = decode_hex(tapscript_hex);
+            let leaf_version = 0xc0u8;
+            let leaf = tapleaf_hash(&tapscript, leaf_version);
+
+            let secp = Secp256k1::verification_only();
+            let internal =
+                XOnlyPublicKey::from_byte_array(internal_arr).expect("valid internal xonly");
+            let mut tweak_data = Vec::with_capacity(64);
+            tweak_data.extend_from_slice(&internal_arr);
+            tweak_data.extend_from_slice(&leaf);
+            let tweak = tagged_hash(b"TapTweak", &tweak_data);
+            let scalar = Scalar::from_be_bytes(tweak.0).expect("valid tweak scalar");
+            let (output_key, parity) = internal.add_tweak(&secp, &scalar).expect("tweak");
+            let output_key_bytes = output_key.serialize();
+
+            let mut control_block = vec![leaf_version | if parity == Parity::Odd { 1 } else { 0 }];
+            control_block.extend_from_slice(&internal_arr);
+            if tamper_control_block {
+                control_block[1] ^= 0x01;
+            }
+
+            let mut spk = vec![0x51, 0x20];
+            spk.extend_from_slice(&output_key_bytes);
+            let prevout = TxOut {
+                value: 1000,
+                script_pubkey: Script::from_bytes(spk),
+            };
+
+            let mut witness: Vec<Vec<u8>> = witness_stack_hex.iter().map(|h| decode_hex(h)).collect();
+            witness.push(tapscript);
+            witness.push(control_block);
+            if let Some(a) = annex_hex {
+                witness.push(decode_hex(a));
+            }
+            (prevout, witness)
+        }
+
+        let fixture_text = include_str!("../tests/fixtures/taproot_vectors.json");
+        let cases: Vec<FixtureCase> = serde_json::from_str(fixture_text).expect("parse taproot fixture");
+        let flags = ScriptFlags {
+            verify_p2sh: true,
+            verify_dersig: true,
+            verify_witness: true,
+            verify_nulldummy: true,
+            verify_cleanstack: false,
+            verify_checklocktimeverify: true,
+            verify_checksequenceverify: true,
+            verify_taproot: true,
+        };
+
+        for case in cases {
+            let (prevout, witness) = match case.mode.as_str() {
+                "key_path" => {
+                    let output_key = decode_hex(case.output_key_hex.as_deref().expect("output key"));
+                    let mut spk = vec![0x51, 0x20];
+                    spk.extend_from_slice(&output_key);
+                    let prevout = TxOut {
+                        value: 1000,
+                        script_pubkey: Script::from_bytes(spk),
+                    };
+                    let witness = vec![decode_hex(case.sig_hex.as_deref().expect("sig"))];
+                    (prevout, witness)
+                }
+                "script_path" => build_script_path_case(
+                    case.internal_key_hex.as_deref().expect("internal key"),
+                    case.tapscript_hex.as_deref().expect("tapscript"),
+                    case.witness_stack_hex.as_deref().unwrap_or(&[]),
+                    case.annex_hex.as_deref(),
+                    case.tamper_control_block.unwrap_or(false),
+                ),
+                other => panic!("unknown mode in fixture: {other}"),
+            };
+
+            let tx = Transaction {
+                version: 2,
+                inputs: vec![TxIn {
+                    previous_output: OutPoint { txid: Hash256::ZERO, vout: 0 },
+                    script_sig: Script::new(),
+                    sequence: 0xffff_ffff,
+                    witness,
+                }],
+                outputs: vec![],
+                lock_time: 0,
+            };
+            let all_prevouts = [prevout.clone()];
+            let ctx = ScriptContext {
+                tx: &tx,
+                input_index: 0,
+                prevout: &prevout,
+                flags,
+                all_prevouts: &all_prevouts,
+            };
+
+            match case.expected.as_str() {
+                "ok" => assert!(verify_input(&ctx).is_ok(), "case failed: {}", case.name),
+                "TaprootInvalidSighashType" => {
+                    let got = verify_input(&ctx).expect_err(&case.name);
+                    assert_eq!(got, ScriptError::TaprootInvalidSighashType, "case: {}", case.name);
+                }
+                "TaprootAny" => {
+                    let got = verify_input(&ctx).expect_err(&case.name);
+                    assert!(matches!(got, ScriptError::Taproot(_)), "case {} got {:?}", case.name, got);
+                }
+                other => panic!("unknown expected value in taproot fixture: {other}"),
             }
         }
     }

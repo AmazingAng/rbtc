@@ -1,0 +1,42 @@
+[
+  {
+    "name": "taproot_keypath_explicit_default_sighash_rejected",
+    "mode": "key_path",
+    "output_key_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+    "sig_hex": "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "expected": "TaprootInvalidSighashType"
+  },
+  {
+    "name": "taproot_keypath_unknown_sighash_rejected",
+    "mode": "key_path",
+    "output_key_hex": "2222222222222222222222222222222222222222222222222222222222222222",
+    "sig_hex": "01010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101ff",
+    "expected": "TaprootInvalidSighashType"
+  },
+  {
+    "name": "taproot_scriptpath_opsuccess_ok",
+    "mode": "script_path",
+    "internal_key_hex": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+    "tapscript_hex": "50",
+    "witness_stack_hex": ["00"],
+    "expected": "ok"
+  },
+  {
+    "name": "taproot_scriptpath_annex_opsuccess_ok",
+    "mode": "script_path",
+    "internal_key_hex": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+    "tapscript_hex": "50",
+    "witness_stack_hex": [],
+    "annex_hex": "5001",
+    "expected": "ok"
+  },
+  {
+    "name": "taproot_scriptpath_controlblock_tampered",
+    "mode": "script_path",
+    "internal_key_hex": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+    "tapscript_hex": "50",
+    "witness_stack_hex": [],
+    "tamper_control_block": true,
+    "expected": "TaprootAny"
+  }
+]
