@@ -321,7 +321,11 @@ pub fn sighash_taproot(
     code_separator_pos: u32,
 ) -> Hash256 {
     let sighash_byte = sighash_type as u8;
-    let base = sighash_byte & 0x1f;
+    // BIP341: 0x00 (TaprootDefault) has SIGHASH_ALL semantics.
+    let mut base = sighash_byte & 0x1f;
+    if base == 0 {
+        base = 1;
+    }
     let anyone_can_pay = sighash_byte & 0x80 != 0;
 
     let mut buf = Vec::new();
@@ -732,5 +736,48 @@ mod tests {
 
         let expected = tagged_hash(b"TapSighash", &msg);
         assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn sighash_taproot_default_commits_outputs() {
+        let tx1 = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: Hash256([9; 32]), vout: 0 },
+                script_sig: Script::new(),
+                sequence: 0xabcdef01,
+                witness: vec![],
+            }],
+            outputs: vec![
+                TxOut { value: 100, script_pubkey: Script::from_bytes(vec![0x51]) },
+                TxOut { value: 200, script_pubkey: Script::from_bytes(vec![0x51, 0x51]) },
+            ],
+            lock_time: 42,
+        };
+        let mut tx2 = tx1.clone();
+        tx2.outputs[1].value = 201;
+        let prevouts = vec![TxOut { value: 12345, script_pubkey: Script::from_bytes(vec![0x51, 0x20]) }];
+
+        let h1 = sighash_taproot(
+            &tx1,
+            0,
+            &prevouts,
+            SighashType::TaprootDefault,
+            None,
+            None,
+            0,
+            u32::MAX,
+        );
+        let h2 = sighash_taproot(
+            &tx2,
+            0,
+            &prevouts,
+            SighashType::TaprootDefault,
+            None,
+            None,
+            0,
+            u32::MAX,
+        );
+        assert_ne!(h1, h2);
     }
 }
