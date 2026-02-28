@@ -108,6 +108,49 @@ impl CachedUtxoSet {
         }
     }
 
+    /// Like `connect_block` but also returns per-tx undo data (spent UTXOs).
+    pub fn connect_block_with_undo(
+        &mut self,
+        txids: &[TxId],
+        txs: &[Transaction],
+        height: u32,
+    ) -> Vec<Vec<(OutPoint, Utxo)>> {
+        let mut undo: Vec<Vec<(OutPoint, Utxo)>> = Vec::with_capacity(txs.len());
+        for (txid, tx) in txids.iter().zip(txs.iter()) {
+            let mut spent = Vec::new();
+            if !tx.is_coinbase() {
+                for input in &tx.inputs {
+                    let outpoint = input.previous_output.clone();
+                    if let Some(utxo) = self.get_utxo(&outpoint) {
+                        spent.push((outpoint.clone(), utxo));
+                    }
+                    // Mark as spent in dirty and remove stale hot entry.
+                    self.dirty.insert(outpoint.clone(), None);
+                    if self.hot.remove(&outpoint).is_some() {
+                        self.hot_bytes = self.hot_bytes.saturating_sub(BYTES_PER_UTXO);
+                    }
+                }
+            }
+            undo.push(spent);
+            let is_coinbase = tx.is_coinbase();
+            for (vout, txout) in tx.outputs.iter().enumerate() {
+                let outpoint = OutPoint {
+                    txid: *txid,
+                    vout: vout as u32,
+                };
+                self.dirty.insert(
+                    outpoint,
+                    Some(Utxo {
+                        txout: txout.clone(),
+                        is_coinbase,
+                        height,
+                    }),
+                );
+            }
+        }
+        undo
+    }
+
     /// Write all dirty entries into `batch` (which the caller will atomically commit)
     /// and promote live entries to the hot cache.  Clears the dirty layer.
     pub fn flush_dirty(&mut self, batch: &mut WriteBatch) {

@@ -86,9 +86,8 @@ pub struct Node {
     /// phase. Maps height → block hash. Empty until all headers are downloaded.
     canonical_header_chain: Vec<Hash256>,
     /// Write-back UTXO cache (hot + dirty layers with RocksDB fallback).
-    /// Used by `verify_block` instead of the full in-memory `chain.utxos` when
-    /// `--utxo-cache > 0`.  Always present; used unconditionally to keep the
-    /// dirty layer in sync with each connected block.
+    /// Used unconditionally for verification, mempool admission and block
+    /// connection state transitions.
     utxo_cache: CachedUtxoSet,
     peer_manager: PeerManager,
     node_event_rx: mpsc::UnboundedReceiver<NodeEvent>,
@@ -193,24 +192,14 @@ impl Node {
         }
 
         // Build UTXO cache based on --utxo-cache flag.
-        // When 0 (unlimited), pre-populate from RocksDB (existing behaviour).
-        // When >0, start empty and rely on dirty-layer + RocksDB fallback.
+        // Core-style: always lazy-load from RocksDB on misses (no full preload).
         let max_bytes = if args.utxo_cache == 0 {
             None // unlimited
         } else {
             Some(args.utxo_cache * 1_000_000)
         };
-        let mut utxo_cache = CachedUtxoSet::new(Arc::clone(&db), max_bytes);
-        if max_bytes.is_none() {
-            // Pre-load all UTXOs into the hot cache to match pre-Phase-8 behaviour.
-            utxo_cache.load_all();
-            info!("utxo_cache: pre-loaded {} entries", utxo_cache.hot_len());
-        } else {
-            info!(
-                "utxo_cache: lazy mode, limit={} MB",
-                args.utxo_cache
-            );
-        }
+        let utxo_cache = CachedUtxoSet::new(Arc::clone(&db), max_bytes);
+        info!("utxo_cache: lazy mode, limit={} MB (0 = unlimited)", args.utxo_cache);
 
         let assumevalid_hash = match args.assumevalid.as_ref() {
             Some(h) => Some(Hash256::from_hex(h).map_err(|_| anyhow!("invalid --assumevalid hash"))?),
@@ -1454,14 +1443,12 @@ impl Node {
                     })
                     .collect();
 
-                // Connect block to in-memory chain state and collect undo data
-                let undo = {
+                // Update UTXO cache and collect per-tx undo.
+                let undo = self
+                    .utxo_cache
+                    .connect_block_with_undo(&txids, &block.transactions, height);
+                {
                     let mut chain = self.chain.write().await;
-                    let undo = chain.utxos.connect_block_with_undo(
-                        &txids,
-                        &block.transactions,
-                        height,
-                    );
                     // Mark block as in-chain in the index
                     if let Some(bi) = chain.block_index.get_mut(&block_hash) {
                         bi.status = BlockStatus::InChain;
@@ -1481,8 +1468,7 @@ impl Node {
                     if new_work > cur_work {
                         chain.best_tip = Some(block_hash);
                     }
-                    undo
-                };
+                }
 
                 // Convert undo data to storage format and persist
                 let undo_stored: Vec<Vec<(rbtc_primitives::transaction::OutPoint, StoredUtxo)>> =
@@ -1504,11 +1490,6 @@ impl Node {
                                 .collect()
                         })
                         .collect();
-
-                // Update the UTXO cache dirty layer to reflect this block's changes.
-                // flush_dirty() will write these to the RocksDB WriteBatch below,
-                // replacing the previous `utxo_store.connect_block_into_batch()` call.
-                self.utxo_cache.connect_block(&txids, &block.transactions, height);
 
                 // Persist everything to RocksDB in one atomic WriteBatch:
                 // block metadata, UTXO changes (via cache flush), and chain tip.
@@ -1665,11 +1646,10 @@ impl Node {
             sha256d(&buf)
         };
 
-        let chain = self.chain.read().await;
-        let height = chain.height();
+        let height = self.chain.read().await.height();
         let mut mp = self.mempool.write().await;
 
-        match mp.accept_tx(tx, &chain.utxos, height) {
+        match mp.accept_tx(tx, &self.utxo_cache, height) {
             Ok(accepted_txid) => {
                 info!(
                     "mempool: accepted tx {} from peer {peer_id}",
@@ -1680,7 +1660,6 @@ impl Node {
                     .map(|e| e.fee_rate * 1000)
                     .unwrap_or(0);
                 drop(mp);
-                drop(chain);
                 // Announce to peers whose feefilter allows this tx
                 let inv = vec![Inventory { inv_type: InvType::WitnessTx, hash: txid }];
                 self.peer_manager.broadcast_tx_inv(NetworkMessage::Inv(inv), fee_rate_sat_kvb);
@@ -2016,13 +1995,13 @@ impl Node {
     async fn log_stats(&self) {
         let chain = self.chain.read().await;
         let height = chain.height();
-        let utxos = chain.utxos.len();
         drop(chain);
+        let utxos_hot = self.utxo_cache.hot_len();
         let peers = self.peer_manager.peer_count();
         let best_peer_height = self.peer_manager.best_peer_height();
         let mp_size = self.mempool.read().await.len();
         info!(
-            "height={height} peers={peers} best_peer={best_peer_height} utxos={utxos} mempool={mp_size} assumevalid_skipped_blocks={} assumevalid_saved_verify_ms={} assumevalid_last_height={:?}",
+            "height={height} peers={peers} best_peer={best_peer_height} utxo_hot={utxos_hot} mempool={mp_size} assumevalid_skipped_blocks={} assumevalid_saved_verify_ms={} assumevalid_last_height={:?}",
             self.assumevalid_skipped_blocks,
             self.assumevalid_saved_verify_ms,
             self.assumevalid_last_height
@@ -2231,25 +2210,10 @@ fn load_chain_state(chain: &mut ChainState, db: &Database) -> Result<()> {
         chain.insert_block_index(hash, index);
     }
 
-    // Load UTXOs from RocksDB into the in-memory UTXO set
-    let utxos = utxo_store.iter_all();
-    let utxo_count = utxos.len();
-    for (outpoint, stored) in utxos {
-        use rbtc_consensus::utxo::Utxo;
-        chain.utxos.insert(
-            outpoint,
-            Utxo {
-                txout: stored.to_txout(),
-                is_coinbase: stored.is_coinbase,
-                height: stored.height,
-            },
-        );
-    }
-
-    info!(
-        "chain rebuilt: height={} utxos={utxo_count}",
-        chain.height()
-    );
+    // Core-style: do not mirror all UTXOs into a second in-memory structure.
+    // `CachedUtxoSet` performs lazy lookup with RocksDB fallback.
+    let _ = utxo_store;
+    info!("chain rebuilt: height={} (utxos lazy-loaded)", chain.height());
     Ok(())
 }
 

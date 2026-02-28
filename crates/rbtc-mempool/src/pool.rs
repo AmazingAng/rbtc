@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use rbtc_consensus::{
     tx_verify::verify_transaction,
-    utxo::UtxoSet,
+    utxo::{UtxoLookup, UtxoSet},
 };
 use rbtc_primitives::{
     hash::TxId,
@@ -54,7 +54,7 @@ impl Mempool {
     pub fn accept_tx(
         &mut self,
         tx: Transaction,
-        chain_utxos: &UtxoSet,
+        chain_utxos: &impl UtxoLookup,
         chain_height: u32,
     ) -> Result<TxId, MempoolError> {
         // Compute txid (legacy serialisation for the witness-stripped hash)
@@ -101,8 +101,8 @@ impl Mempool {
         let mut input_view = UtxoSet::new();
         for input in &tx.inputs {
             let op = &input.previous_output;
-            if let Some(u) = chain_utxos.get(op) {
-                input_view.insert(op.clone(), u.clone());
+            if let Some(u) = chain_utxos.get_utxo(op) {
+                input_view.insert(op.clone(), u);
             } else if let Some(u) = self.mempool_utxos.get(op) {
                 input_view.insert(op.clone(), u.clone());
             } else {
@@ -349,7 +349,7 @@ mod tests {
     };
     use rbtc_consensus::utxo::Utxo;
 
-    fn simple_coinbase_tx(txid: TxId) -> Transaction {
+    fn simple_coinbase_tx() -> Transaction {
         Transaction {
             version: 1,
             inputs: vec![TxIn {
@@ -396,7 +396,7 @@ mod tests {
     #[test]
     fn accept_coinbase_rejected() {
         let mut mp = Mempool::new();
-        let tx = simple_coinbase_tx(Hash256([1; 32]));
+        let tx = simple_coinbase_tx();
         let chain = UtxoSet::new();
         assert!(matches!(mp.accept_tx(tx, &chain, 200), Err(MempoolError::Coinbase)));
     }

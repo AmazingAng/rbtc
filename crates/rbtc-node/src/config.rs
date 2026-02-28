@@ -76,11 +76,9 @@ pub struct Args {
     pub mempool_size: u64,
 
     /// UTXO hot-cache size in megabytes.
-    /// 0 (default) = unlimited: all UTXOs are loaded into memory at startup,
-    /// matching the pre-Phase-8 behaviour.
-    /// When set to a positive value, only recently-used UTXOs are kept in memory;
-    /// older entries are evicted and re-fetched from RocksDB on demand.
-    #[arg(long, value_name = "MB", default_value = "0")]
+    /// Core-style lazy cache: misses always fall back to RocksDB.
+    /// 0 = unlimited in-memory hot cache (not recommended on constrained hosts).
+    #[arg(long, value_name = "MB", default_value = "2048")]
     pub utxo_cache: u64,
 
     /// Script precheck worker threads (0 = use rayon default).
