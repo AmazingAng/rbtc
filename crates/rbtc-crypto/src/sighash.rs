@@ -382,12 +382,6 @@ pub fn sighash_taproot(
         }
         let h = sha256(&data);
         buf.extend_from_slice(&h.0);
-    } else if base == 3 && input_index < tx.outputs.len() {
-        // hash_outputs (SINGLE)
-        let mut data = Vec::new();
-        tx.outputs[input_index].encode(&mut data).unwrap();
-        let h = sha256(&data);
-        buf.extend_from_slice(&h.0);
     }
 
     // spend_type
@@ -418,6 +412,15 @@ pub fn sighash_taproot(
         buf.extend_from_slice(&h.finalize());
     }
 
+    if base == 3 && input_index < tx.outputs.len() {
+        // BIP341: for SIGHASH_SINGLE, hash of the matching output is committed
+        // after spend_type/input/annex data.
+        let mut data = Vec::new();
+        tx.outputs[input_index].encode(&mut data).unwrap();
+        let h = sha256(&data);
+        buf.extend_from_slice(&h.0);
+    }
+
     if let Some(lh) = leaf_hash {
         buf.extend_from_slice(lh);
         buf.push(key_version);
@@ -430,8 +433,23 @@ pub fn sighash_taproot(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sig::verify_schnorr;
     use rbtc_primitives::transaction::{OutPoint, TxIn, TxOut};
     use rbtc_primitives::hash::Hash256;
+    use rbtc_primitives::codec::Decodable;
+    use std::io::Cursor;
+
+    fn decode_hex(s: &str) -> Vec<u8> {
+        assert_eq!(s.len() % 2, 0, "hex string must have even length");
+        let mut out = Vec::with_capacity(s.len() / 2);
+        let bytes = s.as_bytes();
+        for i in (0..bytes.len()).step_by(2) {
+            let hi = (bytes[i] as char).to_digit(16).expect("invalid hex") as u8;
+            let lo = (bytes[i + 1] as char).to_digit(16).expect("invalid hex") as u8;
+            out.push((hi << 4) | lo);
+        }
+        out
+    }
 
     fn sample_tx() -> Transaction {
         Transaction {
@@ -779,5 +797,54 @@ mod tests {
             u32::MAX,
         );
         assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn sighash_taproot_single_anyonecanpay_mainnet_776550_vin1() {
+        // Real mainnet tx from block 776550 where vin=1 uses 0x83
+        // (SIGHASH_SINGLE|ANYONECANPAY). This must verify under Core ordering.
+        let tx_hex = "020000000001033521f3540acb413a3bb15e0e49749b31376f242a5c2cc653d5f5f0e51378269e0000000000ffffffff4b7f67adceab9bdc83fe639d2c96c6d43c483590789644f951d3fb4ee563ad190000000000ffffffff3521f3540acb413a3bb15e0e49749b31376f242a5c2cc653d5f5f0e51378269e0100000000ffffffff031027000000000000225120bb7e66771403f65424a570b6a4cdb3528f964204a2b72744d82f1002bfb1598b10270000000000002251208102001190c6aad9a015dff1540dc9a7bda31613b8ab05a58268c4bff53fae821027000000000000225120bb7e66771403f65424a570b6a4cdb3528f964204a2b72744d82f1002bfb1598b01408b516fc211670bc9ce5ecd128bc7b96974a4b88f7f035977edfade3f6ea2fef7aabfbe7a9022f9a2d0de6203edccfb414b457f4b7275cd9b242f72c8d95ef4c201410d41273b5b93ee77aaf41b3b558924e4cc545c81894cbf81684a89f09c1355f78de33d254d93d6109c9c8bb52f76521a702ea34d9802ed4e9944ee11395b69c7830140a1358aac56f96b1846b81de498e92128f1302bc5a7d9e486a71e3fd6792ad671dd22abd14421a738f631882f3491c2f66b5bd27495413e87df9e0f5bcdcf31cd00000000";
+        let tx = Transaction::decode(&mut Cursor::new(decode_hex(tx_hex))).unwrap();
+
+        let prevouts = vec![
+            TxOut {
+                value: 20_000,
+                script_pubkey: Script::from_bytes(
+                    decode_hex("5120bb7e66771403f65424a570b6a4cdb3528f964204a2b72744d82f1002bfb1598b"),
+                ),
+            },
+            TxOut {
+                value: 10_000,
+                script_pubkey: Script::from_bytes(
+                    decode_hex("51208102001190c6aad9a015dff1540dc9a7bda31613b8ab05a58268c4bff53fae82"),
+                ),
+            },
+            TxOut {
+                value: 5_928,
+                script_pubkey: Script::from_bytes(
+                    decode_hex("5120bb7e66771403f65424a570b6a4cdb3528f964204a2b72744d82f1002bfb1598b"),
+                ),
+            },
+        ];
+
+        let sig_with_hashtype = &tx.inputs[1].witness[0];
+        assert_eq!(sig_with_hashtype.len(), 65);
+        assert_eq!(sig_with_hashtype[64], 0x83);
+        let sig = &sig_with_hashtype[..64];
+
+        let h = sighash_taproot(
+            &tx,
+            1,
+            &prevouts,
+            SighashType::SingleAnyoneCanPay,
+            None,
+            None,
+            0,
+            u32::MAX,
+        );
+
+        // x-only output key from prevout scriptPubKey (OP_1 0x20 <32-byte key>)
+        let output_key = decode_hex("8102001190c6aad9a015dff1540dc9a7bda31613b8ab05a58268c4bff53fae82");
+        assert!(verify_schnorr(&output_key, sig, &h.0).is_ok());
     }
 }
