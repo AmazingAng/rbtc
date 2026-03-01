@@ -2300,8 +2300,40 @@ fn reindex_chainstate(db: &Database, network: rbtc_primitives::network::Network)
     load_chain_state(&mut in_memory, db)?;
 
     let chainstore_tip = chain_store.get_best_block()?;
-    let inmem_tip = in_memory.best_hash();
-    let best_tip = match (chainstore_tip, inmem_tip) {
+    // Candidate header tip from the full block index by maximum chainwork
+    // (excluding explicitly invalid blocks).
+    let header_tip = in_memory
+        .block_index
+        .iter()
+        .filter(|(_, bi)| bi.status != BlockStatus::Invalid)
+        .max_by_key(|(_, bi)| bi.chainwork)
+        .map(|(hash, _)| *hash);
+
+    // Reindex chainstate requires blocks (not just headers). Walk backwards from
+    // the best header tip until we find a hash with stored block data.
+    let data_backed_tip = if let Some(mut cursor) = header_tip {
+        let mut walked = 0u32;
+        loop {
+            let Some(bi) = in_memory.block_index.get(&cursor) else { break None };
+            if bi.height == 0 || block_store.get_block(&cursor)?.is_some() {
+                if walked > 0 {
+                    warn!(
+                        "reindex-chainstate: best header tip lacked block data for {} ancestors; using height {} hash {}",
+                        walked,
+                        bi.height,
+                        cursor.to_hex()
+                    );
+                }
+                break Some(cursor);
+            }
+            walked = walked.saturating_add(1);
+            cursor = bi.header.prev_block;
+        }
+    } else {
+        None
+    };
+
+    let best_tip = match (chainstore_tip, data_backed_tip) {
         (Some(cs), Some(im)) => {
             let cs_work = in_memory
                 .block_index
@@ -2332,6 +2364,14 @@ fn reindex_chainstate(db: &Database, network: rbtc_primitives::network::Network)
         (None, Some(im)) => im,
         (None, None) => return Err(anyhow!("reindex-chainstate: no best tip found")),
     };
+    if let Some(bi) = in_memory.block_index.get(&best_tip) {
+        info!(
+            "reindex-chainstate: selected rebuild tip={} height={} chainwork={}",
+            best_tip.to_hex(),
+            bi.height,
+            bi.chainwork
+        );
+    }
 
     let mut ordered_chain: Vec<Hash256> = Vec::new();
     let mut cursor = best_tip;
