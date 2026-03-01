@@ -11,6 +11,24 @@ use rbtc_crypto::{
 
 use crate::engine::{ScriptEngine, ScriptError, ScriptFlags, SigVersion};
 
+fn push_compact_size(dst: &mut Vec<u8>, n: usize) {
+    match n {
+        0..=0xfc => dst.push(n as u8),
+        0xfd..=0xffff => {
+            dst.push(0xfd);
+            dst.extend_from_slice(&(n as u16).to_le_bytes());
+        }
+        0x1_0000..=0xffff_ffff => {
+            dst.push(0xfe);
+            dst.extend_from_slice(&(n as u32).to_le_bytes());
+        }
+        _ => {
+            dst.push(0xff);
+            dst.extend_from_slice(&(n as u64).to_le_bytes());
+        }
+    }
+}
+
 /// Context for script verification
 pub struct ScriptContext<'a> {
     pub tx: &'a Transaction,
@@ -280,14 +298,7 @@ fn verify_p2tr(ctx: &ScriptContext<'_>, output_key: &[u8; 32]) -> Result<(), Scr
     // Compute leaf hash: tagged_hash("TapLeaf", version || compact_script)
     let leaf_version = control_block[0] & 0xfe;
     let mut leaf_data = vec![leaf_version];
-    // varint-encode script length
-    let script_len = script_bytes.len();
-    if script_len < 0xfd {
-        leaf_data.push(script_len as u8);
-    } else {
-        leaf_data.push(0xfd);
-        leaf_data.extend_from_slice(&(script_len as u16).to_le_bytes());
-    }
+    push_compact_size(&mut leaf_data, script_bytes.len());
     leaf_data.extend_from_slice(script_bytes);
     let leaf_hash = tagged_hash(b"TapLeaf", &leaf_data);
 
@@ -956,12 +967,7 @@ mod tests {
 
         fn tapleaf_hash(script: &[u8], leaf_version: u8) -> [u8; 32] {
             let mut leaf_data = vec![leaf_version];
-            if script.len() < 0xfd {
-                leaf_data.push(script.len() as u8);
-            } else {
-                leaf_data.push(0xfd);
-                leaf_data.extend_from_slice(&(script.len() as u16).to_le_bytes());
-            }
+            push_compact_size(&mut leaf_data, script.len());
             leaf_data.extend_from_slice(script);
             tagged_hash(b"TapLeaf", &leaf_data).0
         }
@@ -1199,5 +1205,22 @@ mod tests {
             all_prevouts: &all_prevouts,
         };
         assert!(verify_input(&ctx).is_ok());
+    }
+
+    #[test]
+    fn tapleaf_hash_large_script_uses_full_compact_size() {
+        let script = vec![0x51; 104_169];
+        let mut leaf_data = vec![0xc0];
+        push_compact_size(&mut leaf_data, script.len());
+        leaf_data.extend_from_slice(&script);
+        let good = tagged_hash(b"TapLeaf", &leaf_data);
+
+        // Old buggy path encoded length with 0xfd + u16 and truncated for values > 0xffff.
+        let mut old_leaf_data = vec![0xc0, 0xfd];
+        old_leaf_data.extend_from_slice(&(script.len() as u16).to_le_bytes());
+        old_leaf_data.extend_from_slice(&script);
+        let old = tagged_hash(b"TapLeaf", &old_leaf_data);
+
+        assert_ne!(good, old);
     }
 }
