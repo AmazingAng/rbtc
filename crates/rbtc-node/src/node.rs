@@ -2331,18 +2331,38 @@ fn reindex_chainstate(db: &Database, network: rbtc_primitives::network::Network)
     }
 
     for hash in ordered_chain {
-        let stored_idx = block_store
-            .get_index(&hash)?
-            .ok_or_else(|| anyhow!("reindex-chainstate: missing stored index {}", hash.to_hex()))?;
+        // Some older databases may not persist a genesis index entry. Fall back to the
+        // in-memory index rebuilt from headers so reindex-chainstate can still proceed.
+        let (height, chainwork) = if let Some(stored_idx) = block_store.get_index(&hash)? {
+            (stored_idx.height, stored_idx.chainwork())
+        } else {
+            let bi = in_memory
+                .block_index
+                .get(&hash)
+                .ok_or_else(|| anyhow!("reindex-chainstate: missing block index {}", hash.to_hex()))?;
+            if bi.height == 0 {
+                warn!(
+                    "reindex-chainstate: missing stored genesis index {}, using header index fallback",
+                    hash.to_hex()
+                );
+            } else {
+                return Err(anyhow!(
+                    "reindex-chainstate: missing stored index {} at height {}",
+                    hash.to_hex(),
+                    bi.height
+                ));
+            }
+            (bi.height, bi.chainwork)
+        };
 
         let Some(block) = block_store.get_block(&hash)? else {
-            if stored_idx.height == 0 {
+            if height == 0 {
                 // Genesis block data may be absent; its coinbase output is unspendable anyway.
                 continue;
             }
             return Err(anyhow!(
                 "reindex-chainstate: missing block data at height {} hash {}",
-                stored_idx.height,
+                height,
                 hash.to_hex()
             ));
         };
@@ -2357,9 +2377,9 @@ fn reindex_chainstate(db: &Database, network: rbtc_primitives::network::Network)
             })
             .collect();
         let mut batch = db.new_batch();
-        utxo_store.connect_block_into_batch(&mut batch, &txids, &block.transactions, stored_idx.height)?;
-        chain_store.update_tip_batch(&mut batch, &hash, stored_idx.height, stored_idx.chainwork())?;
-        chain_store.update_indexed_height_batch(&mut batch, stored_idx.height)?;
+        utxo_store.connect_block_into_batch(&mut batch, &txids, &block.transactions, height)?;
+        chain_store.update_tip_batch(&mut batch, &hash, height, chainwork)?;
+        chain_store.update_indexed_height_batch(&mut batch, height)?;
         db.write_batch(batch)?;
     }
 
