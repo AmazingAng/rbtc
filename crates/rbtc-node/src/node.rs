@@ -2299,10 +2299,39 @@ fn reindex_chainstate(db: &Database, network: rbtc_primitives::network::Network)
     let mut in_memory = ChainState::new(network);
     load_chain_state(&mut in_memory, db)?;
 
-    let best_tip = chain_store
-        .get_best_block()?
-        .or_else(|| in_memory.best_hash())
-        .ok_or_else(|| anyhow!("reindex-chainstate: no best tip found"))?;
+    let chainstore_tip = chain_store.get_best_block()?;
+    let inmem_tip = in_memory.best_hash();
+    let best_tip = match (chainstore_tip, inmem_tip) {
+        (Some(cs), Some(im)) => {
+            let cs_work = in_memory
+                .block_index
+                .get(&cs)
+                .map(|bi| bi.chainwork)
+                .unwrap_or(0);
+            let im_work = in_memory
+                .block_index
+                .get(&im)
+                .map(|bi| bi.chainwork)
+                .unwrap_or(0);
+            if im_work >= cs_work {
+                if im != cs {
+                    warn!(
+                        "reindex-chainstate: chainstore tip {} (work={}) is behind index tip {} (work={}), using index tip",
+                        cs.to_hex(),
+                        cs_work,
+                        im.to_hex(),
+                        im_work
+                    );
+                }
+                im
+            } else {
+                cs
+            }
+        }
+        (Some(cs), None) => cs,
+        (None, Some(im)) => im,
+        (None, None) => return Err(anyhow!("reindex-chainstate: no best tip found")),
+    };
 
     let mut ordered_chain: Vec<Hash256> = Vec::new();
     let mut cursor = best_tip;
