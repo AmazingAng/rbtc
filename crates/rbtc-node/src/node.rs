@@ -2370,7 +2370,7 @@ fn reindex_chainstate(db: &Database, network: rbtc_primitives::network::Network)
 
 fn load_chain_state(chain: &mut ChainState, db: &Database) -> Result<()> {
     let block_store = BlockStore::new(db);
-    let utxo_store = UtxoStore::new(db);
+    let chain_store = ChainStore::new(db);
 
     // Load all stored block indices
     let mut indices = block_store.iter_all_indices();
@@ -2385,22 +2385,108 @@ fn load_chain_state(chain: &mut ChainState, db: &Database) -> Result<()> {
     info!("rebuilding block index from {count} stored entries");
 
     for (hash, stored) in indices {
-        let status = BlockStatus::from_u8(stored.status);
         let chainwork = stored.chainwork();
         let index = BlockIndex {
             hash,
             header: stored.header,
             height: stored.height,
             chainwork,
-            status,
+            status: BlockStatus::from_u8(stored.status),
         };
-        chain.insert_block_index(hash, index);
+        chain.block_index.insert(hash, index);
     }
 
-    // Core-style: do not mirror all UTXOs into a second in-memory structure.
-    // `CachedUtxoSet` performs lazy lookup with RocksDB fallback.
-    let _ = utxo_store;
-    info!("chain rebuilt: height={} (utxos lazy-loaded)", chain.height());
+    // Rebuild active chain from persisted chainstate tip (best_block), which is
+    // updated atomically with UTXO writes. This avoids trusting possibly stale
+    // per-block InChain flags after interrupted writes.
+    let best_block = chain_store.get_best_block()?;
+    let best_height = chain_store.get_best_height()?;
+    if let Some(tip) = best_block {
+        let mut path_rev: Vec<Hash256> = Vec::new();
+        let mut cursor = tip;
+        loop {
+            let bi = chain
+                .block_index
+                .get(&cursor)
+                .ok_or_else(|| anyhow!("best_block {} missing from block index", cursor.to_hex()))?;
+            path_rev.push(cursor);
+            if bi.height == 0 {
+                break;
+            }
+            cursor = bi.header.prev_block;
+        }
+        path_rev.reverse();
+
+        chain.active_chain.clear();
+        chain.active_chain.resize(path_rev.len(), Hash256::ZERO);
+        for hash in &path_rev {
+            let h = chain
+                .block_index
+                .get(hash)
+                .map(|bi| bi.height as usize)
+                .ok_or_else(|| anyhow!("missing block index while rebuilding chain {}", hash.to_hex()))?;
+            if h >= chain.active_chain.len() {
+                chain.active_chain.resize(h + 1, Hash256::ZERO);
+            }
+            chain.active_chain[h] = *hash;
+        }
+        chain.best_tip = Some(tip);
+
+        let in_chain: std::collections::HashSet<Hash256> = path_rev.iter().copied().collect();
+        for (hash, bi) in chain.block_index.iter_mut() {
+            if in_chain.contains(hash) {
+                bi.status = BlockStatus::InChain;
+            } else if bi.status == BlockStatus::InChain {
+                bi.status = BlockStatus::Valid;
+            }
+        }
+
+        if let Some(h) = best_height {
+            let rebuilt_h = chain.height();
+            if h != rebuilt_h {
+                warn!(
+                    "chainstate tip height mismatch: chain_store={} rebuilt={} tip={}",
+                    h,
+                    rebuilt_h,
+                    tip.to_hex()
+                );
+            }
+        }
+    } else {
+        // Fallback for older DBs without chainstate tip metadata.
+        let in_chain_blocks: Vec<(Hash256, u32, u128)> = chain
+            .block_index
+            .iter()
+            .filter_map(|(hash, bi)| {
+                if bi.status == BlockStatus::InChain {
+                    Some((*hash, bi.height, bi.chainwork))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for (hash, height, chainwork) in in_chain_blocks {
+            let h = height as usize;
+            if h >= chain.active_chain.len() {
+                chain.active_chain.resize(h + 1, Hash256::ZERO);
+            }
+            chain.active_chain[h] = hash;
+            let cur_work = chain
+                .best_tip
+                .and_then(|t| chain.block_index.get(&t))
+                .map(|x| x.chainwork)
+                .unwrap_or(0);
+            if chainwork > cur_work {
+                chain.best_tip = Some(hash);
+            }
+        }
+    }
+
+    info!(
+        "chain rebuilt: height={} tip={:?} (utxos lazy-loaded)",
+        chain.height(),
+        chain.best_tip.map(|h| h.to_hex())
+    );
     Ok(())
 }
 
