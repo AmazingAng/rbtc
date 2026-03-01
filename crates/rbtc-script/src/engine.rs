@@ -261,8 +261,9 @@ impl ScriptEngine {
                 Opcode::from_byte(opcode_byte)
             };
 
-            // Count non-push ops
-            if opcode_byte > 0x60 {
+            // Count non-push ops (legacy/v0 path).
+            // BIP342 tapscript does not enforce the legacy MAX_OPS_PER_SCRIPT limit.
+            if sig_version != SigVersion::Taproot && opcode_byte > 0x60 {
                 op_count += 1;
                 if op_count > MAX_OPS_PER_SCRIPT {
                     return Err(ScriptError::OpCountExceeded);
@@ -999,7 +1000,7 @@ fn is_op_successx(op: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rbtc_primitives::transaction::{OutPoint, TxIn};
+    use rbtc_primitives::transaction::{OutPoint, TxIn, TxOut};
     use rbtc_primitives::hash::Hash256;
 
     fn minimal_tx() -> Transaction {
@@ -1207,5 +1208,28 @@ mod tests {
         engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base, None).unwrap();
         assert_eq!(stack.len(), 1);
         assert!(stack[0].is_empty());
+    }
+
+    #[test]
+    fn tapscript_ignores_legacy_opcount_limit() {
+        let engine = ScriptEngine::new(ScriptFlags::standard());
+        let tx = minimal_tx();
+        let prevouts = vec![TxOut { value: 0, script_pubkey: Script::new() }];
+        let leaf_hash = [0u8; 32];
+        let mut script = vec![0x61; 220]; // OP_NOP repeated beyond legacy 201 limit
+        script.push(0x51); // OP_1 so final stack is true
+        let script = Script::from_bytes(script);
+        let mut stack = vec![];
+
+        let r = engine.execute_tapscript(
+            &tx,
+            0,
+            &prevouts,
+            &script,
+            &mut stack,
+            &leaf_hash,
+            None,
+        );
+        assert!(r.is_ok());
     }
 }
