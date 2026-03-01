@@ -153,7 +153,10 @@ impl CachedUtxoSet {
 
     /// Write all dirty entries into `batch` (which the caller will atomically commit)
     /// and promote live entries to the hot cache.  Clears the dirty layer.
-    pub fn flush_dirty(&mut self, batch: &mut WriteBatch) {
+    pub fn flush_dirty(
+        &mut self,
+        batch: &mut WriteBatch,
+    ) -> std::result::Result<(), rbtc_storage::StorageError> {
         let store = UtxoStore::new(&self.db);
         let mut to_add: Vec<(OutPoint, StoredUtxo)> = Vec::new();
         let mut to_remove: Vec<OutPoint> = Vec::new();
@@ -176,7 +179,8 @@ impl CachedUtxoSet {
             }
         }
 
-        store.fill_batch(batch, &to_add, &to_remove).ok();
+        store.fill_batch(batch, &to_add, &to_remove)?;
+        Ok(())
     }
 
     /// Evict clean (non-dirty) entries from the hot cache until usage is at or
@@ -403,7 +407,7 @@ mod tests {
         cache.dirty.insert(op.clone(), Some(make_utxo(777)));
 
         let mut batch = WriteBatch::default();
-        cache.flush_dirty(&mut batch);
+        cache.flush_dirty(&mut batch).unwrap();
 
         assert!(cache.dirty.is_empty());
         assert!(cache.hot.contains_key(&op));
@@ -422,7 +426,7 @@ mod tests {
         cache.dirty.insert(op.clone(), None);
 
         let mut batch = WriteBatch::default();
-        cache.flush_dirty(&mut batch);
+        cache.flush_dirty(&mut batch).unwrap();
 
         assert!(!cache.hot.contains_key(&op));
     }

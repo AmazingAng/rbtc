@@ -1507,21 +1507,21 @@ impl Node {
                         chainwork_hi: (chainwork >> 64) as u64,
                         status: BlockStatus::InChain.as_u8(),
                     };
-                    block_store.put_index(&block_hash, &stored_idx).ok();
-                    block_store.put_block(&block_hash, &block).ok();
-                    block_store.put_undo(&block_hash, &encode_block_undo(&undo_stored)).ok();
+                    block_store.put_index(&block_hash, &stored_idx)?;
+                    block_store.put_block(&block_hash, &block)?;
+                    block_store.put_undo(&block_hash, &encode_block_undo(&undo_stored))?;
 
                     // Single WriteBatch for UTXO (flushed from cache) + tx_index
                     // + addr_index + chain tip.
                     let mut batch = self.db.new_batch();
 
                     // Write dirty UTXO changes and promote them to the hot cache.
-                    self.utxo_cache.flush_dirty(&mut batch);
+                    self.utxo_cache.flush_dirty(&mut batch)?;
 
                     let chain_store = ChainStore::new(&self.db);
-                    chain_store.update_tip_batch(&mut batch, &block_hash, height, chainwork).ok();
+                    chain_store.update_tip_batch(&mut batch, &block_hash, height, chainwork)?;
 
-                    self.db.write_batch(batch).ok();
+                    self.db.write_batch(batch)?;
 
                     // Evicting every block can be expensive at high heights; throttle it.
                     self.blocks_since_utxo_evict = self.blocks_since_utxo_evict.saturating_add(1);
