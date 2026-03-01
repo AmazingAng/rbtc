@@ -81,6 +81,11 @@ pub struct Args {
     #[arg(long, value_name = "MB", default_value = "2048")]
     pub utxo_cache: u64,
 
+    /// Rebuild chainstate (UTXO + tip metadata) from stored blocks and indices.
+    /// Similar to Bitcoin Core's -reindex-chainstate.
+    #[arg(long = "reindex-chainstate", default_value_t = false)]
+    pub reindex_chainstate: bool,
+
     /// Script precheck worker threads (0 = use rayon default).
     #[arg(long, value_name = "N", default_value = "0")]
     pub script_threads: usize,
@@ -177,5 +182,11 @@ mod tests {
         let args = Args::parse_from(["rbtc", "--addnode", "127.0.0.1:18444"]);
         assert_eq!(args.add_nodes.len(), 1);
         assert_eq!(args.add_nodes[0], "127.0.0.1:18444");
+    }
+
+    #[test]
+    fn parse_reindex_chainstate_flag() {
+        let args = Args::parse_from(["rbtc", "--reindex-chainstate"]);
+        assert!(args.reindex_chainstate);
     }
 }

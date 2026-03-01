@@ -151,6 +151,29 @@ impl CachedUtxoSet {
         undo
     }
 
+    /// Undo a connected block (for reorg): remove created outputs, restore spent inputs.
+    pub fn disconnect_block(
+        &mut self,
+        txids: &[TxId],
+        txs: &[Transaction],
+        undo: Vec<Vec<(OutPoint, Utxo)>>,
+    ) {
+        for ((txid, tx), spent) in txids.iter().zip(txs.iter()).rev().zip(undo.into_iter().rev()) {
+            // Remove outputs created by this transaction.
+            for vout in 0..tx.outputs.len() {
+                let outpoint = OutPoint { txid: *txid, vout: vout as u32 };
+                self.dirty.insert(outpoint.clone(), None);
+                if self.hot.remove(&outpoint).is_some() {
+                    self.hot_bytes = self.hot_bytes.saturating_sub(BYTES_PER_UTXO);
+                }
+            }
+            // Restore spent outputs.
+            for (outpoint, utxo) in spent {
+                self.dirty.insert(outpoint, Some(utxo));
+            }
+        }
+    }
+
     /// Write all dirty entries into `batch` (which the caller will atomically commit)
     /// and promote live entries to the hot cache.  Clears the dirty layer.
     pub fn flush_dirty(

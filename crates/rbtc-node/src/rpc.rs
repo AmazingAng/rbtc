@@ -22,7 +22,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, oneshot, RwLock};
 use tracing::{debug, info, warn};
 
 use rbtc_consensus::chain::ChainState;
@@ -51,6 +51,19 @@ pub struct RpcState {
     pub wallet: Option<Arc<RwLock<Wallet>>>,
     /// Channel to submit mined / external blocks into the node's event loop.
     pub submit_block_tx: mpsc::UnboundedSender<Block>,
+    /// Channel for node-management commands that must run on the node loop.
+    pub control_tx: mpsc::UnboundedSender<RpcNodeCommand>,
+}
+
+pub enum RpcNodeCommand {
+    InvalidateBlock {
+        hash: Hash256,
+        reply: oneshot::Sender<std::result::Result<(), String>>,
+    },
+    ReconsiderBlock {
+        hash: Hash256,
+        reply: oneshot::Sender<std::result::Result<(), String>>,
+    },
 }
 
 // ── JSON-RPC envelope ─────────────────────────────────────────────────────────
@@ -114,6 +127,8 @@ async fn handle_rpc(
         "getblockcount"              => rpc_getblockcount(&state).await,
         "getblockhash"               => rpc_getblockhash(&state, &params).await,
         "getblock"                   => rpc_getblock(&state, &params).await,
+        "invalidateblock"            => rpc_invalidateblock(&state, &params).await,
+        "reconsiderblock"            => rpc_reconsiderblock(&state, &params).await,
         // Transactions
         "getrawtransaction"          => rpc_getrawtransaction(&state, &params).await,
         "getrawmempool"              => rpc_getrawmempool(&state).await,
@@ -239,6 +254,48 @@ async fn rpc_getblock(state: &RpcState, params: &Value) -> RpcResult {
         }
         Ok(None) => Err((-5, "Block not found".to_string())),
         Err(e) => Err((-1, e.to_string())),
+    }
+}
+
+async fn rpc_invalidateblock(state: &RpcState, params: &Value) -> RpcResult {
+    let hash_hex = params
+        .get(0)
+        .and_then(Value::as_str)
+        .ok_or((-32602, "Invalid params: expected block hash".to_string()))?;
+    let hash = Hash256::from_hex(hash_hex)
+        .map_err(|_| (-8, "Invalid block hash".to_string()))?;
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    state
+        .control_tx
+        .send(RpcNodeCommand::InvalidateBlock { hash, reply: reply_tx })
+        .map_err(|_| (-1, "node channel closed".to_string()))?;
+
+    match reply_rx.await {
+        Ok(Ok(())) => Ok(json!(null)),
+        Ok(Err(e)) => Err((-1, e)),
+        Err(_) => Err((-1, "node command dropped".to_string())),
+    }
+}
+
+async fn rpc_reconsiderblock(state: &RpcState, params: &Value) -> RpcResult {
+    let hash_hex = params
+        .get(0)
+        .and_then(Value::as_str)
+        .ok_or((-32602, "Invalid params: expected block hash".to_string()))?;
+    let hash = Hash256::from_hex(hash_hex)
+        .map_err(|_| (-8, "Invalid block hash".to_string()))?;
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    state
+        .control_tx
+        .send(RpcNodeCommand::ReconsiderBlock { hash, reply: reply_tx })
+        .map_err(|_| (-1, "node channel closed".to_string()))?;
+
+    match reply_rx.await {
+        Ok(Ok(())) => Ok(json!(null)),
+        Ok(Err(e)) => Err((-1, e)),
+        Err(_) => Err((-1, "node command dropped".to_string())),
     }
 }
 
