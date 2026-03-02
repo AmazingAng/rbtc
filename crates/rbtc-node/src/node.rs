@@ -2388,26 +2388,23 @@ fn reindex_chainstate(db: &Database, network: rbtc_primitives::network::Network)
     }
     ordered_chain.reverse();
 
-    // Clear chainstate families before rebuild.
-    let utxo_end = vec![0xffu8; 37];
-    let chain_state_end = vec![0xffu8; 64];
-    db.delete_range_cf(rbtc_storage::db::CF_UTXO, b"", &utxo_end)?;
-    db.delete_range_cf(rbtc_storage::db::CF_CHAIN_STATE, b"", &chain_state_end)?;
-
     if ordered_chain.is_empty() {
         info!("reindex-chainstate: nothing to rebuild");
         return Ok(());
     }
 
-    for hash in ordered_chain {
+    // Preflight verification before mutating chainstate:
+    // make sure every block needed for replay is present and decodable.
+    let mut replay_plan: Vec<(Hash256, u32, u128)> = Vec::with_capacity(ordered_chain.len());
+    for hash in &ordered_chain {
         // Some older databases may not persist a genesis index entry. Fall back to the
         // in-memory index rebuilt from headers so reindex-chainstate can still proceed.
-        let (height, chainwork) = if let Some(stored_idx) = block_store.get_index(&hash)? {
+        let (height, chainwork) = if let Some(stored_idx) = block_store.get_index(hash)? {
             (stored_idx.height, stored_idx.chainwork())
         } else {
             let bi = in_memory
                 .block_index
-                .get(&hash)
+                .get(hash)
                 .ok_or_else(|| anyhow!("reindex-chainstate: missing block index {}", hash.to_hex()))?;
             if bi.height == 0 {
                 warn!(
@@ -2424,9 +2421,10 @@ fn reindex_chainstate(db: &Database, network: rbtc_primitives::network::Network)
             (bi.height, bi.chainwork)
         };
 
-        let Some(block) = block_store.get_block(&hash)? else {
+        let Some(_) = block_store.get_block(hash)? else {
             if height == 0 {
                 // Genesis block data may be absent; its coinbase output is unspendable anyway.
+                replay_plan.push((*hash, height, chainwork));
                 continue;
             }
             return Err(anyhow!(
@@ -2435,6 +2433,28 @@ fn reindex_chainstate(db: &Database, network: rbtc_primitives::network::Network)
                 hash.to_hex()
             ));
         };
+        replay_plan.push((*hash, height, chainwork));
+    }
+
+    // Clear chainstate families only after preflight succeeds, so failures do not
+    // leave the node with a partially-destroyed chainstate.
+    let utxo_end = vec![0xffu8; 37];
+    let chain_state_end = vec![0xffu8; 64];
+    db.delete_range_cf(rbtc_storage::db::CF_UTXO, b"", &utxo_end)?;
+    db.delete_range_cf(rbtc_storage::db::CF_CHAIN_STATE, b"", &chain_state_end)?;
+
+    for (hash, height, chainwork) in replay_plan {
+        let Some(block) = block_store.get_block(&hash)? else {
+            return Err(anyhow!(
+                "reindex-chainstate: preflight/data mismatch at height {} hash {}",
+                height,
+                hash.to_hex()
+            ));
+        };
+        if height == 0 {
+            // Genesis coinbase is unspendable and may be absent from pruned datasets.
+            continue;
+        }
 
         let txids: Vec<_> = block
             .transactions

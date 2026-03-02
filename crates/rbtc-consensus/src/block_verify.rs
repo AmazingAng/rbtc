@@ -144,7 +144,8 @@ pub fn verify_block_with_options(
     }
 
     // ── BIP30 duplicate-txid check ────────────────────────────────────────
-    enforce_bip30(block, ctx.height, ctx.network, utxos)?;
+    let block_hash = sha256d(&encode_block_header(header));
+    enforce_bip30(block, block_hash, ctx.height, ctx.network, utxos)?;
 
     // ── Transaction verification + sigops + fees ─────────────────────────
     let subsidy = block_subsidy(ctx.height);
@@ -542,6 +543,7 @@ fn compute_txid(tx: &rbtc_primitives::transaction::Transaction) -> Hash256 {
 
 fn enforce_bip30(
     block: &Block,
+    block_hash: Hash256,
     height: u32,
     network: Network,
     utxos: &impl UtxoLookup,
@@ -552,10 +554,18 @@ fn enforce_bip30(
         return Ok(());
     }
     // Mainnet historical exceptions (pre-BIP34 duplicate-coinbase blocks).
-    if network == Network::Mainnet && (height == 91_842 || height == 91_880) {
+    // Core equivalent: IsBIP30Repeat(height, hash).
+    let is_bip30_repeat = network == Network::Mainnet
+        && ((height == 91_842
+            && block_hash.to_hex()
+                == "00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec")
+            || (height == 91_880
+                && block_hash.to_hex()
+                    == "00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721"));
+    if is_bip30_repeat {
         return Ok(());
     }
-    for tx in block.transactions.iter().skip(1) {
+    for tx in &block.transactions {
         let txid = compute_txid(tx);
         if utxos.has_unspent_txid(&txid) {
             return Err(ConsensusError::Bip30Conflict(txid.to_hex()));
@@ -963,7 +973,13 @@ mod tests {
             header: header_with_valid_pow(0x207fffff),
             transactions: vec![coinbase, spend],
         };
-        let r = enforce_bip30(&block, 100_000, Network::Mainnet, &utxos);
+        let r = enforce_bip30(
+            &block,
+            sha256d(&encode_block_header(&block.header)),
+            100_000,
+            Network::Mainnet,
+            &utxos,
+        );
         assert!(matches!(r, Err(ConsensusError::Bip30Conflict(_))));
     }
 
@@ -996,7 +1012,63 @@ mod tests {
             transactions: vec![coinbase, spend],
         };
         let utxos = UtxoSet::new();
-        assert!(enforce_bip30(&block, 100_000, Network::Mainnet, &utxos).is_ok());
+        assert!(enforce_bip30(
+            &block,
+            sha256d(&encode_block_header(&block.header)),
+            100_000,
+            Network::Mainnet,
+            &utxos
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn bip30_exception_requires_matching_hash_not_just_height() {
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: Script::from_bytes(vec![2, 0, 0]),
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            lock_time: 0,
+        };
+        let spend = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: Hash256([5; 32]), vout: 0 },
+                script_sig: Script::new(),
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 1_000, script_pubkey: Script::new() }],
+            lock_time: 0,
+        };
+        let txid = compute_txid(&spend);
+        let mut utxos = UtxoSet::new();
+        utxos.insert(
+            OutPoint { txid, vout: 0 },
+            Utxo {
+                txout: TxOut { value: 123, script_pubkey: Script::new() },
+                is_coinbase: false,
+                height: 1,
+            },
+        );
+        let block = Block {
+            header: header_with_valid_pow(0x207fffff),
+            transactions: vec![coinbase, spend],
+        };
+        // Height matches historical repeat, but hash does not.
+        let r = enforce_bip30(
+            &block,
+            sha256d(&encode_block_header(&block.header)),
+            91_842,
+            Network::Mainnet,
+            &utxos,
+        );
+        assert!(matches!(r, Err(ConsensusError::Bip30Conflict(_))));
     }
 
     #[test]
