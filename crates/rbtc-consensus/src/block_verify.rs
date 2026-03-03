@@ -6,6 +6,7 @@ use rbtc_primitives::{
     codec::Encodable,
     constants::{MAX_BLOCK_SIGOPS_COST, MAX_BLOCK_WEIGHT, MAX_FUTURE_BLOCK_TIME, WITNESS_SCALE_FACTOR},
     hash::Hash256,
+    transaction::OutPoint,
     Network,
 };
 use rbtc_crypto::{merkle_root, sha256d};
@@ -567,8 +568,15 @@ fn enforce_bip30(
     }
     for tx in &block.transactions {
         let txid = compute_txid(tx);
-        if utxos.has_unspent_txid(&txid) {
-            return Err(ConsensusError::Bip30Conflict(txid.to_hex()));
+        // Core behavior: check each would-be-created outpoint, not just txid-level existence.
+        for vout in 0..tx.outputs.len() {
+            let outpoint = OutPoint {
+                txid,
+                vout: vout as u32,
+            };
+            if utxos.get_utxo(&outpoint).is_some() {
+                return Err(ConsensusError::Bip30Conflict(txid.to_hex()));
+            }
         }
     }
     Ok(())
@@ -1069,6 +1077,56 @@ mod tests {
             &utxos,
         );
         assert!(matches!(r, Err(ConsensusError::Bip30Conflict(_))));
+    }
+
+    #[test]
+    fn bip30_checks_outpoint_not_txid_prefix_only() {
+        // Existing txid has only vout=1 unspent; new tx creates only vout=0.
+        // Core-style BIP30 should allow this.
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: Script::from_bytes(vec![2, 0, 0]),
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            lock_time: 0,
+        };
+        let spend = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: Hash256([6; 32]), vout: 0 },
+                script_sig: Script::new(),
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 1_000, script_pubkey: Script::new() }], // only vout=0
+            lock_time: 0,
+        };
+        let txid = compute_txid(&spend);
+        let mut utxos = UtxoSet::new();
+        utxos.insert(
+            OutPoint { txid, vout: 1 }, // only vout=1 exists
+            Utxo {
+                txout: TxOut { value: 123, script_pubkey: Script::new() },
+                is_coinbase: false,
+                height: 1,
+            },
+        );
+        let block = Block {
+            header: header_with_valid_pow(0x207fffff),
+            transactions: vec![coinbase, spend],
+        };
+        assert!(enforce_bip30(
+            &block,
+            sha256d(&encode_block_header(&block.header)),
+            100_000,
+            Network::Mainnet,
+            &utxos
+        )
+        .is_ok());
     }
 
     #[test]
