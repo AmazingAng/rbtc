@@ -1419,6 +1419,23 @@ impl Node {
             .unwrap_or_default()
             .as_secs() as u32;
 
+        // Core-style invariant: only connect blocks that extend the current
+        // active tip. Side-branch blocks may be indexed, but must not mutate
+        // the active chain UTXO state through this path.
+        let expected_prev = self.chain.read().await.best_hash().ok_or_else(|| {
+            anyhow!("connect invariant violated: missing best tip before height {height}")
+        })?;
+        if block.header.prev_block != expected_prev {
+            return Err(anyhow!(
+                "block {} does not extend active tip: prev={} expected={} height={} peer={}",
+                block_hash.to_hex(),
+                block.header.prev_block.to_hex(),
+                expected_prev.to_hex(),
+                height,
+                peer_id
+            ));
+        }
+
         // Core-style: query MTP from block index on demand during verification.
         let verify_started = Instant::now();
         let assumevalid_skip_scripts;
