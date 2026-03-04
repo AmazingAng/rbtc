@@ -18,6 +18,7 @@ use rbtc_net::{
     peer_manager::{BAN_DURATION, NodeEvent, PeerManager, PeerManagerConfig},
 };
 use rbtc_primitives::hash::Hash256;
+use rbtc_primitives::codec::Encodable;
 use rbtc_storage::{
     encode_block_undo, decode_block_undo, AddrIndexStore, BlockStore, ChainStore, Database,
     PeerStore, StoredBlockIndex, StoredUtxo, TxIndexStore, UtxoStore,
@@ -1504,9 +1505,6 @@ impl Node {
                 {
                     let chainwork = self.chain.read().await.block_index[&block_hash].chainwork;
 
-                    // Block data (large blobs) are written separately; they don't
-                    // need to be atomic with the index updates.
-                    let block_store = BlockStore::new(&self.db);
                     let stored_idx = StoredBlockIndex {
                         header: block.header.clone(),
                         height,
@@ -1516,13 +1514,28 @@ impl Node {
                         // the chainstate batch commit succeeds.
                         status: BlockStatus::Valid.as_u8(),
                     };
-                    block_store.put_index(&block_hash, &stored_idx)?;
-                    block_store.put_block(&block_hash, &block)?;
-                    block_store.put_undo(&block_hash, &encode_block_undo(&undo_stored))?;
-
-                    // Single WriteBatch for UTXO (flushed from cache) + tx_index
-                    // + addr_index + chain tip.
+                    // Single WriteBatch for block index/data/undo + UTXO changes
+                    // + chain tip. This prevents partial persistence such as
+                    // "index exists but raw block is missing" after crashes.
                     let mut batch = self.db.new_batch();
+                    self.db.batch_put_cf(
+                        &mut batch,
+                        rbtc_storage::db::CF_BLOCK_INDEX,
+                        &block_hash.0,
+                        &stored_idx.encode_bytes(),
+                    )?;
+                    self.db.batch_put_cf(
+                        &mut batch,
+                        rbtc_storage::db::CF_BLOCK_DATA,
+                        &block_hash.0,
+                        &block.encode_to_vec(),
+                    )?;
+                    self.db.batch_put_cf(
+                        &mut batch,
+                        rbtc_storage::db::CF_UNDO,
+                        &block_hash.0,
+                        &encode_block_undo(&undo_stored),
+                    )?;
 
                     // Write dirty UTXO changes and promote them to the hot cache.
                     self.utxo_cache.flush_dirty(&mut batch)?;
