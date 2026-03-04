@@ -1422,9 +1422,19 @@ impl Node {
         // Core-style invariant: only connect blocks that extend the current
         // active tip. Side-branch blocks may be indexed, but must not mutate
         // the active chain UTXO state through this path.
-        let expected_prev = self.chain.read().await.best_hash().ok_or_else(|| {
-            anyhow!("connect invariant violated: missing best tip before height {height}")
-        })?;
+        let expected_prev = {
+            let chain = self.chain.read().await;
+            if let Some(tip) = chain.best_hash() {
+                tip
+            } else if height == 1 {
+                Hash256::from_hex(chain.network.genesis_hash())
+                    .map_err(|_| anyhow!("invalid genesis hash encoding for {:?}", chain.network))?
+            } else {
+                return Err(anyhow!(
+                    "connect invariant violated: missing best tip before height {height}"
+                ));
+            }
+        };
         if block.header.prev_block != expected_prev {
             return Err(anyhow!(
                 "block {} does not extend active tip: prev={} expected={} height={} peer={}",
