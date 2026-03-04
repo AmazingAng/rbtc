@@ -453,4 +453,5 @@ mod tests {
 
         assert!(!cache.hot.contains_key(&op));
     }
+
 }

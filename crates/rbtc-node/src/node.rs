@@ -138,6 +138,17 @@ pub struct Node {
 }
 
 impl Node {
+    fn is_block_connected(chain: &ChainState, hash: &Hash256) -> bool {
+        let Some(bi) = chain.block_index.get(hash) else {
+            return false;
+        };
+        chain
+            .active_chain
+            .get(bi.height as usize)
+            .copied()
+            == Some(*hash)
+    }
+
     pub async fn new(args: Args) -> Result<Self> {
         let data_dir = args.data_dir();
         std::fs::create_dir_all(&data_dir)
@@ -929,12 +940,7 @@ impl Node {
             // without their predecessors (which would stall frontier connection).
             let Some(hash) = hash else { break };
             // Skip blocks already connected.
-            if chain
-                .block_index
-                .get(&hash)
-                .map(|bi| bi.status == BlockStatus::InChain)
-                .unwrap_or(false)
-            {
+            if Self::is_block_connected(&chain, &hash) {
                 continue;
             }
             hashes.push(hash);
@@ -1076,11 +1082,7 @@ impl Node {
             frontier_hash_for_preemption = Some(frontier_hash);
             let frontier_connected = {
                 let chain = self.chain.read().await;
-                chain
-                    .block_index
-                    .get(&frontier_hash)
-                    .map(|bi| bi.status == BlockStatus::InChain)
-                    .unwrap_or(false)
+                Self::is_block_connected(&chain, &frontier_hash)
             };
             if !frontier_connected {
                 frontier_pending = true;
@@ -1334,11 +1336,7 @@ impl Node {
         // Skip if already connected.
         let already_connected = {
             let chain = self.chain.read().await;
-            chain
-                .block_index
-                .get(&block_hash)
-                .map(|bi| bi.status == BlockStatus::InChain)
-                .unwrap_or(false)
+            Self::is_block_connected(&chain, &block_hash)
         };
         if already_connected {
             self.ibd_mark_connected_all(&block_hash).await;
@@ -1479,29 +1477,6 @@ impl Node {
                 let undo = self
                     .utxo_cache
                     .connect_block_with_undo(&txids, &block.transactions, height);
-                {
-                    let mut chain = self.chain.write().await;
-                    // Mark block as in-chain in the index
-                    if let Some(bi) = chain.block_index.get_mut(&block_hash) {
-                        bi.status = BlockStatus::InChain;
-                    }
-                    // Update active chain
-                    if height as usize >= chain.active_chain.len() {
-                        chain.active_chain.resize(height as usize + 1, Hash256::ZERO);
-                    }
-                    chain.active_chain[height as usize] = block_hash;
-                    // Update best tip
-                    let new_work = chain.block_index[&block_hash].chainwork;
-                    let cur_work = chain
-                        .best_tip
-                        .and_then(|h| chain.block_index.get(&h))
-                        .map(|bi| bi.chainwork)
-                        .unwrap_or(0);
-                    if new_work > cur_work {
-                        chain.best_tip = Some(block_hash);
-                    }
-                }
-
                 // Convert undo data to storage format and persist
                 let undo_stored: Vec<Vec<(rbtc_primitives::transaction::OutPoint, StoredUtxo)>> =
                     undo.iter()
@@ -1537,7 +1512,9 @@ impl Node {
                         height,
                         chainwork_lo: chainwork as u64,
                         chainwork_hi: (chainwork >> 64) as u64,
-                        status: BlockStatus::InChain.as_u8(),
+                        // Persist as Valid first; only mark InChain in memory after
+                        // the chainstate batch commit succeeds.
+                        status: BlockStatus::Valid.as_u8(),
                     };
                     block_store.put_index(&block_hash, &stored_idx)?;
                     block_store.put_block(&block_hash, &block)?;
@@ -1560,6 +1537,25 @@ impl Node {
                     if self.blocks_since_utxo_evict >= UTXO_EVICT_INTERVAL_BLOCKS {
                         self.utxo_cache.evict_cold();
                         self.blocks_since_utxo_evict = 0;
+                    }
+                }
+                {
+                    let mut chain = self.chain.write().await;
+                    if let Some(bi) = chain.block_index.get_mut(&block_hash) {
+                        bi.status = BlockStatus::InChain;
+                    }
+                    if height as usize >= chain.active_chain.len() {
+                        chain.active_chain.resize(height as usize + 1, Hash256::ZERO);
+                    }
+                    chain.active_chain[height as usize] = block_hash;
+                    let new_work = chain.block_index[&block_hash].chainwork;
+                    let cur_work = chain
+                        .best_tip
+                        .and_then(|h| chain.block_index.get(&h))
+                        .map(|bi| bi.chainwork)
+                        .unwrap_or(0);
+                    if new_work > cur_work {
+                        chain.best_tip = Some(block_hash);
                     }
                 }
                 let write_elapsed = write_started.elapsed();
@@ -2010,11 +2006,7 @@ impl Node {
             if let Some(frontier_hash) = frontier_hash {
                 let frontier_connected = {
                     let chain = self.chain.read().await;
-                    chain
-                        .block_index
-                        .get(&frontier_hash)
-                        .map(|bi| bi.status == BlockStatus::InChain)
-                        .unwrap_or(false)
+                    Self::is_block_connected(&chain, &frontier_hash)
                 };
                 if !frontier_connected {
                     let frontier_owner = self
@@ -2444,6 +2436,10 @@ fn reindex_chainstate(db: &Database, network: rbtc_primitives::network::Network)
     db.delete_range_cf(rbtc_storage::db::CF_CHAIN_STATE, b"", &chain_state_end)?;
 
     for (hash, height, chainwork) in replay_plan {
+        if height == 0 {
+            // Genesis coinbase is unspendable and may be absent from pruned datasets.
+            continue;
+        }
         let Some(block) = block_store.get_block(&hash)? else {
             return Err(anyhow!(
                 "reindex-chainstate: preflight/data mismatch at height {} hash {}",
@@ -2451,10 +2447,6 @@ fn reindex_chainstate(db: &Database, network: rbtc_primitives::network::Network)
                 hash.to_hex()
             ));
         };
-        if height == 0 {
-            // Genesis coinbase is unspendable and may be absent from pruned datasets.
-            continue;
-        }
 
         let txids: Vec<_> = block
             .transactions
