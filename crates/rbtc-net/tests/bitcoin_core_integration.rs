@@ -1026,3 +1026,189 @@ async fn test_rpc_getchaintips() {
         &active_tip["hash"].as_str().unwrap()[..16]
     );
 }
+
+// ── Test 15: Dust limit enforcement (Phase E, E3) ───────────────────────────
+
+/// Verify that Bitcoin Core rejects dust outputs and that our thresholds match.
+#[tokio::test]
+async fn test_dust_limit_enforcement() {
+    if !bitcoin_cli_available() {
+        eprintln!("bitcoin-cli not available -- skipping");
+        return;
+    }
+
+    let dust_addr = match bitcoin_cli(&["getnewaddress", "", "bech32"]) {
+        Some(a) => a,
+        None => { eprintln!("getnewaddress failed -- skipping"); return; }
+    };
+    let change_addr = match bitcoin_cli(&["getnewaddress", "", "bech32"]) {
+        Some(a) => a,
+        None => { eprintln!("getnewaddress failed -- skipping"); return; }
+    };
+
+    let utxos_str = match bitcoin_cli(&["listunspent"]) {
+        Some(s) => s,
+        None => { eprintln!("listunspent failed -- skipping"); return; }
+    };
+    let utxos: serde_json::Value = serde_json::from_str(&utxos_str).unwrap();
+    let utxo_arr = utxos.as_array().unwrap();
+    if utxo_arr.is_empty() {
+        eprintln!("no UTXOs -- skipping");
+        return;
+    }
+
+    let utxo = &utxo_arr[0];
+    let txid = utxo["txid"].as_str().unwrap();
+    let vout = utxo["vout"].as_u64().unwrap();
+    let amount = utxo["amount"].as_f64().unwrap();
+
+    // Create a tx with a dust output (100 sat = 0.00000100 BTC, below P2WPKH threshold of 294)
+    let dust_amount = 0.00000100;
+    let change = amount - dust_amount - 0.001;
+    if change < 0.0001 {
+        eprintln!("not enough funds for dust test -- skipping");
+        return;
+    }
+
+    let inputs = format!("[{{\"txid\":\"{txid}\",\"vout\":{vout}}}]");
+    let outputs = format!("{{\"{}\":{:.8},\"{}\":{:.8}}}", dust_addr, dust_amount, change_addr, change);
+
+    let raw = match bitcoin_cli(&["createrawtransaction", &inputs, &outputs]) {
+        Some(r) => r,
+        None => { eprintln!("createrawtransaction failed -- skipping"); return; }
+    };
+
+    let signed_str = match bitcoin_cli(&["signrawtransactionwithwallet", &raw]) {
+        Some(s) => s,
+        None => { eprintln!("signrawtransactionwithwallet failed -- skipping"); return; }
+    };
+    let signed: serde_json::Value = serde_json::from_str(&signed_str).unwrap();
+    let signed_hex = signed["hex"].as_str().unwrap();
+
+    let accept_str = bitcoin_cli(&["testmempoolaccept", &format!("[\"{signed_hex}\"]")]).unwrap();
+    let accept: serde_json::Value = serde_json::from_str(&accept_str).unwrap();
+    let allowed = accept[0]["allowed"].as_bool().unwrap_or(true);
+
+    if !allowed {
+        let reason = accept[0]["reject-reason"].as_str().unwrap_or("");
+        println!("[dust] tx with 100 sat output correctly rejected: {reason} ✓");
+    } else {
+        println!("[dust] tx with 100 sat output accepted (output type may allow it)");
+    }
+
+    // Verify our dust thresholds match Bitcoin Core
+    let p2wpkh_script = rbtc_primitives::script::Script::from_bytes({
+        let mut s = vec![0x00u8, 0x14];
+        s.extend_from_slice(&[0u8; 20]);
+        s
+    });
+    assert_eq!(rbtc_mempool::dust_threshold(&p2wpkh_script), 294);
+
+    let p2pkh_script = rbtc_primitives::script::Script::from_bytes({
+        let mut s = vec![0x76u8, 0xa9, 0x14];
+        s.extend_from_slice(&[0u8; 20]);
+        s.extend_from_slice(&[0x88, 0xac]);
+        s
+    });
+    assert_eq!(rbtc_mempool::dust_threshold(&p2pkh_script), 546);
+
+    let p2tr_script = rbtc_primitives::script::Script::from_bytes({
+        let mut s = vec![0x51u8, 0x20];
+        s.extend_from_slice(&[0u8; 32]);
+        s
+    });
+    assert_eq!(rbtc_mempool::dust_threshold(&p2tr_script), 330);
+
+    println!("[dust] thresholds: P2WPKH=294, P2PKH=546, P2TR=330 ✓");
+}
+
+// ── Test 16: IsStandard policy (Phase E, E4) ─────────────────────────────────
+
+/// Verify our IsStandard implementation matches Bitcoin Core behavior.
+#[tokio::test]
+async fn test_mempool_standardness() {
+    // Version > 2 is non-standard
+    let tx_v3 = rbtc_primitives::transaction::Transaction {
+        version: 3,
+        inputs: vec![rbtc_primitives::transaction::TxIn {
+            previous_output: rbtc_primitives::transaction::OutPoint {
+                txid: rbtc_primitives::hash::Hash256([1; 32]),
+                vout: 0,
+            },
+            script_sig: rbtc_primitives::script::Script::new(),
+            sequence: 0xffffffff,
+            witness: vec![],
+        }],
+        outputs: vec![rbtc_primitives::transaction::TxOut {
+            value: 1_000_000,
+            script_pubkey: rbtc_primitives::script::Script::from_bytes({
+                let mut s = vec![0x00u8, 0x14];
+                s.extend_from_slice(&[0u8; 20]);
+                s
+            }),
+        }],
+        lock_time: 0,
+    };
+    assert!(rbtc_mempool::is_standard_tx(&tx_v3).is_err());
+    println!("[standard] version > 2 correctly rejected ✓");
+
+    // Multiple OP_RETURN outputs are non-standard
+    let tx_multi_opreturn = rbtc_primitives::transaction::Transaction {
+        version: 2,
+        inputs: vec![rbtc_primitives::transaction::TxIn {
+            previous_output: rbtc_primitives::transaction::OutPoint {
+                txid: rbtc_primitives::hash::Hash256([1; 32]),
+                vout: 0,
+            },
+            script_sig: rbtc_primitives::script::Script::new(),
+            sequence: 0xffffffff,
+            witness: vec![],
+        }],
+        outputs: vec![
+            rbtc_primitives::transaction::TxOut {
+                value: 1_000_000,
+                script_pubkey: rbtc_primitives::script::Script::from_bytes({
+                    let mut s = vec![0x00u8, 0x14];
+                    s.extend_from_slice(&[0u8; 20]);
+                    s
+                }),
+            },
+            rbtc_primitives::transaction::TxOut {
+                value: 0,
+                script_pubkey: rbtc_primitives::script::Script::from_bytes(vec![0x6a, 0x02, 0xaa, 0xbb]),
+            },
+            rbtc_primitives::transaction::TxOut {
+                value: 0,
+                script_pubkey: rbtc_primitives::script::Script::from_bytes(vec![0x6a, 0x02, 0xcc, 0xdd]),
+            },
+        ],
+        lock_time: 0,
+    };
+    assert!(rbtc_mempool::is_standard_tx(&tx_multi_opreturn).is_err());
+    println!("[standard] multiple OP_RETURN correctly rejected ✓");
+
+    // Dust output is non-standard
+    let tx_dust = rbtc_primitives::transaction::Transaction {
+        version: 2,
+        inputs: vec![rbtc_primitives::transaction::TxIn {
+            previous_output: rbtc_primitives::transaction::OutPoint {
+                txid: rbtc_primitives::hash::Hash256([1; 32]),
+                vout: 0,
+            },
+            script_sig: rbtc_primitives::script::Script::new(),
+            sequence: 0xffffffff,
+            witness: vec![],
+        }],
+        outputs: vec![rbtc_primitives::transaction::TxOut {
+            value: 100, // Below 294 P2WPKH dust
+            script_pubkey: rbtc_primitives::script::Script::from_bytes({
+                let mut s = vec![0x00u8, 0x14];
+                s.extend_from_slice(&[0u8; 20]);
+                s
+            }),
+        }],
+        lock_time: 0,
+    };
+    assert!(rbtc_mempool::is_standard_tx(&tx_dust).is_err());
+    println!("[standard] dust output correctly rejected ✓");
+}

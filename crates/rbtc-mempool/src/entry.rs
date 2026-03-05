@@ -18,6 +18,18 @@ pub struct MempoolEntry {
     /// Effective fee rate including unconfirmed ancestors (CPFP).
     /// Equals `fee_rate` when all inputs are confirmed.
     pub ancestor_fee_rate: u64,
+    /// Total ancestor count (including self)
+    pub ancestor_count: u64,
+    /// Total ancestor virtual size (including self)
+    pub ancestor_vsize: u64,
+    /// Total ancestor fees (including self)
+    pub ancestor_fees: u64,
+    /// Number of in-mempool descendants (excluding self)
+    pub descendant_count: u64,
+    /// Total descendant virtual size (including self)
+    pub descendant_vsize: u64,
+    /// Total descendant fees (including self)
+    pub descendant_fees: u64,
     /// Wall-clock time when the entry was accepted
     pub added_at: Instant,
 }

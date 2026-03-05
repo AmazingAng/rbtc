@@ -11,7 +11,11 @@ use rbtc_primitives::{
 use rbtc_script::ScriptFlags;
 use tracing::{debug, info, warn};
 
-use crate::{entry::MempoolEntry, error::MempoolError};
+use crate::{
+    entry::MempoolEntry,
+    error::MempoolError,
+    policy::{is_standard_tx, V3PolicyError, MAX_V3_TX_VSIZE},
+};
 
 /// Default maximum total vsize (~300 MB).
 const DEFAULT_MAX_VSIZE: u64 = 300_000_000;
@@ -70,6 +74,11 @@ impl Mempool {
 
         if self.entries.contains_key(&txid) {
             return Err(MempoolError::AlreadyKnown);
+        }
+
+        // ── Standardness checks (E4) ────────────────────────────────────
+        if let Err(reason) = is_standard_tx(&tx) {
+            return Err(MempoolError::NonStandard(reason.to_string()));
         }
 
         let new_signals_rbf = signals_rbf(&tx);
@@ -144,6 +153,46 @@ impl Mempool {
             self.rebuild_mempool_utxos();
         }
 
+        // ── V3 transaction policy (BIP431 / E2) ─────────────────────────
+        if tx.version == 3 {
+            if vsize > MAX_V3_TX_VSIZE {
+                return Err(MempoolError::V3Policy(
+                    V3PolicyError::TxTooLarge(vsize).to_string(),
+                ));
+            }
+            // Count unconfirmed parents
+            let unconfirmed_parents: Vec<TxId> = tx
+                .inputs
+                .iter()
+                .filter_map(|i| {
+                    let ptxid = i.previous_output.txid;
+                    if self.entries.contains_key(&ptxid) {
+                        Some(ptxid)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if unconfirmed_parents.len() > 1 {
+                return Err(MempoolError::V3Policy(
+                    V3PolicyError::TooManyUnconfirmedParents(unconfirmed_parents.len()).to_string(),
+                ));
+            }
+            // If there's one unconfirmed parent, check it doesn't already have an
+            // in-mempool child
+            if let Some(parent_txid) = unconfirmed_parents.first() {
+                let has_existing_child = self.entries.values().any(|e| {
+                    e.txid != txid
+                        && e.tx.inputs.iter().any(|i| i.previous_output.txid == *parent_txid)
+                });
+                if has_existing_child {
+                    return Err(MempoolError::V3Policy(
+                        V3PolicyError::ParentAlreadyHasChild.to_string(),
+                    ));
+                }
+            }
+        }
+
         // ── CPFP ancestor fee rate ────────────────────────────────────────
         let ancestor_fee_rate = self.compute_ancestor_fee_rate(&tx, fee, vsize);
 
@@ -155,6 +204,16 @@ impl Mempool {
             txid.to_hex()
         );
 
+        // Compute ancestor stats (including self)
+        let (anc_fee, anc_vsize) = self.ancestor_package(&txid);
+        // ancestor_package won't find our tx yet, so add self manually
+        let ancestor_fees = anc_fee + fee;
+        let ancestor_vsize_total = anc_vsize + vsize;
+        let ancestor_count = {
+            let mut visited = HashSet::new();
+            self.count_ancestors_inner(&tx, &mut visited) + 1
+        };
+
         let entry = MempoolEntry {
             tx,
             txid,
@@ -163,9 +222,18 @@ impl Mempool {
             fee_rate,
             signals_rbf: new_signals_rbf,
             ancestor_fee_rate,
+            ancestor_count: ancestor_count as u64,
+            ancestor_vsize: ancestor_vsize_total,
+            ancestor_fees,
+            descendant_count: 0,
+            descendant_vsize: vsize,
+            descendant_fees: fee,
             added_at: std::time::Instant::now(),
         };
         self.entries.insert(txid, entry);
+
+        // Update descendant stats of all ancestors
+        self.update_ancestor_descendants(txid, fee, vsize);
 
         // ── Size cap eviction ─────────────────────────────────────────────
         if self.total_vsize() > self.max_vsize {
@@ -292,13 +360,13 @@ impl Mempool {
 
     // ── Eviction ──────────────────────────────────────────────────────────────
 
-    /// Evict lowest-fee-rate transactions until `total_vsize ≤ max_vsize`.
-    /// If the just-inserted transaction (with `new_fee_rate`) has the lowest rate,
-    /// it is also removed and `MempoolFull` is returned.
+    /// Evict lowest-ancestor-fee-rate transactions until `total_vsize ≤ max_vsize`.
+    /// Uses ancestor fee rate for eviction priority (matching Bitcoin Core).
+    /// If the just-inserted transaction has the lowest rate, it is rejected.
     fn evict_below_fee_rate(&mut self, new_fee_rate: u64) -> Result<(), MempoolError> {
-        // Sort ascending by fee_rate → evict cheapest first
+        // Sort ascending by ancestor_fee_rate → evict cheapest first (E5)
         let mut by_rate: Vec<(TxId, u64)> = self.entries.values()
-            .map(|e| (e.txid, e.fee_rate))
+            .map(|e| (e.txid, e.ancestor_fee_rate))
             .collect();
         by_rate.sort_unstable_by_key(|&(_, r)| r);
 
@@ -306,22 +374,132 @@ impl Mempool {
             if self.total_vsize() <= self.max_vsize {
                 break;
             }
-            // If we would need to evict the just-accepted tx itself, reject it
             if *evict_rate >= new_fee_rate {
-                self.entries.remove(&{
-                    // find the most recently inserted tx with this rate
-                    // (it is the one we just added, as existing entries had their rates set earlier)
-                    let _ = new_fee_rate;
-                    *evict_id
-                });
+                self.entries.remove(evict_id);
                 self.rebuild_mempool_utxos();
                 return Err(MempoolError::MempoolFull);
             }
-            warn!("mempool: evicting {} (fee_rate={evict_rate}) due to size limit", evict_id.to_hex());
+            warn!("mempool: evicting {} (ancestor_fee_rate={evict_rate}) due to size limit", evict_id.to_hex());
             self.entries.remove(evict_id);
         }
         self.rebuild_mempool_utxos();
         Ok(())
+    }
+
+    // ── Ancestor/descendant helpers ─────────────────────────────────────
+
+    /// Count in-mempool ancestors of a transaction (not yet inserted).
+    fn count_ancestors_inner(
+        &self,
+        tx: &Transaction,
+        visited: &mut HashSet<TxId>,
+    ) -> u64 {
+        let mut count = 0u64;
+        for input in &tx.inputs {
+            let ptxid = input.previous_output.txid;
+            if !visited.insert(ptxid) {
+                continue;
+            }
+            if let Some(parent) = self.entries.get(&ptxid) {
+                count += 1;
+                count += self.count_ancestors_inner(&parent.tx.clone(), visited);
+            }
+        }
+        count
+    }
+
+    /// After inserting a new entry, update descendant stats of all its ancestors.
+    fn update_ancestor_descendants(&mut self, new_txid: TxId, fee: u64, vsize: u64) {
+        let tx = match self.entries.get(&new_txid) {
+            Some(e) => e.tx.clone(),
+            None => return,
+        };
+        let mut visited = HashSet::new();
+        let mut stack: Vec<TxId> = tx
+            .inputs
+            .iter()
+            .filter_map(|i| {
+                let ptxid = i.previous_output.txid;
+                if self.entries.contains_key(&ptxid) {
+                    Some(ptxid)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        while let Some(ancestor_id) = stack.pop() {
+            if !visited.insert(ancestor_id) {
+                continue;
+            }
+            if let Some(ancestor) = self.entries.get_mut(&ancestor_id) {
+                ancestor.descendant_count += 1;
+                ancestor.descendant_vsize += vsize;
+                ancestor.descendant_fees += fee;
+                let parent_tx = ancestor.tx.clone();
+                for inp in &parent_tx.inputs {
+                    if self.entries.contains_key(&inp.previous_output.txid) {
+                        stack.push(inp.previous_output.txid);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Accept a package of transactions (parent + children) together (E1).
+    ///
+    /// This allows child-pays-for-parent where the child's fee compensates
+    /// for a low-fee parent that would not be accepted individually.
+    pub fn accept_package(
+        &mut self,
+        txs: Vec<Transaction>,
+        chain_utxos: &impl UtxoLookup,
+        chain_height: u32,
+    ) -> Result<Vec<TxId>, MempoolError> {
+        // Sort topologically: parents before children
+        let mut sorted = Vec::with_capacity(txs.len());
+        let mut remaining: Vec<Transaction> = txs;
+        let mut accepted_txids: HashSet<TxId> = HashSet::new();
+
+        let max_rounds = remaining.len() + 1;
+        for _ in 0..max_rounds {
+            if remaining.is_empty() {
+                break;
+            }
+            let mut next_remaining = Vec::new();
+            let mut made_progress = false;
+            for tx in remaining {
+                let all_parents_available = tx.inputs.iter().all(|i| {
+                    let ptxid = i.previous_output.txid;
+                    chain_utxos.get_utxo(&i.previous_output).is_some()
+                        || self.entries.contains_key(&ptxid)
+                        || accepted_txids.contains(&ptxid)
+                });
+                if all_parents_available {
+                    let mut buf = Vec::new();
+                    tx.encode_legacy(&mut buf).ok();
+                    let txid = rbtc_crypto::sha256d(&buf);
+                    sorted.push(tx);
+                    accepted_txids.insert(txid);
+                    made_progress = true;
+                } else {
+                    next_remaining.push(tx);
+                }
+            }
+            remaining = next_remaining;
+            if !made_progress {
+                return Err(MempoolError::MissingInput(
+                    "package has unresolvable dependencies".to_string(),
+                    0,
+                ));
+            }
+        }
+
+        let mut result = Vec::new();
+        for tx in sorted {
+            let txid = self.accept_tx(tx, chain_utxos, chain_height)?;
+            result.push(txid);
+        }
+        Ok(result)
     }
 
     // ── private helpers ──────────────────────────────────────────────────────
@@ -363,8 +541,11 @@ mod tests {
         }
     }
 
-    /// scriptPubKey = OP_TRUE (0x51 = OP_1), scriptSig = empty → always succeeds
+    /// Create a spending tx with a standard P2WPKH output.
     fn spend_tx(prev_txid: TxId, value_out: u64) -> Transaction {
+        // P2WPKH scriptPubKey: OP_0 <20 bytes>
+        let mut spk = vec![0x00, 0x14];
+        spk.extend_from_slice(&[0u8; 20]);
         Transaction {
             version: 1,
             inputs: vec![TxIn {
@@ -373,7 +554,7 @@ mod tests {
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: value_out, script_pubkey: Script::new() }],
+            outputs: vec![TxOut { value: value_out, script_pubkey: Script::from_bytes(spk) }],
             lock_time: 0,
         }
     }

@@ -20,6 +20,15 @@ pub enum MempoolError {
     #[error("outputs exceed inputs (negative fee)")]
     NegativeFee,
 
+    #[error("non-standard transaction: {0}")]
+    NonStandard(String),
+
+    #[error("dust output #{0}: value {1} below threshold {2}")]
+    Dust(usize, u64, u64),
+
+    #[error("v3 transaction policy violation: {0}")]
+    V3Policy(String),
+
     // ── RBF (BIP125) ──────────────────────────────────────────────────────────
 
     #[error("conflicting transaction in mempool (input already spent) and original does not signal RBF")]
