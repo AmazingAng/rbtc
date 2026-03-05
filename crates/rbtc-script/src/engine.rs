@@ -157,6 +157,32 @@ impl ScriptFlags {
         }
     }
 
+    /// Compute `standard() & ~excluded`: start from standard flags and clear
+    /// any flag that appears in `excluded`.  Used by tx_valid.json harness.
+    pub fn standard_minus(excluded: &Self) -> Self {
+        let mut f = Self::standard();
+        if excluded.verify_p2sh                            { f.verify_p2sh = false; }
+        if excluded.verify_dersig                          { f.verify_dersig = false; }
+        if excluded.verify_witness                         { f.verify_witness = false; }
+        if excluded.verify_nulldummy                       { f.verify_nulldummy = false; }
+        if excluded.verify_cleanstack                      { f.verify_cleanstack = false; }
+        if excluded.verify_checklocktimeverify             { f.verify_checklocktimeverify = false; }
+        if excluded.verify_checksequenceverify             { f.verify_checksequenceverify = false; }
+        if excluded.verify_taproot                         { f.verify_taproot = false; }
+        if excluded.verify_strictenc                       { f.verify_strictenc = false; }
+        if excluded.verify_low_s                           { f.verify_low_s = false; }
+        if excluded.verify_sigpushonly                     { f.verify_sigpushonly = false; }
+        if excluded.verify_minimaldata                     { f.verify_minimaldata = false; }
+        if excluded.verify_discourage_upgradable_nops      { f.verify_discourage_upgradable_nops = false; }
+        if excluded.verify_discourage_upgradable_witness_program {
+            f.verify_discourage_upgradable_witness_program = false;
+        }
+        if excluded.verify_minimalif                       { f.verify_minimalif = false; }
+        if excluded.verify_nullfail                        { f.verify_nullfail = false; }
+        if excluded.verify_witness_pubkeytype              { f.verify_witness_pubkeytype = false; }
+        f
+    }
+
     /// Parse a comma-separated flags string from Bitcoin Core test vectors.
     /// Recognised tokens: NONE, P2SH, STRICTENC, DERSIG, LOW_S, SIGPUSHONLY,
     /// MINIMALDATA, DISCOURAGE_UPGRADABLE_NOPS, CLEANSTACK,
@@ -1033,7 +1059,9 @@ impl ScriptEngine {
                     if seq < 0 { return Err(ScriptError::LockTimeFailed); }
                     if seq as u32 & (1 << 31) != 0 { continue; } // disabled flag
                     let tx_seq = tx.inputs[input_index].sequence;
-                    if tx.version < 2 { return Err(ScriptError::LockTimeFailed); }
+                    // Bitcoin Core uses unsigned comparison: (uint32_t)nVersion < 2.
+                    // This means version = -1 (0xffffffff) is treated as 4294967295 ≥ 2.
+                    if (tx.version as u32) < 2 { return Err(ScriptError::LockTimeFailed); }
                     if tx_seq & (1 << 31) != 0 { return Err(ScriptError::LockTimeFailed); }
                     // Type match check
                     if (seq as u32 & (1 << 22)) != (tx_seq & (1 << 22)) {

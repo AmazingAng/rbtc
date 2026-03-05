@@ -15,3 +15,6 @@ rbtc-script     = { workspace = true }
 thiserror       = { workspace = true }
 rayon           = { workspace = true }
 tracing         = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
