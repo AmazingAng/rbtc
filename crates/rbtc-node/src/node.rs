@@ -1443,12 +1443,24 @@ impl Node {
     ) -> Result<()> {
         let block_hash = header_hash(&block.header);
 
-        // Skip if already connected.
-        let already_connected = {
+        // Skip if already connected or marked invalid.
+        let (already_connected, is_invalid) = {
             let chain = self.chain.read().await;
-            Self::is_block_connected(&chain, &block_hash)
+            let connected = Self::is_block_connected(&chain, &block_hash);
+            let invalid = chain
+                .block_index
+                .get(&block_hash)
+                .map(|bi| bi.status == BlockStatus::Invalid)
+                .unwrap_or(false);
+            (connected, invalid)
         };
-        if already_connected {
+        if already_connected || is_invalid {
+            if is_invalid {
+                debug!(
+                    "skipping invalid block {} from peer {peer_id}",
+                    block_hash.to_hex()
+                );
+            }
             self.ibd_mark_connected_all(&block_hash).await;
             return Ok(());
         }
@@ -1497,8 +1509,17 @@ impl Node {
 
         // height == chain_height + 1: validate and connect immediately, then
         // drain any consecutively-pending blocks that are now unblocked.
-        self.do_connect_block(peer_id, block_hash, block, height)
-            .await?;
+        if let Err(e) = self
+            .do_connect_block(peer_id, block_hash, block, height)
+            .await
+        {
+            // Block failed validation — already marked Invalid in do_connect_block.
+            // Still mark the IBD delivery as complete so the scheduler can move on
+            // (it will skip invalid blocks when rebuilding the canonical chain).
+            warn!("block connection failed at height {height}: {e}");
+            self.ibd_mark_connected_all(&block_hash).await;
+            return Ok(());
+        }
         self.ibd_mark_connected_all(&block_hash).await;
 
         loop {
@@ -1533,8 +1554,14 @@ impl Node {
                 self.pending_blocks.insert(next_height, candidates);
             }
             let p_hash = header_hash(&p_block.header);
-            self.do_connect_block(p_peer, p_hash, p_block, next_height)
-                .await?;
+            if let Err(e) = self
+                .do_connect_block(p_peer, p_hash, p_block, next_height)
+                .await
+            {
+                warn!("pending block connection failed at height {next_height}: {e}");
+                self.ibd_mark_connected_all(&p_hash).await;
+                break;
+            }
             // Mark connected here — not at cache time — so peer batch tracking
             // reflects actual chain progress, not just block delivery.
             self.ibd_mark_connected_all(&p_hash).await;
@@ -1792,9 +1819,20 @@ impl Node {
             }
             Err(e) => {
                 warn!(
-                    "block {} rejected from peer {peer_id}: {e}",
+                    "block {} at height {height} rejected from peer {peer_id}: {e}",
                     block_hash.to_hex()
                 );
+                // Core-style: mark the block as invalid so it is never retried.
+                {
+                    let mut chain = self.chain.write().await;
+                    if let Some(bi) = chain.block_index.get_mut(&block_hash) {
+                        bi.status = BlockStatus::Invalid;
+                    }
+                }
+                return Err(anyhow!(
+                    "block {} rejected: {e}",
+                    block_hash.to_hex()
+                ));
             }
         }
 
