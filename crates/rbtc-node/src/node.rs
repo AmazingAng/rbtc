@@ -104,9 +104,10 @@ pub struct Node {
     /// Key = block_hash, Value = (compact block, list of already-filled tx slots).
     pending_compact: HashMap<rbtc_primitives::hash::Hash256, (CompactBlock, Vec<Option<rbtc_primitives::transaction::Transaction>>)>,
     /// Out-of-order blocks received during parallel IBD, waiting for predecessors.
-    /// Key = block height, Value = (sender peer_id, block).
-    /// Only the first copy for each height is kept (subsequent duplicates are dropped).
-    pending_blocks: HashMap<u32, (u64, rbtc_primitives::block::Block)>,
+    /// Key = block height, Value = candidate blocks for that height.
+    /// We keep multiple candidates to avoid dropping the valid chain block when
+    /// an alternative block at the same height arrives first.
+    pending_blocks: HashMap<u32, Vec<(u64, rbtc_primitives::block::Block)>>,
     /// Timestamp of last peer address persistence flush
     last_peer_persist: std::time::Instant,
     /// Peers that have been asked to disconnect but haven't emitted
@@ -1031,6 +1032,30 @@ impl Node {
         base.min(max_w)
     }
 
+    /// Returns true when we already cached at least one pending block at `height`
+    /// that can extend the current active tip immediately.
+    async fn has_connectable_pending_at_height(&self, height: u32) -> bool {
+        let Some(candidates) = self.pending_blocks.get(&height) else {
+            return false;
+        };
+        let expected_prev = {
+            let chain = self.chain.read().await;
+            if let Some(tip) = chain.best_hash() {
+                tip
+            } else if height == 1 {
+                match Hash256::from_hex(chain.network.genesis_hash()) {
+                    Ok(h) => h,
+                    Err(_) => return false,
+                }
+            } else {
+                return false;
+            }
+        };
+        candidates
+            .iter()
+            .any(|(_, block)| block.header.prev_block == expected_prev)
+    }
+
     fn adaptive_global_window(&self, peer_count: usize) -> u32 {
         if self.args.ibd_global_window > 0 {
             return self.args.ibd_global_window;
@@ -1131,7 +1156,7 @@ impl Node {
             // If frontier block is already cached in pending_blocks, it will be
             // drained automatically once the chain tip advances — no need to
             // treat it as pending or preempt peers for it.
-            let frontier_cached = self.pending_blocks.contains_key(&frontier);
+            let frontier_cached = self.has_connectable_pending_at_height(frontier).await;
             if !frontier_connected && !frontier_cached {
                 frontier_pending = true;
                 let frontier_owners: Vec<(u64, Duration)> = self
@@ -1423,13 +1448,13 @@ impl Node {
                 chain_height,
                 peer_id
             );
-            self.pending_blocks.entry(height).or_insert((peer_id, block));
-            // Mark this block as delivered so the peer becomes idle and can be
-            // reassigned to new work (e.g., frontier recovery).  The frontier-
-            // pending logic in assign_blocks_to_peers() already prevents runaway
-            // ahead-assignment by capping per-peer windows and reserving idle
-            // peers for frontier failover.
-            self.ibd_mark_connected_all(&block_hash).await;
+            let candidates = self.pending_blocks.entry(height).or_default();
+            let already_cached = candidates
+                .iter()
+                .any(|(_, b)| header_hash(&b.header) == block_hash);
+            if !already_cached {
+                candidates.push((peer_id, block));
+            }
             return Ok(());
         }
 
@@ -1446,9 +1471,34 @@ impl Node {
 
         loop {
             let next_height = self.chain.read().await.height() + 1;
-            let Some((p_peer, p_block)) = self.pending_blocks.remove(&next_height) else {
+            let Some(mut candidates) = self.pending_blocks.remove(&next_height) else {
                 break;
             };
+            let expected_prev = {
+                let chain = self.chain.read().await;
+                if let Some(tip) = chain.best_hash() {
+                    tip
+                } else if next_height == 1 {
+                    Hash256::from_hex(chain.network.genesis_hash())
+                        .map_err(|_| anyhow!("invalid genesis hash encoding for {:?}", chain.network))?
+                } else {
+                    break;
+                }
+            };
+            let Some((idx, _)) = candidates
+                .iter()
+                .enumerate()
+                .find(|(_, (_, b))| b.header.prev_block == expected_prev)
+            else {
+                // Keep candidates for retry/diagnostics. If none extend current tip,
+                // this height cannot connect yet.
+                self.pending_blocks.insert(next_height, candidates);
+                break;
+            };
+            let (p_peer, p_block) = candidates.remove(idx);
+            if !candidates.is_empty() {
+                self.pending_blocks.insert(next_height, candidates);
+            }
             let p_hash = header_hash(&p_block.header);
             self.do_connect_block(p_peer, p_hash, p_block, next_height).await?;
             // Mark connected here — not at cache time — so peer batch tracking
@@ -2109,7 +2159,7 @@ impl Node {
                 };
                 // Skip failover if frontier block is already cached and waiting
                 // to be drained — it will connect once prior blocks finish.
-                let frontier_cached = self.pending_blocks.contains_key(&frontier);
+                let frontier_cached = self.has_connectable_pending_at_height(frontier).await;
                 if !frontier_connected && !frontier_cached {
                     let frontier_owner = self
                         .ibd
