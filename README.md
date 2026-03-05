@@ -397,7 +397,6 @@ cargo llvm-cov --workspace --all-features --tests --lcov --output-path lcov.info
 
 - No BIP37 bloom filtering
 - Compact Blocks (BIP152) implemented but only tested on regtest; mainnet relay may have edge-case short-ID collisions
-- Signet challenge validation not implemented
 - Mempool eviction policy not yet implemented (no size cap)
 - `sendrawtransaction` relay requires script-valid inputs (P2PKH etc.); bare scripts that rely on policy flags may differ from Bitcoin Core behavior
 - Wallet imported keys (via `importprivkey`) are cached only for the current session; WIF keys are not re-derived from the master xprv

@@ -134,6 +134,8 @@ pub struct Node {
     assumevalid_skipped_blocks: u64,
     assumevalid_saved_verify_ms: u128,
     assumevalid_last_height: Option<u32>,
+    /// Optional custom signet challenge script (from --signet-challenge).
+    signet_challenge: Option<Vec<u8>>,
     /// Per-peer delivery/timeout stats for adaptive IBD scheduling.
     peer_ibd_stats: HashMap<u64, PeerIbdStats>,
 }
@@ -229,6 +231,7 @@ impl Node {
         };
         let min_chain_work = args.min_chain_work;
         let check_all_scripts = args.check_all_scripts;
+        let signet_challenge = args.signet_challenge.as_ref().and_then(|h| hex::decode(h).ok());
 
         Ok(Self {
             args,
@@ -262,6 +265,7 @@ impl Node {
             assumevalid_skipped_blocks: 0,
             assumevalid_saved_verify_ms: 0,
             assumevalid_last_height: None,
+            signet_challenge,
             peer_ibd_stats: HashMap::new(),
         })
     }
@@ -1500,6 +1504,7 @@ impl Node {
                 flags,
                 network,
                 mtp_provider: &mtp_provider,
+                signet_challenge: self.signet_challenge.as_deref(),
             };
             verify_block_with_options(&ctx, &self.utxo_cache, assumevalid_skip_scripts)
         };

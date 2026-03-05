@@ -63,6 +63,8 @@ pub enum ConsensusError {
     AlreadyKnown,
     #[error("genesis block mismatch")]
     GenesisMismatch,
+    #[error("signet challenge verification failed: {0}")]
+    SignetChallengeFailed(String),
 
     // Codec / IO errors
     #[error("decode error: {0}")]

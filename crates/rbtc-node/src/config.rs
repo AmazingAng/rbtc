@@ -104,6 +104,11 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub check_all_scripts: bool,
 
+    /// Custom signet challenge script (hex). Overrides the default signet
+    /// challenge. Only used when --network=signet.
+    #[arg(long, value_name = "HEX")]
+    pub signet_challenge: Option<String>,
+
     /// Script execution cache size (entries). 0 disables script execution cache.
     #[arg(long, value_name = "N", default_value = "100000")]
     pub script_cache_size: usize,

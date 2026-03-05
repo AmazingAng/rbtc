@@ -93,6 +93,8 @@ pub struct BlockValidationContext<'a> {
     pub network: Network,
     /// Chain MTP lookup by height (used by BIP68 relative time locks).
     pub mtp_provider: &'a dyn MedianTimeProvider,
+    /// Optional signet challenge script override (None uses network default).
+    pub signet_challenge: Option<&'a [u8]>,
 }
 
 /// Verify a complete block against the UTXO set.
@@ -114,7 +116,32 @@ pub fn verify_block_with_options(
     let header = &block.header;
 
     // ── Header checks ────────────────────────────────────────────────────
-    verify_block_header(header, ctx.expected_bits, ctx.median_time_past, ctx.network_time)?;
+    if ctx.network != Network::Signet {
+        // Signet blocks do not require PoW; they are authenticated by the challenge script.
+        verify_block_header(header, ctx.expected_bits, ctx.median_time_past, ctx.network_time)?;
+    } else {
+        // For signet we still check nBits and timestamps, but not PoW.
+        if header.bits != ctx.expected_bits {
+            return Err(ConsensusError::BadBits(header.bits));
+        }
+        if header.time <= ctx.median_time_past {
+            return Err(ConsensusError::TimestampTooOld);
+        }
+        if header.time > ctx.network_time.saturating_add(MAX_FUTURE_BLOCK_TIME as u32) {
+            return Err(ConsensusError::TimestampTooNew);
+        }
+    }
+
+    // ── Signet challenge verification (BIP325) ───────────────────────────
+    if ctx.network == Network::Signet {
+        let challenge = ctx
+            .signet_challenge
+            .or_else(|| ctx.network.signet_challenge())
+            .unwrap_or(&[]);
+        if !challenge.is_empty() {
+            verify_signet_block_solution(block, challenge)?;
+        }
+    }
 
     // ── Structural checks ────────────────────────────────────────────────
     if block.transactions.is_empty() {
@@ -613,6 +640,260 @@ fn enforce_bip30(
     Ok(())
 }
 
+// ── Signet challenge verification (BIP325) ────────────────────────────────
+
+/// 4-byte signet header magic embedded after OP_RETURN in the coinbase.
+const SIGNET_HEADER: [u8; 4] = [0xec, 0xc7, 0xda, 0xa2];
+
+/// Extract the signet solution (scriptSig, witness) from the coinbase.
+///
+/// Bitcoin Core scans coinbase outputs for `OP_RETURN <push SIGNET_HEADER || solution>`.
+/// The solution is encoded as: `<scriptSig_len> <scriptSig> <witness>`.
+fn extract_signet_solution(
+    coinbase: &rbtc_primitives::transaction::Transaction,
+) -> Option<(rbtc_primitives::script::Script, Vec<Vec<u8>>)> {
+    use rbtc_primitives::codec::{Decodable, VarInt};
+
+    for output in &coinbase.outputs {
+        let spk = output.script_pubkey.as_bytes();
+        // OP_RETURN (0x6a) followed by a push of data starting with SIGNET_HEADER
+        if spk.len() < 6 || spk[0] != 0x6a {
+            continue;
+        }
+        // Parse the push opcode after OP_RETURN
+        let (push_len, data_start) = if spk[1] <= 0x4b {
+            (spk[1] as usize, 2usize)
+        } else if spk[1] == 0x4c && spk.len() > 3 {
+            // OP_PUSHDATA1
+            (spk[2] as usize, 3usize)
+        } else if spk[1] == 0x4d && spk.len() > 4 {
+            // OP_PUSHDATA2
+            (u16::from_le_bytes([spk[2], spk[3]]) as usize, 4usize)
+        } else {
+            continue;
+        };
+        if data_start + push_len > spk.len() {
+            continue;
+        }
+        let data = &spk[data_start..data_start + push_len];
+        if data.len() < 4 || data[..4] != SIGNET_HEADER {
+            continue;
+        }
+        let solution = &data[4..];
+        // Decode solution: varint(scriptSig_len) || scriptSig || witness
+        let mut cursor = std::io::Cursor::new(solution);
+        let sig_len = match VarInt::decode(&mut cursor) {
+            Ok(v) => v.0 as usize,
+            Err(_) => continue,
+        };
+        let pos = cursor.position() as usize;
+        if pos + sig_len > solution.len() {
+            continue;
+        }
+        let script_sig =
+            rbtc_primitives::script::Script::from_bytes(solution[pos..pos + sig_len].to_vec());
+
+        // Remaining bytes are the witness stack
+        let witness_data = &solution[pos + sig_len..];
+        let witness = if witness_data.is_empty() {
+            Vec::new()
+        } else {
+            let mut wcursor = std::io::Cursor::new(witness_data);
+            let stack_len = match VarInt::decode(&mut wcursor) {
+                Ok(v) => v.0 as usize,
+                Err(_) => return Some((script_sig, Vec::new())),
+            };
+            let mut items = Vec::with_capacity(stack_len);
+            for _ in 0..stack_len {
+                let item = match Vec::<u8>::decode(&mut wcursor) {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+                items.push(item);
+            }
+            items
+        };
+
+        return Some((script_sig, witness));
+    }
+    None
+}
+
+/// Compute the "to_spend" transaction hash for signet block signing.
+///
+/// This is the virtual transaction output that the signet signer must spend.
+/// Commits to the block header with nonce=0 and the signet output stripped
+/// from the coinbase.
+fn signet_txid_to_spend(
+    block: &Block,
+    challenge: &[u8],
+) -> rbtc_primitives::hash::Hash256 {
+    use rbtc_primitives::codec::Encodable;
+
+    // Build a modified header with nonce=0
+    let mut modified_header = block.header.clone();
+    modified_header.nonce = 0;
+
+    // Build modified coinbase: strip the signet commitment output
+    let mut modified_coinbase = block.transactions[0].clone();
+    modified_coinbase.outputs.retain(|output| {
+        let spk = output.script_pubkey.as_bytes();
+        if spk.len() < 6 || spk[0] != 0x6a {
+            return true; // keep non-OP_RETURN outputs
+        }
+        let (push_len, data_start) = if spk[1] <= 0x4b {
+            (spk[1] as usize, 2usize)
+        } else if spk[1] == 0x4c && spk.len() > 3 {
+            (spk[2] as usize, 3usize)
+        } else if spk[1] == 0x4d && spk.len() > 4 {
+            (u16::from_le_bytes([spk[2], spk[3]]) as usize, 4usize)
+        } else {
+            return true;
+        };
+        if data_start + push_len > spk.len() {
+            return true;
+        }
+        let data = &spk[data_start..data_start + push_len];
+        !(data.len() >= 4 && data[..4] == SIGNET_HEADER)
+    });
+    // Clear witness from modified coinbase (not part of the commitment)
+    for input in &mut modified_coinbase.inputs {
+        input.witness.clear();
+    }
+
+    // Recompute merkle root with modified coinbase
+    let mut txids: Vec<rbtc_primitives::hash::Hash256> = Vec::with_capacity(block.transactions.len());
+    let mut buf = Vec::new();
+    modified_coinbase.encode_legacy(&mut buf).ok();
+    txids.push(sha256d(&buf));
+    for tx in &block.transactions[1..] {
+        txids.push(compute_txid(tx));
+    }
+    modified_header.merkle_root = merkle_root(&txids).unwrap_or(Hash256::ZERO);
+
+    // Serialize the modified header
+    let header_bytes = encode_block_header(&modified_header);
+
+    // Build the "to_spend" transaction:
+    // version=0, 1 input (outpoint=0:0xffffffff, scriptSig=header_bytes, seq=0),
+    // 1 output (value=0, scriptPubKey=challenge), locktime=0
+    let to_spend = rbtc_primitives::transaction::Transaction {
+        version: 0,
+        inputs: vec![rbtc_primitives::transaction::TxIn {
+            previous_output: rbtc_primitives::transaction::OutPoint::null(),
+            script_sig: rbtc_primitives::script::Script::from_bytes(
+                // Push the block header as data: length prefix + data
+                {
+                    let mut s = Vec::new();
+                    // OP_PUSHDATA1 (0x4c) because header is 80 bytes > 75
+                    s.push(0x4c);
+                    s.push(header_bytes.len() as u8);
+                    s.extend_from_slice(&header_bytes);
+                    s
+                },
+            ),
+            sequence: 0,
+            witness: Vec::new(),
+        }],
+        outputs: vec![rbtc_primitives::transaction::TxOut {
+            value: 0,
+            script_pubkey: rbtc_primitives::script::Script::from_bytes(challenge.to_vec()),
+        }],
+        lock_time: 0,
+    };
+
+    // Compute txid of to_spend
+    let mut to_spend_buf = Vec::new();
+    to_spend.encode_legacy(&mut to_spend_buf).ok();
+    sha256d(&to_spend_buf)
+}
+
+/// Verify the signet block solution (BIP325).
+///
+/// Returns Ok(()) if the block satisfies the signet challenge, or if the
+/// network is not signet.
+pub fn verify_signet_block_solution(
+    block: &Block,
+    challenge: &[u8],
+) -> Result<(), ConsensusError> {
+    use rbtc_script::{ScriptContext, ScriptFlags, verify_input};
+
+    // Genesis block is exempt from signet challenge
+    if block.header.prev_block == Hash256::ZERO {
+        return Ok(());
+    }
+
+    if block.transactions.is_empty() {
+        return Err(ConsensusError::SignetChallengeFailed("no coinbase".into()));
+    }
+
+    let (solution_sig, solution_witness) =
+        extract_signet_solution(&block.transactions[0]).ok_or_else(|| {
+            ConsensusError::SignetChallengeFailed("no signet solution in coinbase".into())
+        })?;
+
+    let to_spend_txid = signet_txid_to_spend(block, challenge);
+
+    // Build the "to_sign" spending transaction
+    let to_sign = rbtc_primitives::transaction::Transaction {
+        version: 0,
+        inputs: vec![rbtc_primitives::transaction::TxIn {
+            previous_output: rbtc_primitives::transaction::OutPoint {
+                txid: to_spend_txid,
+                vout: 0,
+            },
+            script_sig: solution_sig,
+            sequence: 0,
+            witness: solution_witness,
+        }],
+        outputs: vec![rbtc_primitives::transaction::TxOut {
+            value: 0,
+            script_pubkey: rbtc_primitives::script::Script::from_bytes(vec![0x6a]), // OP_RETURN
+        }],
+        lock_time: 0,
+    };
+
+    let prevout = rbtc_primitives::transaction::TxOut {
+        value: 0,
+        script_pubkey: rbtc_primitives::script::Script::from_bytes(challenge.to_vec()),
+    };
+
+    let all_prevouts = vec![prevout.clone()];
+
+    // Use standard flags but with P2SH and witness enabled
+    let flags = ScriptFlags {
+        verify_p2sh: true,
+        verify_dersig: true,
+        verify_witness: true,
+        verify_nulldummy: true,
+        verify_cleanstack: true,
+        verify_checklocktimeverify: true,
+        verify_checksequenceverify: true,
+        verify_taproot: true,
+        verify_strictenc: false,
+        verify_low_s: false,
+        verify_sigpushonly: false,
+        verify_minimaldata: false,
+        verify_discourage_upgradable_nops: false,
+        verify_discourage_upgradable_witness_program: false,
+        verify_minimalif: false,
+        verify_nullfail: true,
+        verify_witness_pubkeytype: true,
+    };
+
+    let ctx = ScriptContext {
+        tx: &to_sign,
+        input_index: 0,
+        prevout: &all_prevouts[0],
+        flags,
+        all_prevouts: &all_prevouts,
+    };
+
+    verify_input(&ctx).map_err(|e| {
+        ConsensusError::SignetChallengeFailed(format!("script verification failed: {e}"))
+    })
+}
+
 pub fn encode_block_header(header: &rbtc_primitives::block::BlockHeader) -> Vec<u8> {
     let mut buf = Vec::with_capacity(80);
     header.version.encode(&mut buf).ok();
@@ -688,6 +969,7 @@ mod tests {
             flags: ScriptFlags::default(),
             network: Network::Regtest,
             mtp_provider: &TestMtpProvider,
+            signet_challenge: None,
         };
         let r = verify_block(&ctx, &UtxoSet::new());
         assert!(r.is_err());
@@ -719,6 +1001,7 @@ mod tests {
             flags: ScriptFlags::default(),
             network: Network::Regtest,
             mtp_provider: &TestMtpProvider,
+            signet_challenge: None,
         };
         let r = verify_block(&ctx, &UtxoSet::new());
         assert!(r.is_err());
@@ -749,6 +1032,7 @@ mod tests {
             flags: ScriptFlags::default(),
             network: Network::Regtest,
             mtp_provider: &TestMtpProvider,
+            signet_challenge: None,
         };
         let r = verify_block(&ctx, &UtxoSet::new());
         assert!(r.is_err());
@@ -780,6 +1064,7 @@ mod tests {
             flags: ScriptFlags::default(),
             network: Network::Regtest,
             mtp_provider: &TestMtpProvider,
+            signet_challenge: None,
         };
         let r = verify_block(&ctx, &UtxoSet::new());
         assert!(r.is_err());
@@ -823,6 +1108,7 @@ mod tests {
             flags: ScriptFlags::default(),
             network: Network::Regtest,
             mtp_provider: &TestMtpProvider,
+            signet_challenge: None,
         };
         let r = verify_block(&ctx, &UtxoSet::new());
         assert!(r.is_err());
@@ -867,6 +1153,7 @@ mod tests {
             flags: ScriptFlags::default(),
             network: Network::Regtest,
             mtp_provider: &TestMtpProvider,
+            signet_challenge: None,
         };
         let fees = verify_block(&ctx, &UtxoSet::new()).unwrap();
         assert_eq!(fees, 0);
@@ -1248,6 +1535,7 @@ mod tests {
             flags: ScriptFlags::default(),
             network: Network::Regtest,
             mtp_provider: &TestMtpProvider,
+            signet_challenge: None,
         };
 
         let fees = verify_block(&ctx, &utxos).unwrap();
@@ -1335,6 +1623,7 @@ mod tests {
             flags: ScriptFlags::default(),
             network: Network::Regtest,
             mtp_provider: &TestMtpProvider,
+            signet_challenge: None,
         };
 
         let err = verify_block(&ctx, &utxos).unwrap_err();
@@ -1395,6 +1684,7 @@ mod tests {
             flags: ScriptFlags::default(),
             network: Network::Regtest,
             mtp_provider: &TestMtpProvider,
+            signet_challenge: None,
         };
 
         let err = verify_block(&ctx, &UtxoSet::new()).unwrap_err();
@@ -1491,6 +1781,7 @@ mod tests {
             flags: ScriptFlags::default(),
             network: Network::Regtest,
             mtp_provider: &TestMtpProvider,
+            signet_challenge: None,
         };
         let err = verify_block(&ctx, &utxos).unwrap_err();
         assert!(matches!(err, ConsensusError::CoinbaseNotMature(_, _)));
@@ -1541,6 +1832,7 @@ mod tests {
             flags: ScriptFlags::default(),
             network: Network::Regtest,
             mtp_provider: &TestMtpProvider,
+            signet_challenge: None,
         };
         let fees = verify_block(&ctx, &utxos).unwrap();
         assert_eq!(fees, 4_000); // 5000 - 1000
@@ -1576,6 +1868,7 @@ mod tests {
             flags: ScriptFlags::default(),
             network: Network::Regtest,
             mtp_provider: &TestMtpProvider,
+            signet_challenge: None,
         };
         assert!(verify_block(&ctx, &UtxoSet::new()).is_ok());
     }
@@ -1621,6 +1914,7 @@ mod tests {
             flags: ScriptFlags::default(),
             network: Network::Regtest,
             mtp_provider: &TestMtpProvider,
+            signet_challenge: None,
         };
         let err = verify_block(&ctx, &UtxoSet::new()).unwrap_err();
         assert!(matches!(err, ConsensusError::BlockTooLarge(_, _)));
@@ -1652,6 +1946,7 @@ mod tests {
             flags: ScriptFlags::default(),
             network: Network::Regtest, // Regtest: bip34_height=0
             mtp_provider: &TestMtpProvider,
+            signet_challenge: None,
         };
         assert!(verify_block(&ctx, &UtxoSet::new()).is_ok());
     }
@@ -1681,6 +1976,7 @@ mod tests {
             flags: ScriptFlags::default(),
             network: Network::Regtest,
             mtp_provider: &TestMtpProvider,
+            signet_challenge: None,
         };
         let err = verify_block(&ctx, &UtxoSet::new()).unwrap_err();
         assert!(matches!(err, ConsensusError::InvalidTx(_)));
@@ -1720,6 +2016,7 @@ mod tests {
             flags: ScriptFlags::default(),
             network: Network::Regtest,
             mtp_provider: &TestMtpProvider,
+            signet_challenge: None,
         };
         assert!(verify_block(&ctx, &UtxoSet::new()).is_ok());
     }
@@ -1751,6 +2048,7 @@ mod tests {
             flags: ScriptFlags::default(),
             network: Network::Regtest,
             mtp_provider: &TestMtpProvider,
+            signet_challenge: None,
         };
         assert!(verify_block(&ctx, &UtxoSet::new()).is_ok());
     }
@@ -1781,6 +2079,7 @@ mod tests {
             flags: ScriptFlags::default(),
             network: Network::Regtest,
             mtp_provider: &TestMtpProvider,
+            signet_challenge: None,
         };
         let err = verify_block(&ctx, &UtxoSet::new()).unwrap_err();
         assert!(matches!(err, ConsensusError::BadCoinbaseAmount(_, _)));
@@ -1834,6 +2133,7 @@ mod tests {
             flags: ScriptFlags::default(),
             network: Network::Regtest,
             mtp_provider: &TestMtpProvider,
+            signet_challenge: None,
         };
         let fees = verify_block(&ctx, &utxos).unwrap();
         assert_eq!(fees, fee);
@@ -1941,6 +2241,7 @@ mod tests {
             flags: ScriptFlags::default(),
             network: Network::Regtest,
             mtp_provider: &TestMtpProvider,
+            signet_challenge: None,
         };
         let err = verify_block(&ctx, &UtxoSet::new()).unwrap_err();
         assert!(matches!(err, ConsensusError::InvalidTx(_)));
@@ -1969,6 +2270,7 @@ mod tests {
             flags: ScriptFlags::default(),
             network: Network::Regtest,
             mtp_provider: &TestMtpProvider,
+            signet_challenge: None,
         };
         let err = verify_block(&ctx, &UtxoSet::new()).unwrap_err();
         assert!(matches!(err, ConsensusError::InvalidTx(_)));
@@ -2046,6 +2348,7 @@ mod tests {
             flags: ScriptFlags::default(),
             network: Network::Regtest,
             mtp_provider: &TestMtpProvider,
+            signet_challenge: None,
         };
         let fees = verify_block(&ctx, &utxos).unwrap();
         assert_eq!(fees, 3_000); // (5000-4000) + (5000-3000) = 1000 + 2000
@@ -2097,6 +2400,7 @@ mod tests {
             flags: ScriptFlags::default(),
             network: Network::Regtest,
             mtp_provider: &TestMtpProvider,
+            signet_challenge: None,
         };
         let err = verify_block(&ctx, &utxos).unwrap_err();
         assert!(matches!(err, ConsensusError::NegativeFee));
@@ -2122,5 +2426,124 @@ mod tests {
         // Verify hash matches known genesis hash
         let hash_hex = hash.to_hex();
         assert_eq!(hash_hex, Network::Mainnet.genesis_hash());
+    }
+
+    // ── Signet challenge tests ─────────────────────────────────────────────
+
+    #[test]
+    fn signet_extract_solution_no_opreturn() {
+        // Coinbase with no OP_RETURN outputs -> None
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: Script::from_bytes(vec![0x04, 0x01, 0x00, 0x00, 0x00]),
+                sequence: 0xffffffff,
+                witness: Vec::new(),
+            }],
+            outputs: vec![TxOut {
+                value: 5_000_000_000,
+                script_pubkey: Script::from_bytes(vec![0x76, 0xa9, 0x14,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0x88, 0xac]),
+            }],
+            lock_time: 0,
+        };
+        assert!(extract_signet_solution(&coinbase).is_none());
+    }
+
+    #[test]
+    fn signet_extract_solution_with_valid_header() {
+        // Build a coinbase with OP_RETURN + SIGNET_HEADER + solution
+        let mut solution_data = Vec::new();
+        // SIGNET_HEADER
+        solution_data.extend_from_slice(&SIGNET_HEADER);
+        // scriptSig: varint(3) + 3 bytes
+        solution_data.push(0x03); // varint(3)
+        solution_data.extend_from_slice(&[0xaa, 0xbb, 0xcc]);
+        // witness: varint(1) item, varint(2) 2-byte item
+        solution_data.push(0x01); // 1 stack item
+        solution_data.push(0x02); // 2 bytes
+        solution_data.extend_from_slice(&[0xdd, 0xee]);
+
+        // OP_RETURN <push solution_data>
+        let mut spk = vec![0x6a]; // OP_RETURN
+        spk.push(solution_data.len() as u8); // direct push (< 75)
+        spk.extend_from_slice(&solution_data);
+
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: Script::from_bytes(vec![0x04, 0x01, 0x00, 0x00, 0x00]),
+                sequence: 0xffffffff,
+                witness: Vec::new(),
+            }],
+            outputs: vec![
+                TxOut { value: 5_000_000_000, script_pubkey: Script::new() },
+                TxOut { value: 0, script_pubkey: Script::from_bytes(spk) },
+            ],
+            lock_time: 0,
+        };
+
+        let (sig, wit) = extract_signet_solution(&coinbase).expect("should extract");
+        assert_eq!(sig.as_bytes(), &[0xaa, 0xbb, 0xcc]);
+        assert_eq!(wit.len(), 1);
+        assert_eq!(wit[0], vec![0xdd, 0xee]);
+    }
+
+    #[test]
+    fn signet_genesis_exempt() {
+        // Genesis block (prev_block = ZERO) should pass challenge check
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_block: Hash256::ZERO,
+                merkle_root: Hash256::ZERO,
+                time: 0,
+                bits: 0,
+                nonce: 0,
+            },
+            transactions: vec![],
+        };
+        // Any challenge should pass for genesis
+        let challenge = &[0x51, 0xae]; // OP_1 OP_CHECKMULTISIG (dummy)
+        assert!(verify_signet_block_solution(&block, challenge).is_ok());
+    }
+
+    #[test]
+    fn signet_no_solution_fails() {
+        // Non-genesis block with no signet solution should fail
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_block: Hash256([1; 32]), // non-zero
+                merkle_root: Hash256::ZERO,
+                time: 0,
+                bits: 0,
+                nonce: 0,
+            },
+            transactions: vec![Transaction {
+                version: 1,
+                inputs: vec![TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: Script::from_bytes(vec![0x04, 0x01, 0x00, 0x00, 0x00]),
+                    sequence: 0xffffffff,
+                    witness: Vec::new(),
+                }],
+                outputs: vec![TxOut { value: 0, script_pubkey: Script::new() }],
+                lock_time: 0,
+            }],
+        };
+        let challenge = &[0x51, 0xae];
+        let err = verify_signet_block_solution(&block, challenge).unwrap_err();
+        assert!(matches!(err, ConsensusError::SignetChallengeFailed(_)));
+    }
+
+    #[test]
+    fn signet_challenge_available_for_signet_network() {
+        assert!(Network::Signet.signet_challenge().is_some());
+        assert!(Network::Mainnet.signet_challenge().is_none());
+        assert!(Network::Regtest.signet_challenge().is_none());
     }
 }

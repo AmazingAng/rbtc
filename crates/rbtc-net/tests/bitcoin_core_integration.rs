@@ -493,3 +493,196 @@ async fn test_sync_first_10_blocks() {
     assert_eq!(received, wanted.len(), "did not receive all blocks");
     println!("[sync] verified {received} blocks ✓");
 }
+
+// ── Test 6: merkle root verification (C4) ───────────────────────────────────
+
+/// Fetch blocks from Bitcoin Core and verify that our merkle root computation
+/// matches the header's merkle_root field.  This exercises the CVE-2012-2459
+/// defense code path (duplicate txid detection) and ensures our merkle tree
+/// implementation matches Core's.
+#[tokio::test]
+async fn test_merkle_root_matches_header() {
+    let (mut reader, mut writer, peer_height) =
+        match connect_and_handshake(Network::Regtest).await {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("skipping: {e}");
+                return;
+            }
+        };
+
+    if peer_height < 5 {
+        eprintln!("peer only has {peer_height} blocks; need ≥5 -- skipping");
+        return;
+    }
+
+    let magic = Network::Regtest.magic();
+
+    // Get headers from genesis
+    let genesis =
+        Hash256::from_hex("0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206")
+            .unwrap();
+    writer
+        .write_all(
+            &Message::new(
+                magic,
+                NetworkMessage::GetHeaders(GetBlocksMessage::new(vec![genesis])),
+            )
+            .encode_to_bytes(),
+        )
+        .await
+        .unwrap();
+
+    let headers = timeout(TIMEOUT, async {
+        loop {
+            let msg = Message::read_from(&mut reader, &magic).await.unwrap();
+            if let NetworkMessage::Headers(h) = msg.payload {
+                return h;
+            }
+        }
+    })
+    .await
+    .expect("headers timed out");
+
+    // Compute hashes of first 5 headers and fetch the blocks
+    let wanted: Vec<Hash256> = headers
+        .headers
+        .iter()
+        .take(5)
+        .map(|h| {
+            use rbtc_crypto::sha256d;
+            use rbtc_primitives::codec::Encodable;
+            let mut buf = Vec::with_capacity(80);
+            h.version.encode(&mut buf).ok();
+            h.prev_block.0.encode(&mut buf).ok();
+            h.merkle_root.0.encode(&mut buf).ok();
+            h.time.encode(&mut buf).ok();
+            h.bits.encode(&mut buf).ok();
+            h.nonce.encode(&mut buf).ok();
+            sha256d(&buf)
+        })
+        .collect();
+
+    let inv: Vec<Inventory> = wanted
+        .iter()
+        .map(|h| Inventory { inv_type: InvType::WitnessBlock, hash: *h })
+        .collect();
+
+    writer
+        .write_all(&Message::new(magic, NetworkMessage::GetData(inv)).encode_to_bytes())
+        .await
+        .unwrap();
+
+    let mut verified = 0usize;
+    timeout(Duration::from_secs(15), async {
+        while verified < wanted.len() {
+            let msg = Message::read_from(&mut reader, &magic).await.unwrap();
+            if let NetworkMessage::Block(block) = msg.payload {
+                // Compute merkle root from transactions
+                let txids: Vec<Hash256> = block.transactions.iter().map(|tx| {
+                    let mut buf = Vec::new();
+                    tx.encode_legacy(&mut buf).ok();
+                    rbtc_crypto::sha256d(&buf)
+                }).collect();
+
+                let computed_root = rbtc_crypto::merkle_root(&txids).unwrap_or(Hash256::ZERO);
+                assert_eq!(
+                    computed_root, block.header.merkle_root,
+                    "merkle root mismatch at block #{verified}"
+                );
+
+                // Also verify no duplicate txids (CVE-2012-2459)
+                let unique: std::collections::HashSet<Hash256> = txids.iter().copied().collect();
+                assert_eq!(
+                    unique.len(), txids.len(),
+                    "duplicate txid found in block #{verified}"
+                );
+
+                verified += 1;
+                println!(
+                    "  block #{verified}: merkle_root OK, txns={}, no dup txids ✓",
+                    block.transactions.len()
+                );
+            }
+        }
+    })
+    .await
+    .expect("block fetch timed out");
+
+    println!("[merkle] verified {verified} blocks ✓");
+}
+
+// ── Test 7: block version bits parsing (C3) ─────────────────────────────────
+
+/// Fetch block headers from Bitcoin Core regtest and verify that BIP9 version
+/// bits are correctly represented: the top 3 bits should follow the BIP9
+/// pattern (bit 29 set for version-bits signaling blocks on regtest).
+#[tokio::test]
+async fn test_block_version_bits() {
+    let (mut reader, mut writer, peer_height) =
+        match connect_and_handshake(Network::Regtest).await {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("skipping: {e}");
+                return;
+            }
+        };
+
+    if peer_height < 1 {
+        eprintln!("peer has no blocks -- skipping");
+        return;
+    }
+
+    let magic = Network::Regtest.magic();
+    let genesis =
+        Hash256::from_hex("0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206")
+            .unwrap();
+
+    writer
+        .write_all(
+            &Message::new(
+                magic,
+                NetworkMessage::GetHeaders(GetBlocksMessage::new(vec![genesis])),
+            )
+            .encode_to_bytes(),
+        )
+        .await
+        .unwrap();
+
+    let headers = timeout(TIMEOUT, async {
+        loop {
+            let msg = Message::read_from(&mut reader, &magic).await.unwrap();
+            if let NetworkMessage::Headers(h) = msg.payload {
+                return h;
+            }
+        }
+    })
+    .await
+    .expect("headers timed out");
+
+    println!("[version-bits] received {} headers", headers.headers.len());
+    assert!(!headers.headers.is_empty());
+
+    for (i, hdr) in headers.headers.iter().enumerate() {
+        // Block version should be > 0 (typical regtest uses version 0x20000000)
+        assert!(hdr.version > 0, "header[{i}] has non-positive version: {}", hdr.version);
+
+        // Modern Bitcoin Core regtest uses BIP9 version bits (bit 29 set)
+        // The top bits pattern is 0x20xxxxxx
+        let has_bip9_top = (hdr.version & 0xe0000000u32 as i32) == 0x20000000;
+        if has_bip9_top {
+            // Extract signaled bits (0..28)
+            let signal_bits = hdr.version & 0x1fffffff;
+            println!(
+                "  header[{i}]: version=0x{:08x} BIP9=true signal_bits=0x{:07x}",
+                hdr.version, signal_bits
+            );
+        } else {
+            println!(
+                "  header[{i}]: version=0x{:08x} (legacy)",
+                hdr.version
+            );
+        }
+    }
+    println!("[version-bits] all headers parsed ✓");
+}
