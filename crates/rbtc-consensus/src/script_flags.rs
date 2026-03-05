@@ -41,7 +41,11 @@ pub fn script_flags_for_block(
     if !verify_p2sh {
         let _ = (block_time, median_time_past);
     } else if p.bip16_exception_hash.is_none() {
-        let activation_time = if median_time_past == 0 { block_time } else { median_time_past };
+        let activation_time = if median_time_past == 0 {
+            block_time
+        } else {
+            median_time_past
+        };
         verify_p2sh = activation_time >= p.bip16_time;
     }
 

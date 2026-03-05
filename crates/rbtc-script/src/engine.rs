@@ -1,12 +1,15 @@
-use rbtc_primitives::{
-    constants::{MAX_OPS_PER_SCRIPT, MAX_PUBKEYS_PER_MULTISIG, MAX_SCRIPT_ELEMENT_SIZE, MAX_SCRIPT_SIZE, MAX_STACK_SIZE},
-    script::Script,
-    transaction::{Transaction, TxOut},
-};
 use rbtc_crypto::{
     digest::{hash160, sha256, sha256d},
     sig::{verify_ecdsa_with_policy, verify_schnorr},
     sighash::{sighash_legacy_with_u32, sighash_segwit_v0_with_u32, sighash_taproot, SighashType},
+};
+use rbtc_primitives::{
+    constants::{
+        MAX_OPS_PER_SCRIPT, MAX_PUBKEYS_PER_MULTISIG, MAX_SCRIPT_ELEMENT_SIZE, MAX_SCRIPT_SIZE,
+        MAX_STACK_SIZE,
+    },
+    script::Script,
+    transaction::{Transaction, TxOut},
 };
 use secp256k1;
 use thiserror::Error;
@@ -161,25 +164,57 @@ impl ScriptFlags {
     /// any flag that appears in `excluded`.  Used by tx_valid.json harness.
     pub fn standard_minus(excluded: &Self) -> Self {
         let mut f = Self::standard();
-        if excluded.verify_p2sh                            { f.verify_p2sh = false; }
-        if excluded.verify_dersig                          { f.verify_dersig = false; }
-        if excluded.verify_witness                         { f.verify_witness = false; }
-        if excluded.verify_nulldummy                       { f.verify_nulldummy = false; }
-        if excluded.verify_cleanstack                      { f.verify_cleanstack = false; }
-        if excluded.verify_checklocktimeverify             { f.verify_checklocktimeverify = false; }
-        if excluded.verify_checksequenceverify             { f.verify_checksequenceverify = false; }
-        if excluded.verify_taproot                         { f.verify_taproot = false; }
-        if excluded.verify_strictenc                       { f.verify_strictenc = false; }
-        if excluded.verify_low_s                           { f.verify_low_s = false; }
-        if excluded.verify_sigpushonly                     { f.verify_sigpushonly = false; }
-        if excluded.verify_minimaldata                     { f.verify_minimaldata = false; }
-        if excluded.verify_discourage_upgradable_nops      { f.verify_discourage_upgradable_nops = false; }
+        if excluded.verify_p2sh {
+            f.verify_p2sh = false;
+        }
+        if excluded.verify_dersig {
+            f.verify_dersig = false;
+        }
+        if excluded.verify_witness {
+            f.verify_witness = false;
+        }
+        if excluded.verify_nulldummy {
+            f.verify_nulldummy = false;
+        }
+        if excluded.verify_cleanstack {
+            f.verify_cleanstack = false;
+        }
+        if excluded.verify_checklocktimeverify {
+            f.verify_checklocktimeverify = false;
+        }
+        if excluded.verify_checksequenceverify {
+            f.verify_checksequenceverify = false;
+        }
+        if excluded.verify_taproot {
+            f.verify_taproot = false;
+        }
+        if excluded.verify_strictenc {
+            f.verify_strictenc = false;
+        }
+        if excluded.verify_low_s {
+            f.verify_low_s = false;
+        }
+        if excluded.verify_sigpushonly {
+            f.verify_sigpushonly = false;
+        }
+        if excluded.verify_minimaldata {
+            f.verify_minimaldata = false;
+        }
+        if excluded.verify_discourage_upgradable_nops {
+            f.verify_discourage_upgradable_nops = false;
+        }
         if excluded.verify_discourage_upgradable_witness_program {
             f.verify_discourage_upgradable_witness_program = false;
         }
-        if excluded.verify_minimalif                       { f.verify_minimalif = false; }
-        if excluded.verify_nullfail                        { f.verify_nullfail = false; }
-        if excluded.verify_witness_pubkeytype              { f.verify_witness_pubkeytype = false; }
+        if excluded.verify_minimalif {
+            f.verify_minimalif = false;
+        }
+        if excluded.verify_nullfail {
+            f.verify_nullfail = false;
+        }
+        if excluded.verify_witness_pubkeytype {
+            f.verify_witness_pubkeytype = false;
+        }
         f
     }
 
@@ -195,7 +230,10 @@ impl ScriptFlags {
             match token.trim() {
                 "NONE" => {}
                 "P2SH" => f.verify_p2sh = true,
-                "STRICTENC" => { f.verify_strictenc = true; f.verify_dersig = true; }
+                "STRICTENC" => {
+                    f.verify_strictenc = true;
+                    f.verify_dersig = true;
+                }
                 "DERSIG" => f.verify_dersig = true,
                 "LOW_S" => f.verify_low_s = true,
                 "SIGPUSHONLY" => f.verify_sigpushonly = true,
@@ -224,7 +262,9 @@ impl ScriptFlags {
 /// Returns true if the byte slice is the minimal encoding of a script integer.
 /// Mirrors Bitcoin Core's `CScriptNum` minimal-encoding check.
 fn is_minimal_script_int(bytes: &[u8]) -> bool {
-    if bytes.is_empty() { return true; }
+    if bytes.is_empty() {
+        return true;
+    }
     // If the last byte is 0x00 or 0x80 (high 7 bits all zero), check whether
     // it's a necessary sign byte or an unnecessary extra zero.
     if (bytes.last().unwrap() & 0x7f) == 0 {
@@ -242,7 +282,11 @@ fn is_minimal_script_int(bytes: &[u8]) -> bool {
 
 /// Convert a stack item to a script integer (little-endian, with sign bit).
 /// If `require_minimal` is true, the encoding must be minimal (MINIMALDATA semantics).
-pub fn decode_script_int_opts(bytes: &[u8], max_size: usize, require_minimal: bool) -> Result<i64, ScriptError> {
+pub fn decode_script_int_opts(
+    bytes: &[u8],
+    max_size: usize,
+    require_minimal: bool,
+) -> Result<i64, ScriptError> {
     if bytes.len() > max_size {
         return Err(ScriptError::ScriptFailed("script number overflow".into()));
     }
@@ -353,6 +397,7 @@ impl ScriptEngine {
 
     /// Execute a script with a given initial stack.
     /// Returns the resulting stack on success.
+    #[allow(clippy::too_many_arguments)]
     pub fn execute(
         &self,
         script: &Script,
@@ -387,7 +432,7 @@ impl ScriptEngine {
             }
 
             // Handle data push opcodes (0x01–0x4b)
-            let op = if opcode_byte >= 0x01 && opcode_byte <= 0x4b {
+            let op = if (0x01..=0x4b).contains(&opcode_byte) {
                 let len = opcode_byte as usize;
                 if pc + len > bytes.len() {
                     return Err(ScriptError::ScriptFailed("push past end".into()));
@@ -427,10 +472,11 @@ impl ScriptEngine {
                         let top = stack.pop().unwrap();
                         // MINIMALIF (BIP141/342): in SegWit and Tapscript, OP_IF/OP_NOTIF
                         // argument must be exactly 0 (empty) or 1 (single byte 0x01).
-                        if sig_version != SigVersion::Base && self.flags.verify_minimalif {
-                            if top.len() > 1 || (top.len() == 1 && top[0] != 1) {
-                                return Err(ScriptError::MinimalIf);
-                            }
+                        if sig_version != SigVersion::Base
+                            && self.flags.verify_minimalif
+                            && (top.len() > 1 || (top.len() == 1 && top[0] != 1))
+                        {
+                            return Err(ScriptError::MinimalIf);
                         }
                         let mut val = cast_to_bool(&top);
                         if op == Opcode::OpNotIf {
@@ -475,7 +521,7 @@ impl ScriptEngine {
                         }
                         Opcode::OpPushData2 => {
                             if pc + 1 < bytes.len() {
-                                let l = u16::from_le_bytes([bytes[pc], bytes[pc+1]]) as usize;
+                                let l = u16::from_le_bytes([bytes[pc], bytes[pc + 1]]) as usize;
                                 pc += 2;
                                 if l > MAX_SCRIPT_ELEMENT_SIZE {
                                     return Err(ScriptError::PushSizeExceeded);
@@ -485,7 +531,12 @@ impl ScriptEngine {
                         }
                         Opcode::OpPushData4 => {
                             if pc + 3 < bytes.len() {
-                                let l = u32::from_le_bytes([bytes[pc], bytes[pc+1], bytes[pc+2], bytes[pc+3]]) as usize;
+                                let l = u32::from_le_bytes([
+                                    bytes[pc],
+                                    bytes[pc + 1],
+                                    bytes[pc + 2],
+                                    bytes[pc + 3],
+                                ]) as usize;
                                 pc += 4;
                                 if l > MAX_SCRIPT_ELEMENT_SIZE {
                                     return Err(ScriptError::PushSizeExceeded);
@@ -520,11 +571,19 @@ impl ScriptEngine {
 
                 // ── Push data ────────────────────────────────────────────
                 Opcode::OpPushData1 => {
-                    if pc >= bytes.len() { return Err(ScriptError::ScriptFailed("truncated".into())); }
-                    let len = bytes[pc] as usize; pc += 1;
-                    if pc + len > bytes.len() { return Err(ScriptError::ScriptFailed("truncated".into())); }
-                    let data = bytes[pc..pc+len].to_vec(); pc += len;
-                    if data.len() > MAX_SCRIPT_ELEMENT_SIZE { return Err(ScriptError::PushSizeExceeded); }
+                    if pc >= bytes.len() {
+                        return Err(ScriptError::ScriptFailed("truncated".into()));
+                    }
+                    let len = bytes[pc] as usize;
+                    pc += 1;
+                    if pc + len > bytes.len() {
+                        return Err(ScriptError::ScriptFailed("truncated".into()));
+                    }
+                    let data = bytes[pc..pc + len].to_vec();
+                    pc += len;
+                    if data.len() > MAX_SCRIPT_ELEMENT_SIZE {
+                        return Err(ScriptError::PushSizeExceeded);
+                    }
                     // MINIMALDATA: PUSHDATA1 is only minimal when data.len() > 0x4b
                     if self.flags.verify_minimaldata && data.len() <= 0x4b {
                         return Err(ScriptError::MinimalData);
@@ -532,11 +591,19 @@ impl ScriptEngine {
                     stack.push(data);
                 }
                 Opcode::OpPushData2 => {
-                    if pc + 1 >= bytes.len() { return Err(ScriptError::ScriptFailed("truncated".into())); }
-                    let len = u16::from_le_bytes([bytes[pc], bytes[pc+1]]) as usize; pc += 2;
-                    if pc + len > bytes.len() { return Err(ScriptError::ScriptFailed("truncated".into())); }
-                    let data = bytes[pc..pc+len].to_vec(); pc += len;
-                    if data.len() > MAX_SCRIPT_ELEMENT_SIZE { return Err(ScriptError::PushSizeExceeded); }
+                    if pc + 1 >= bytes.len() {
+                        return Err(ScriptError::ScriptFailed("truncated".into()));
+                    }
+                    let len = u16::from_le_bytes([bytes[pc], bytes[pc + 1]]) as usize;
+                    pc += 2;
+                    if pc + len > bytes.len() {
+                        return Err(ScriptError::ScriptFailed("truncated".into()));
+                    }
+                    let data = bytes[pc..pc + len].to_vec();
+                    pc += len;
+                    if data.len() > MAX_SCRIPT_ELEMENT_SIZE {
+                        return Err(ScriptError::PushSizeExceeded);
+                    }
                     // MINIMALDATA: PUSHDATA2 is only minimal when data.len() > 0xff
                     if self.flags.verify_minimaldata && data.len() <= 0xff {
                         return Err(ScriptError::MinimalData);
@@ -544,12 +611,24 @@ impl ScriptEngine {
                     stack.push(data);
                 }
                 Opcode::OpPushData4 => {
-                    if pc + 3 >= bytes.len() { return Err(ScriptError::ScriptFailed("truncated".into())); }
-                    let len = u32::from_le_bytes([bytes[pc], bytes[pc+1], bytes[pc+2], bytes[pc+3]]) as usize;
+                    if pc + 3 >= bytes.len() {
+                        return Err(ScriptError::ScriptFailed("truncated".into()));
+                    }
+                    let len = u32::from_le_bytes([
+                        bytes[pc],
+                        bytes[pc + 1],
+                        bytes[pc + 2],
+                        bytes[pc + 3],
+                    ]) as usize;
                     pc += 4;
-                    if len > MAX_SCRIPT_ELEMENT_SIZE { return Err(ScriptError::PushSizeExceeded); }
-                    if pc + len > bytes.len() { return Err(ScriptError::ScriptFailed("truncated".into())); }
-                    let data = bytes[pc..pc+len].to_vec(); pc += len;
+                    if len > MAX_SCRIPT_ELEMENT_SIZE {
+                        return Err(ScriptError::PushSizeExceeded);
+                    }
+                    if pc + len > bytes.len() {
+                        return Err(ScriptError::ScriptFailed("truncated".into()));
+                    }
+                    let data = bytes[pc..pc + len].to_vec();
+                    pc += len;
                     // MINIMALDATA: PUSHDATA4 is only minimal when data.len() > 0xffff
                     if self.flags.verify_minimaldata && data.len() <= 0xffff {
                         return Err(ScriptError::MinimalData);
@@ -560,9 +639,14 @@ impl ScriptEngine {
                 // ── NOP variants ─────────────────────────────────────────
                 Opcode::OpNop => {}
                 // OP_NOP1 and OP_NOP4–OP_NOP10 are upgradable NOPs; reject if flag set.
-                Opcode::OpNop1 | Opcode::OpNop4 | Opcode::OpNop5
-                | Opcode::OpNop6 | Opcode::OpNop7 | Opcode::OpNop8
-                | Opcode::OpNop9 | Opcode::OpNop10 => {
+                Opcode::OpNop1
+                | Opcode::OpNop4
+                | Opcode::OpNop5
+                | Opcode::OpNop6
+                | Opcode::OpNop7
+                | Opcode::OpNop8
+                | Opcode::OpNop9
+                | Opcode::OpNop10 => {
                     if self.flags.verify_discourage_upgradable_nops {
                         return Err(ScriptError::DiscourageUpgradableNops);
                     }
@@ -572,88 +656,126 @@ impl ScriptEngine {
                 Opcode::OpReturn => return Err(ScriptError::OpReturn),
 
                 // ── Stack ops ────────────────────────────────────────────
-                Opcode::OpDrop => { pop(stack)?; }
-                Opcode::Op2Drop => { pop(stack)?; pop(stack)?; }
+                Opcode::OpDrop => {
+                    pop(stack)?;
+                }
+                Opcode::Op2Drop => {
+                    pop(stack)?;
+                    pop(stack)?;
+                }
                 Opcode::OpDup => {
                     let top = peek(stack)?.clone();
                     stack.push(top);
                 }
                 Opcode::Op2Dup => {
-                    if stack.len() < 2 { return Err(ScriptError::StackUnderflow); }
-                    let a = stack[stack.len()-2].clone();
-                    let b = stack[stack.len()-1].clone();
-                    stack.push(a); stack.push(b);
+                    if stack.len() < 2 {
+                        return Err(ScriptError::StackUnderflow);
+                    }
+                    let a = stack[stack.len() - 2].clone();
+                    let b = stack[stack.len() - 1].clone();
+                    stack.push(a);
+                    stack.push(b);
                 }
                 Opcode::Op3Dup => {
-                    if stack.len() < 3 { return Err(ScriptError::StackUnderflow); }
-                    let a = stack[stack.len()-3].clone();
-                    let b = stack[stack.len()-2].clone();
-                    let c = stack[stack.len()-1].clone();
-                    stack.push(a); stack.push(b); stack.push(c);
+                    if stack.len() < 3 {
+                        return Err(ScriptError::StackUnderflow);
+                    }
+                    let a = stack[stack.len() - 3].clone();
+                    let b = stack[stack.len() - 2].clone();
+                    let c = stack[stack.len() - 1].clone();
+                    stack.push(a);
+                    stack.push(b);
+                    stack.push(c);
                 }
                 Opcode::OpOver => {
-                    if stack.len() < 2 { return Err(ScriptError::StackUnderflow); }
-                    let val = stack[stack.len()-2].clone();
+                    if stack.len() < 2 {
+                        return Err(ScriptError::StackUnderflow);
+                    }
+                    let val = stack[stack.len() - 2].clone();
                     stack.push(val);
                 }
                 Opcode::Op2Over => {
-                    if stack.len() < 4 { return Err(ScriptError::StackUnderflow); }
-                    let a = stack[stack.len()-4].clone();
-                    let b = stack[stack.len()-3].clone();
-                    stack.push(a); stack.push(b);
+                    if stack.len() < 4 {
+                        return Err(ScriptError::StackUnderflow);
+                    }
+                    let a = stack[stack.len() - 4].clone();
+                    let b = stack[stack.len() - 3].clone();
+                    stack.push(a);
+                    stack.push(b);
                 }
                 Opcode::OpSwap => {
-                    if stack.len() < 2 { return Err(ScriptError::StackUnderflow); }
+                    if stack.len() < 2 {
+                        return Err(ScriptError::StackUnderflow);
+                    }
                     let n = stack.len();
-                    stack.swap(n-1, n-2);
+                    stack.swap(n - 1, n - 2);
                 }
                 Opcode::Op2Swap => {
-                    if stack.len() < 4 { return Err(ScriptError::StackUnderflow); }
+                    if stack.len() < 4 {
+                        return Err(ScriptError::StackUnderflow);
+                    }
                     let n = stack.len();
-                    stack.swap(n-1, n-3);
-                    stack.swap(n-2, n-4);
+                    stack.swap(n - 1, n - 3);
+                    stack.swap(n - 2, n - 4);
                 }
                 Opcode::OpRot => {
-                    if stack.len() < 3 { return Err(ScriptError::StackUnderflow); }
-                    let val = stack.remove(stack.len()-3);
+                    if stack.len() < 3 {
+                        return Err(ScriptError::StackUnderflow);
+                    }
+                    let val = stack.remove(stack.len() - 3);
                     stack.push(val);
                 }
                 Opcode::Op2Rot => {
-                    if stack.len() < 6 { return Err(ScriptError::StackUnderflow); }
+                    if stack.len() < 6 {
+                        return Err(ScriptError::StackUnderflow);
+                    }
                     let n = stack.len();
-                    let a = stack.remove(n-6);
-                    let b = stack.remove(n-6); // was n-5, now at n-6
-                    stack.push(a); stack.push(b);
+                    let a = stack.remove(n - 6);
+                    let b = stack.remove(n - 6); // was n-5, now at n-6
+                    stack.push(a);
+                    stack.push(b);
                 }
                 Opcode::OpNip => {
-                    if stack.len() < 2 { return Err(ScriptError::StackUnderflow); }
+                    if stack.len() < 2 {
+                        return Err(ScriptError::StackUnderflow);
+                    }
                     let n = stack.len();
-                    stack.remove(n-2);
+                    stack.remove(n - 2);
                 }
                 Opcode::OpTuck => {
-                    if stack.len() < 2 { return Err(ScriptError::StackUnderflow); }
-                    let top = stack[stack.len()-1].clone();
+                    if stack.len() < 2 {
+                        return Err(ScriptError::StackUnderflow);
+                    }
+                    let top = stack[stack.len() - 1].clone();
                     let n = stack.len();
-                    stack.insert(n-2, top);
+                    stack.insert(n - 2, top);
                 }
                 Opcode::OpIfDup => {
                     let top = peek(stack)?.clone();
-                    if cast_to_bool(&top) { stack.push(top); }
+                    if cast_to_bool(&top) {
+                        stack.push(top);
+                    }
                 }
                 Opcode::OpDepth => {
                     let d = stack.len() as i64;
                     stack.push(encode_script_int(d));
                 }
                 Opcode::OpPick => {
-                    let n = decode_script_int_opts(&pop(stack)?, 4, self.flags.verify_minimaldata)? as usize;
-                    if n >= stack.len() { return Err(ScriptError::StackUnderflow); }
-                    let val = stack[stack.len()-1-n].clone();
+                    let n = decode_script_int_opts(&pop(stack)?, 4, self.flags.verify_minimaldata)?
+                        as usize;
+                    if n >= stack.len() {
+                        return Err(ScriptError::StackUnderflow);
+                    }
+                    let val = stack[stack.len() - 1 - n].clone();
                     stack.push(val);
                 }
                 Opcode::OpRoll => {
-                    let n = decode_script_int_opts(&pop(stack)?, 4, self.flags.verify_minimaldata)? as usize;
-                    if n >= stack.len() { return Err(ScriptError::StackUnderflow); }
-                    let idx = stack.len()-1-n;
+                    let n = decode_script_int_opts(&pop(stack)?, 4, self.flags.verify_minimaldata)?
+                        as usize;
+                    if n >= stack.len() {
+                        return Err(ScriptError::StackUnderflow);
+                    }
+                    let idx = stack.len() - 1 - n;
                     let val = stack.remove(idx);
                     stack.push(val);
                 }
@@ -672,7 +794,9 @@ impl ScriptEngine {
                     let a = pop(stack)?;
                     let equal = a == b;
                     if op == Opcode::OpEqualVerify {
-                        if !equal { return Err(ScriptError::ScriptFailed("OP_EQUALVERIFY failed".into())); }
+                        if !equal {
+                            return Err(ScriptError::ScriptFailed("OP_EQUALVERIFY failed".into()));
+                        }
                     } else {
                         stack.push(if equal { vec![1u8] } else { Vec::new() });
                     }
@@ -736,7 +860,11 @@ impl ScriptEngine {
                     let a = decode_script_int_opts(&pop(stack)?, 4, self.flags.verify_minimaldata)?;
                     let eq = a == b;
                     if op == Opcode::OpNumEqualVerify {
-                        if !eq { return Err(ScriptError::ScriptFailed("OP_NUMEQUALVERIFY failed".into())); }
+                        if !eq {
+                            return Err(ScriptError::ScriptFailed(
+                                "OP_NUMEQUALVERIFY failed".into(),
+                            ));
+                        }
                     } else {
                         stack.push(encode_script_int(if eq { 1 } else { 0 }));
                     }
@@ -777,9 +905,11 @@ impl ScriptEngine {
                     stack.push(encode_script_int(a.max(b)));
                 }
                 Opcode::OpWithin => {
-                    let max = decode_script_int_opts(&pop(stack)?, 4, self.flags.verify_minimaldata)?;
-                    let min = decode_script_int_opts(&pop(stack)?, 4, self.flags.verify_minimaldata)?;
-                    let x   = decode_script_int_opts(&pop(stack)?, 4, self.flags.verify_minimaldata)?;
+                    let max =
+                        decode_script_int_opts(&pop(stack)?, 4, self.flags.verify_minimaldata)?;
+                    let min =
+                        decode_script_int_opts(&pop(stack)?, 4, self.flags.verify_minimaldata)?;
+                    let x = decode_script_int_opts(&pop(stack)?, 4, self.flags.verify_minimaldata)?;
                     stack.push(encode_script_int(if x >= min && x < max { 1 } else { 0 }));
                 }
 
@@ -838,58 +968,54 @@ impl ScriptEngine {
                             );
                             verify_schnorr(&pubkey, sig_bytes, &hash.0).is_ok()
                         }
+                    } else if sig.is_empty() {
+                        false
                     } else {
-                        if sig.is_empty() {
-                            false
-                        } else {
-                            let sighash_byte = *sig.last().unwrap();
-                            let sighash_u32 = sighash_byte as u32;
-                            // STRICTENC: sighash type must be known.
-                            if self.flags.verify_strictenc && !is_defined_hashtype(sighash_byte) {
-                                return Err(ScriptError::InvalidSigHashType);
-                            }
-                            // STRICTENC: pubkey must be compressed or uncompressed.
-                            if self.flags.verify_strictenc
-                                && !is_valid_pubkey_encoding(&pubkey)
-                            {
-                                return Err(ScriptError::PubkeyType);
-                            }
-                            // WITNESS_PUBKEYTYPE: in SegWit v0, pubkeys must be compressed.
-                            if sig_version == SigVersion::WitnessV0
-                                && self.flags.verify_witness_pubkeytype
-                                && !is_compressed_pubkey(&pubkey)
-                            {
-                                return Err(ScriptError::WitnessPubkeyType);
-                            }
-                            let sig_der = &sig[..sig.len() - 1];
-                            let strict_der = self.flags.verify_dersig || self.flags.verify_strictenc;
-                            if strict_der && !is_valid_der_signature_encoding(&sig) {
-                                return Err(ScriptError::InvalidSigEncoding);
-                            }
-                            // DERSIG/STRICTENC: validate DER structure (fails for 1-byte sigs too).
-                            if strict_der && !self.flags.verify_low_s {
-                                secp256k1::ecdsa::Signature::from_der(sig_der)
-                                    .map_err(|_| ScriptError::InvalidSigEncoding)?;
-                            }
-                            // LOW_S: S must be in the lower half of the curve order.
-                            if self.flags.verify_low_s {
-                                check_low_s(sig_der, strict_der)?;
-                            }
-                            let mut sc = if let Some(pos) = codesep_pos {
-                                Script::from_bytes(script_code.as_bytes()[pos..].to_vec())
-                            } else {
-                                script_code.clone()
-                            };
-                            if sig_version == SigVersion::Base {
-                                sc = find_and_delete_script_sig(&sc, &sig);
-                            }
-                            let hash = if sig_version == SigVersion::WitnessV0 {
-                                sighash_segwit_v0_with_u32(tx, input_index, &sc, amount, sighash_u32)
-                            } else {
-                                sighash_legacy_with_u32(tx, input_index, &sc, sighash_u32)
-                            };
-                            verify_ecdsa_with_policy(&pubkey, sig_der, &hash.0, strict_der).is_ok()
+                        let sighash_byte = *sig.last().unwrap();
+                        let sighash_u32 = sighash_byte as u32;
+                        // STRICTENC: sighash type must be known.
+                        if self.flags.verify_strictenc && !is_defined_hashtype(sighash_byte) {
+                            return Err(ScriptError::InvalidSigHashType);
                         }
+                        // STRICTENC: pubkey must be compressed or uncompressed.
+                        if self.flags.verify_strictenc && !is_valid_pubkey_encoding(&pubkey) {
+                            return Err(ScriptError::PubkeyType);
+                        }
+                        // WITNESS_PUBKEYTYPE: in SegWit v0, pubkeys must be compressed.
+                        if sig_version == SigVersion::WitnessV0
+                            && self.flags.verify_witness_pubkeytype
+                            && !is_compressed_pubkey(&pubkey)
+                        {
+                            return Err(ScriptError::WitnessPubkeyType);
+                        }
+                        let sig_der = &sig[..sig.len() - 1];
+                        let strict_der = self.flags.verify_dersig || self.flags.verify_strictenc;
+                        if strict_der && !is_valid_der_signature_encoding(&sig) {
+                            return Err(ScriptError::InvalidSigEncoding);
+                        }
+                        // DERSIG/STRICTENC: validate DER structure (fails for 1-byte sigs too).
+                        if strict_der && !self.flags.verify_low_s {
+                            secp256k1::ecdsa::Signature::from_der(sig_der)
+                                .map_err(|_| ScriptError::InvalidSigEncoding)?;
+                        }
+                        // LOW_S: S must be in the lower half of the curve order.
+                        if self.flags.verify_low_s {
+                            check_low_s(sig_der, strict_der)?;
+                        }
+                        let mut sc = if let Some(pos) = codesep_pos {
+                            Script::from_bytes(script_code.as_bytes()[pos..].to_vec())
+                        } else {
+                            script_code.clone()
+                        };
+                        if sig_version == SigVersion::Base {
+                            sc = find_and_delete_script_sig(&sc, &sig);
+                        }
+                        let hash = if sig_version == SigVersion::WitnessV0 {
+                            sighash_segwit_v0_with_u32(tx, input_index, &sc, amount, sighash_u32)
+                        } else {
+                            sighash_legacy_with_u32(tx, input_index, &sc, sighash_u32)
+                        };
+                        verify_ecdsa_with_policy(&pubkey, sig_der, &hash.0, strict_der).is_ok()
                     };
 
                     // NULLFAIL: if verification failed, the sig must have been empty.
@@ -897,7 +1023,9 @@ impl ScriptEngine {
                         return Err(ScriptError::NullFail);
                     }
                     if op == Opcode::OpCheckSigVerify {
-                        if !ok { return Err(ScriptError::SigCheckFailed); }
+                        if !ok {
+                            return Err(ScriptError::SigCheckFailed);
+                        }
                     } else {
                         stack.push(if ok { vec![1u8] } else { Vec::new() });
                     }
@@ -907,7 +1035,8 @@ impl ScriptEngine {
                     if sig_version == SigVersion::Taproot {
                         return Err(ScriptError::InvalidOpcode);
                     }
-                    let n_keys_i64 = decode_script_int_opts(&pop(stack)?, 4, self.flags.verify_minimaldata)?;
+                    let n_keys_i64 =
+                        decode_script_int_opts(&pop(stack)?, 4, self.flags.verify_minimaldata)?;
                     if n_keys_i64 < 0 || n_keys_i64 as usize > MAX_PUBKEYS_PER_MULTISIG {
                         return Err(ScriptError::MultisigPubkeyCount);
                     }
@@ -918,15 +1047,20 @@ impl ScriptEngine {
                     }
 
                     let mut pubkeys = Vec::with_capacity(n_keys);
-                    for _ in 0..n_keys { pubkeys.push(pop(stack)?); }
+                    for _ in 0..n_keys {
+                        pubkeys.push(pop(stack)?);
+                    }
 
-                    let n_sigs_i64 = decode_script_int_opts(&pop(stack)?, 4, self.flags.verify_minimaldata)?;
+                    let n_sigs_i64 =
+                        decode_script_int_opts(&pop(stack)?, 4, self.flags.verify_minimaldata)?;
                     if n_sigs_i64 < 0 || n_sigs_i64 as usize > n_keys {
                         return Err(ScriptError::MultisigPubkeyCount);
                     }
                     let n_sigs = n_sigs_i64 as usize;
                     let mut sigs = Vec::with_capacity(n_sigs);
-                    for _ in 0..n_sigs { sigs.push(pop(stack)?); }
+                    for _ in 0..n_sigs {
+                        sigs.push(pop(stack)?);
+                    }
 
                     // BIP147 NULLDUMMY (activated with segwit).
                     let dummy = pop(stack)?;
@@ -1001,7 +1135,13 @@ impl ScriptEngine {
                                 check_low_s(sig_der, strict_der)?;
                             }
                             let h = if sig_version == SigVersion::WitnessV0 {
-                                sighash_segwit_v0_with_u32(tx, input_index, &sc, amount, sighash_u32)
+                                sighash_segwit_v0_with_u32(
+                                    tx,
+                                    input_index,
+                                    &sc,
+                                    amount,
+                                    sighash_u32,
+                                )
                             } else {
                                 sighash_legacy_with_u32(tx, input_index, &sc, sighash_u32)
                             };
@@ -1024,7 +1164,9 @@ impl ScriptEngine {
                         }
                     }
                     if op == Opcode::OpCheckMultiSigVerify {
-                        if !all_ok { return Err(ScriptError::SigCheckFailed); }
+                        if !all_ok {
+                            return Err(ScriptError::SigCheckFailed);
+                        }
                     } else {
                         stack.push(if all_ok { vec![1u8] } else { Vec::new() });
                     }
@@ -1040,29 +1182,47 @@ impl ScriptEngine {
 
                 // ── Locktime ─────────────────────────────────────────────
                 Opcode::OpCheckLockTimeVerify => {
-                    if !self.flags.verify_checklocktimeverify { continue; }
-                    let locktime = decode_script_int_opts(peek(stack)?, 5, self.flags.verify_minimaldata)?;
-                    if locktime < 0 { return Err(ScriptError::LockTimeFailed); }
+                    if !self.flags.verify_checklocktimeverify {
+                        continue;
+                    }
+                    let locktime =
+                        decode_script_int_opts(peek(stack)?, 5, self.flags.verify_minimaldata)?;
+                    if locktime < 0 {
+                        return Err(ScriptError::LockTimeFailed);
+                    }
                     let tx_locktime = tx.lock_time as i64;
                     // Type mismatch (one is block height, other is time) is a failure
                     if (locktime < 500_000_000) != (tx_locktime < 500_000_000) {
                         return Err(ScriptError::LockTimeFailed);
                     }
-                    if locktime > tx_locktime { return Err(ScriptError::LockTimeFailed); }
+                    if locktime > tx_locktime {
+                        return Err(ScriptError::LockTimeFailed);
+                    }
                     if tx.inputs[input_index].sequence == 0xffffffff {
                         return Err(ScriptError::LockTimeFailed);
                     }
                 }
                 Opcode::OpCheckSequenceVerify => {
-                    if !self.flags.verify_checksequenceverify { continue; }
-                    let seq = decode_script_int_opts(peek(stack)?, 5, self.flags.verify_minimaldata)?;
-                    if seq < 0 { return Err(ScriptError::LockTimeFailed); }
-                    if seq as u32 & (1 << 31) != 0 { continue; } // disabled flag
+                    if !self.flags.verify_checksequenceverify {
+                        continue;
+                    }
+                    let seq =
+                        decode_script_int_opts(peek(stack)?, 5, self.flags.verify_minimaldata)?;
+                    if seq < 0 {
+                        return Err(ScriptError::LockTimeFailed);
+                    }
+                    if seq as u32 & (1 << 31) != 0 {
+                        continue;
+                    } // disabled flag
                     let tx_seq = tx.inputs[input_index].sequence;
                     // Bitcoin Core uses unsigned comparison: (uint32_t)nVersion < 2.
                     // This means version = -1 (0xffffffff) is treated as 4294967295 ≥ 2.
-                    if (tx.version as u32) < 2 { return Err(ScriptError::LockTimeFailed); }
-                    if tx_seq & (1 << 31) != 0 { return Err(ScriptError::LockTimeFailed); }
+                    if (tx.version as u32) < 2 {
+                        return Err(ScriptError::LockTimeFailed);
+                    }
+                    if tx_seq & (1 << 31) != 0 {
+                        return Err(ScriptError::LockTimeFailed);
+                    }
                     // Type match check
                     if (seq as u32 & (1 << 22)) != (tx_seq & (1 << 22)) {
                         return Err(ScriptError::LockTimeFailed);
@@ -1130,6 +1290,7 @@ impl ScriptEngine {
     }
 
     /// Execute tapscript with BIP342 checks and Taproot sighash context.
+    #[allow(clippy::too_many_arguments)]
     pub fn execute_tapscript(
         &self,
         tx: &Transaction,
@@ -1260,7 +1421,7 @@ fn check_minimal_push(opcode_byte: u8, data: &[u8]) -> Result<(), ScriptError> {
     }
     if data.len() == 1 {
         let v = data[0];
-        if v >= 1 && v <= 16 {
+        if (1..=16).contains(&v) {
             // Bytes 1–16 → should use OP_1–OP_16 (0x51–0x60).
             if opcode_byte != 0x50 + v {
                 return Err(ScriptError::MinimalData);
@@ -1286,7 +1447,7 @@ fn check_minimal_push(opcode_byte: u8, data: &[u8]) -> Result<(), ScriptError> {
 /// (SIGHASH_ALL, NONE, SINGLE, with or without ANYONECANPAY).
 fn is_defined_hashtype(sighash_byte: u8) -> bool {
     let base = sighash_byte & !0x80;
-    base >= 1 && base <= 3
+    (1..=3).contains(&base)
 }
 
 /// Returns true if the pubkey is a valid compressed or uncompressed SEC encoding.
@@ -1376,14 +1537,17 @@ fn is_valid_der_signature_encoding(sig: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rbtc_primitives::transaction::{OutPoint, TxIn, TxOut};
     use rbtc_primitives::hash::Hash256;
+    use rbtc_primitives::transaction::{OutPoint, TxIn, TxOut};
 
     fn minimal_tx() -> Transaction {
         Transaction {
             version: 1,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: Hash256::ZERO, vout: 0 },
+                previous_output: OutPoint {
+                    txid: Hash256::ZERO,
+                    vout: 0,
+                },
                 script_sig: Script::new(),
                 sequence: 0xffffffff,
                 witness: vec![],
@@ -1439,7 +1603,18 @@ mod tests {
         let tx = minimal_tx();
         let script = Script::from_bytes(vec![0x00, 0x51]);
         let mut stack = vec![];
-        engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base, None).unwrap();
+        engine
+            .execute(
+                &script,
+                &mut stack,
+                &tx,
+                0,
+                0,
+                &script,
+                SigVersion::Base,
+                None,
+            )
+            .unwrap();
         assert_eq!(stack.len(), 2);
     }
 
@@ -1449,7 +1624,16 @@ mod tests {
         let tx = minimal_tx();
         let script = Script::from_bytes(vec![0x6a]);
         let mut stack = vec![];
-        let r = engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base, None);
+        let r = engine.execute(
+            &script,
+            &mut stack,
+            &tx,
+            0,
+            0,
+            &script,
+            SigVersion::Base,
+            None,
+        );
         assert!(r.is_err());
         assert!(matches!(r.unwrap_err(), ScriptError::OpReturn));
     }
@@ -1460,7 +1644,16 @@ mod tests {
         let tx = minimal_tx();
         let script = Script::from_bytes(vec![0x75]);
         let mut stack = vec![];
-        let r = engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base, None);
+        let r = engine.execute(
+            &script,
+            &mut stack,
+            &tx,
+            0,
+            0,
+            &script,
+            SigVersion::Base,
+            None,
+        );
         assert!(r.is_err());
         assert!(matches!(r.unwrap_err(), ScriptError::StackUnderflow));
     }
@@ -1471,7 +1664,18 @@ mod tests {
         let tx = minimal_tx();
         let script = Script::from_bytes(vec![0x01, 0x01, 0x76, 0x87]);
         let mut stack = vec![];
-        engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base, None).unwrap();
+        engine
+            .execute(
+                &script,
+                &mut stack,
+                &tx,
+                0,
+                0,
+                &script,
+                SigVersion::Base,
+                None,
+            )
+            .unwrap();
         assert_eq!(stack.len(), 1);
         assert_eq!(stack[0], vec![1u8]);
     }
@@ -1482,7 +1686,16 @@ mod tests {
         let tx = minimal_tx();
         let script = Script::from_bytes(vec![0x01, 0x00, 0x01, 0x00, 0x7e]);
         let mut stack = vec![];
-        let r = engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base, None);
+        let r = engine.execute(
+            &script,
+            &mut stack,
+            &tx,
+            0,
+            0,
+            &script,
+            SigVersion::Base,
+            None,
+        );
         assert!(r.is_err());
     }
 
@@ -1492,7 +1705,16 @@ mod tests {
         let tx = minimal_tx();
         let script = Script::from_bytes(vec![0x62]);
         let mut stack = vec![];
-        let r = engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base, None);
+        let r = engine.execute(
+            &script,
+            &mut stack,
+            &tx,
+            0,
+            0,
+            &script,
+            SigVersion::Base,
+            None,
+        );
         assert!(r.is_err());
         assert!(matches!(r.unwrap_err(), ScriptError::InvalidOpcode));
     }
@@ -1503,7 +1725,16 @@ mod tests {
         let tx = minimal_tx();
         let script = Script::from_bytes(vec![0x63]);
         let mut stack = vec![vec![1]];
-        let r = engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base, None);
+        let r = engine.execute(
+            &script,
+            &mut stack,
+            &tx,
+            0,
+            0,
+            &script,
+            SigVersion::Base,
+            None,
+        );
         assert!(r.is_err());
         assert!(matches!(r.unwrap_err(), ScriptError::UnbalancedIf));
     }
@@ -1514,7 +1745,16 @@ mod tests {
         let tx = minimal_tx();
         let script = Script::from_bytes(vec![0x00, 0x69]);
         let mut stack = vec![];
-        let r = engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base, None);
+        let r = engine.execute(
+            &script,
+            &mut stack,
+            &tx,
+            0,
+            0,
+            &script,
+            SigVersion::Base,
+            None,
+        );
         assert!(r.is_err());
     }
 
@@ -1524,7 +1764,18 @@ mod tests {
         let tx = minimal_tx();
         let script = Script::from_bytes(vec![0x51, 0x63, 0x51, 0x67, 0x00, 0x68]);
         let mut stack = vec![];
-        engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base, None).unwrap();
+        engine
+            .execute(
+                &script,
+                &mut stack,
+                &tx,
+                0,
+                0,
+                &script,
+                SigVersion::Base,
+                None,
+            )
+            .unwrap();
         assert_eq!(stack.len(), 1);
     }
 
@@ -1534,7 +1785,18 @@ mod tests {
         let tx = minimal_tx();
         let script = Script::from_bytes(vec![0x01, 0x61, 0xa9]);
         let mut stack = vec![];
-        engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base, None).unwrap();
+        engine
+            .execute(
+                &script,
+                &mut stack,
+                &tx,
+                0,
+                0,
+                &script,
+                SigVersion::Base,
+                None,
+            )
+            .unwrap();
         assert_eq!(stack.len(), 1);
         assert_eq!(stack[0].len(), 20);
     }
@@ -1545,7 +1807,18 @@ mod tests {
         let tx = minimal_tx();
         let script = Script::from_bytes(vec![0x01, 0x61, 0xa7]);
         let mut stack = vec![];
-        engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base, None).unwrap();
+        engine
+            .execute(
+                &script,
+                &mut stack,
+                &tx,
+                0,
+                0,
+                &script,
+                SigVersion::Base,
+                None,
+            )
+            .unwrap();
         assert_eq!(stack.len(), 1);
         assert_eq!(stack[0].len(), 20);
     }
@@ -1556,7 +1829,16 @@ mod tests {
         let tx = minimal_tx();
         let script = Script::from_bytes(vec![0xba]);
         let mut stack = vec![];
-        let r = engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base, None);
+        let r = engine.execute(
+            &script,
+            &mut stack,
+            &tx,
+            0,
+            0,
+            &script,
+            SigVersion::Base,
+            None,
+        );
         assert!(r.is_err());
         assert!(matches!(r.unwrap_err(), ScriptError::InvalidOpcode));
     }
@@ -1567,7 +1849,16 @@ mod tests {
         let tx = minimal_tx();
         let script = Script::from_bytes(vec![0x05, 0x00, 0x00]);
         let mut stack = vec![];
-        let r = engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base, None);
+        let r = engine.execute(
+            &script,
+            &mut stack,
+            &tx,
+            0,
+            0,
+            &script,
+            SigVersion::Base,
+            None,
+        );
         assert!(r.is_err());
     }
 
@@ -1581,7 +1872,18 @@ mod tests {
         script.push(0xac);
         let script = Script::from_bytes(script);
         let mut stack = vec![];
-        engine.execute(&script, &mut stack, &tx, 0, 0, &script, SigVersion::Base, None).unwrap();
+        engine
+            .execute(
+                &script,
+                &mut stack,
+                &tx,
+                0,
+                0,
+                &script,
+                SigVersion::Base,
+                None,
+            )
+            .unwrap();
         assert_eq!(stack.len(), 1);
         assert!(stack[0].is_empty());
     }
@@ -1590,22 +1892,17 @@ mod tests {
     fn tapscript_ignores_legacy_opcount_limit() {
         let engine = ScriptEngine::new(ScriptFlags::standard());
         let tx = minimal_tx();
-        let prevouts = vec![TxOut { value: 0, script_pubkey: Script::new() }];
+        let prevouts = vec![TxOut {
+            value: 0,
+            script_pubkey: Script::new(),
+        }];
         let leaf_hash = [0u8; 32];
         let mut script = vec![0x61; 220]; // OP_NOP repeated beyond legacy 201 limit
         script.push(0x51); // OP_1 so final stack is true
         let script = Script::from_bytes(script);
         let mut stack = vec![];
 
-        let r = engine.execute_tapscript(
-            &tx,
-            0,
-            &prevouts,
-            &script,
-            &mut stack,
-            &leaf_hash,
-            None,
-        );
+        let r = engine.execute_tapscript(&tx, 0, &prevouts, &script, &mut stack, &leaf_hash, None);
         assert!(r.is_ok());
     }
 }

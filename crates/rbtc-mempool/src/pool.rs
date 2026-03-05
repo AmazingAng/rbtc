@@ -14,7 +14,10 @@ use tracing::{debug, info, warn};
 use crate::{
     entry::MempoolEntry,
     error::MempoolError,
-    policy::{is_standard_tx, count_tx_sigops, V3PolicyError, MAX_V3_TX_VSIZE, MAX_STANDARD_TX_SIGOPS_COST},
+    policy::{
+        count_tx_sigops, is_standard_tx, V3PolicyError, MAX_STANDARD_TX_SIGOPS_COST,
+        MAX_V3_TX_VSIZE,
+    },
 };
 
 /// Default maximum total vsize (~300 MB).
@@ -55,7 +58,10 @@ impl Mempool {
     }
 
     pub fn with_max_vsize(max_vsize: u64) -> Self {
-        Self { max_vsize, ..Self::new() }
+        Self {
+            max_vsize,
+            ..Self::new()
+        }
     }
 
     /// Try to accept a transaction into the mempool.
@@ -104,21 +110,25 @@ impl Mempool {
         // ── Sigops limit ──────────────────────────────────────────────
         let sigops = count_tx_sigops(&tx);
         if sigops > MAX_STANDARD_TX_SIGOPS_COST {
-            return Err(MempoolError::NonStandard(
-                format!("too many sigops: {sigops} > {MAX_STANDARD_TX_SIGOPS_COST}"),
-            ));
+            return Err(MempoolError::NonStandard(format!(
+                "too many sigops: {sigops} > {MAX_STANDARD_TX_SIGOPS_COST}"
+            )));
         }
 
         let new_signals_rbf = signals_rbf(&tx);
 
         // Collect the set of outpoints spent by this transaction
-        let tx_spends: HashSet<&OutPoint> = tx.inputs.iter()
-            .map(|i| &i.previous_output)
-            .collect();
+        let tx_spends: HashSet<&OutPoint> = tx.inputs.iter().map(|i| &i.previous_output).collect();
 
         // ── BIP125 conflict detection ──────────────────────────────────────
-        let conflicting: Vec<TxId> = self.entries.values()
-            .filter(|e| e.tx.inputs.iter().any(|i| tx_spends.contains(&i.previous_output)))
+        let conflicting: Vec<TxId> = self
+            .entries
+            .values()
+            .filter(|e| {
+                e.tx.inputs
+                    .iter()
+                    .any(|i| tx_spends.contains(&i.previous_output))
+            })
             .map(|e| e.txid)
             .collect();
 
@@ -160,19 +170,23 @@ impl Mempool {
         // ── RBF fee bump check ────────────────────────────────────────────
         if !conflicting.is_empty() {
             // New fee rate must exceed the highest conflicting rate + relay fee
-            let max_conflict_rate = conflicting.iter()
+            let max_conflict_rate = conflicting
+                .iter()
                 .map(|cid| self.entries[cid].fee_rate)
                 .max()
                 .unwrap_or(0);
             let required = max_conflict_rate.saturating_add(self.min_relay_fee_rate);
             if fee_rate < required {
-                return Err(MempoolError::RbfInsufficientFee(fee_rate, max_conflict_rate, self.min_relay_fee_rate));
+                return Err(MempoolError::RbfInsufficientFee(
+                    fee_rate,
+                    max_conflict_rate,
+                    self.min_relay_fee_rate,
+                ));
             }
 
             // BIP125 Rule 3: replacement absolute fee must exceed sum of replaced fees
-            let total_conflict_fees: u64 = conflicting.iter()
-                .map(|cid| self.entries[cid].fee)
-                .sum();
+            let total_conflict_fees: u64 =
+                conflicting.iter().map(|cid| self.entries[cid].fee).sum();
             if fee < total_conflict_fees {
                 return Err(MempoolError::RbfAbsoluteFeeTooLow(fee, total_conflict_fees));
             }
@@ -219,10 +233,15 @@ impl Mempool {
             // existing child if the new one pays a strictly higher fee rate AND
             // higher absolute fee (BIP431 sibling eviction).
             if let Some(parent_txid) = unconfirmed_parents.first() {
-                let existing_child: Option<(TxId, u64, u64)> = self.entries.values()
+                let existing_child: Option<(TxId, u64, u64)> = self
+                    .entries
+                    .values()
                     .find(|e| {
                         e.txid != txid
-                            && e.tx.inputs.iter().any(|i| i.previous_output.txid == *parent_txid)
+                            && e.tx
+                                .inputs
+                                .iter()
+                                .any(|i| i.previous_output.txid == *parent_txid)
                     })
                     .map(|e| (e.txid, e.fee_rate, e.fee));
 
@@ -297,7 +316,7 @@ impl Mempool {
             fee_rate,
             signals_rbf: new_signals_rbf,
             ancestor_fee_rate,
-            ancestor_count: ancestor_count as u64,
+            ancestor_count,
             ancestor_vsize: ancestor_vsize_total,
             ancestor_fees,
             descendant_count: 0,
@@ -375,15 +394,18 @@ impl Mempool {
 
     /// Check whether an outpoint is spent by an in-mempool transaction.
     pub fn has_spend(&self, outpoint: &OutPoint) -> bool {
-        self.entries.values().any(|e| {
-            e.tx.inputs.iter().any(|i| &i.previous_output == outpoint)
-        })
+        self.entries
+            .values()
+            .any(|e| e.tx.inputs.iter().any(|i| &i.previous_output == outpoint))
     }
 
     /// Return the minimum fee_rate (sat/vbyte) of any entry currently in the pool,
     /// or `min_relay_fee_rate` when the pool is empty.  Used by `estimatesmartfee`.
     pub fn min_fee_rate(&self) -> u64 {
-        self.entries.values().map(|e| e.fee_rate).min()
+        self.entries
+            .values()
+            .map(|e| e.fee_rate)
+            .min()
             .unwrap_or(self.min_relay_fee_rate)
     }
 
@@ -422,7 +444,9 @@ impl Mempool {
         if !visited.insert(*txid) {
             return (0, 0);
         }
-        let Some(entry) = self.entries.get(txid) else { return (0, 0); };
+        let Some(entry) = self.entries.get(txid) else {
+            return (0, 0);
+        };
         let mut total_fee = entry.fee;
         let mut total_vsize = entry.vsize;
         for input in &entry.tx.inputs {
@@ -464,7 +488,9 @@ impl Mempool {
     /// in-mempool descendants are removed as well to avoid orphans.
     fn evict_below_fee_rate(&mut self, new_fee_rate: u64) -> Result<(), MempoolError> {
         // Sort ascending by mining_score → evict cheapest first
-        let mut by_score: Vec<(TxId, u64)> = self.entries.values()
+        let mut by_score: Vec<(TxId, u64)> = self
+            .entries
+            .values()
             .map(|e| (e.txid, e.ancestor_fee_rate.min(e.fee_rate)))
             .collect();
         by_score.sort_unstable_by_key(|&(_, s)| s);
@@ -479,7 +505,10 @@ impl Mempool {
                 self.rebuild_mempool_utxos();
                 return Err(MempoolError::MempoolFull);
             }
-            warn!("mempool: evicting {} (mining_score={evict_score}) due to size limit", evict_id.to_hex());
+            warn!(
+                "mempool: evicting {} (mining_score={evict_score}) due to size limit",
+                evict_id.to_hex()
+            );
             self.remove_with_descendants(evict_id);
         }
         self.rebuild_mempool_utxos();
@@ -493,8 +522,14 @@ impl Mempool {
         while i < to_remove.len() {
             let current = to_remove[i];
             // Find all entries that spend an output of `current`
-            let children: Vec<TxId> = self.entries.values()
-                .filter(|e| e.tx.inputs.iter().any(|inp| inp.previous_output.txid == current))
+            let children: Vec<TxId> = self
+                .entries
+                .values()
+                .filter(|e| {
+                    e.tx.inputs
+                        .iter()
+                        .any(|inp| inp.previous_output.txid == current)
+                })
                 .map(|e| e.txid)
                 .collect();
             for child in children {
@@ -512,11 +547,7 @@ impl Mempool {
     // ── Ancestor/descendant helpers ─────────────────────────────────────
 
     /// Count in-mempool ancestors of a transaction (not yet inserted).
-    fn count_ancestors_inner(
-        &self,
-        tx: &Transaction,
-        visited: &mut HashSet<TxId>,
-    ) -> u64 {
+    fn count_ancestors_inner(&self, tx: &Transaction, visited: &mut HashSet<TxId>) -> u64 {
         let mut count = 0u64;
         for input in &tx.inputs {
             let ptxid = input.previous_output.txid;
@@ -633,7 +664,9 @@ impl Mempool {
                     input_view.insert(op.clone(), u.clone());
                 }
             }
-            if let Ok(fee) = verify_transaction(tx, &input_view, chain_height, ScriptFlags::standard()) {
+            if let Ok(fee) =
+                verify_transaction(tx, &input_view, chain_height, ScriptFlags::standard())
+            {
                 total_pkg_fee += fee;
                 total_pkg_vsize += tx.vsize();
             }
@@ -678,12 +711,12 @@ fn signals_rbf(tx: &Transaction) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rbtc_consensus::utxo::Utxo;
     use rbtc_primitives::{
         hash::Hash256,
         script::Script,
         transaction::{TxIn, TxOut},
     };
-    use rbtc_consensus::utxo::Utxo;
 
     fn simple_coinbase_tx() -> Transaction {
         Transaction {
@@ -694,7 +727,10 @@ mod tests {
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: 50_0000_0000,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         }
     }
@@ -707,12 +743,18 @@ mod tests {
         Transaction {
             version: 1,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: prev_txid, vout: 0 },
+                previous_output: OutPoint {
+                    txid: prev_txid,
+                    vout: 0,
+                },
                 script_sig: Script::new(),
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: value_out, script_pubkey: Script::from_bytes(spk) }],
+            outputs: vec![TxOut {
+                value: value_out,
+                script_pubkey: Script::from_bytes(spk),
+            }],
             lock_time: 0,
         }
     }
@@ -724,7 +766,10 @@ mod tests {
         set.insert(
             outpoint,
             Utxo {
-                txout: TxOut { value, script_pubkey: Script::from_bytes(vec![0x51]) },
+                txout: TxOut {
+                    value,
+                    script_pubkey: Script::from_bytes(vec![0x51]),
+                },
                 is_coinbase: false,
                 height: 100,
             },
@@ -737,7 +782,10 @@ mod tests {
         let mut mp = Mempool::new();
         let tx = simple_coinbase_tx();
         let chain = UtxoSet::new();
-        assert!(matches!(mp.accept_tx(tx, &chain, 200), Err(MempoolError::Coinbase)));
+        assert!(matches!(
+            mp.accept_tx(tx, &chain, 200),
+            Err(MempoolError::Coinbase)
+        ));
     }
 
     #[test]
@@ -745,14 +793,20 @@ mod tests {
         let mut mp = Mempool::new();
         let tx = spend_tx(Hash256([1; 32]), 1000);
         let chain = UtxoSet::new(); // empty
-        assert!(matches!(mp.accept_tx(tx, &chain, 200), Err(MempoolError::MissingInput(_, _))));
+        assert!(matches!(
+            mp.accept_tx(tx, &chain, 200),
+            Err(MempoolError::MissingInput(_, _))
+        ));
     }
 
     #[test]
     fn accept_and_remove_confirmed() {
         let mut mp = Mempool::new();
         let prev_txid = Hash256([42; 32]);
-        let outpoint = OutPoint { txid: prev_txid, vout: 0 };
+        let outpoint = OutPoint {
+            txid: prev_txid,
+            vout: 0,
+        };
         let chain = utxo_set_with(outpoint, 50_0000_0000);
         // value_out < value_in so fee > 0
         let tx = spend_tx(prev_txid, 49_9999_0000);
@@ -768,7 +822,10 @@ mod tests {
     fn duplicate_rejected() {
         let mut mp = Mempool::new();
         let prev_txid = Hash256([7; 32]);
-        let outpoint = OutPoint { txid: prev_txid, vout: 0 };
+        let outpoint = OutPoint {
+            txid: prev_txid,
+            vout: 0,
+        };
         let chain = utxo_set_with(outpoint, 50_0000_0000);
         let tx = spend_tx(prev_txid, 49_9999_0000);
         mp.accept_tx(tx.clone(), &chain, 200).unwrap();
@@ -783,32 +840,51 @@ mod tests {
         Transaction {
             version: 1,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: prev_txid, vout: 0 },
+                previous_output: OutPoint {
+                    txid: prev_txid,
+                    vout: 0,
+                },
                 script_sig: Script::new(),
                 sequence: 0xfffffffd, // signals RBF
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: value_out, script_pubkey: Script::from_bytes(spk) }],
+            outputs: vec![TxOut {
+                value: value_out,
+                script_pubkey: Script::from_bytes(spk),
+            }],
             lock_time: 0,
         }
     }
 
     /// Create a larger spending tx with multiple outputs that signals RBF.
+    #[allow(dead_code)]
     fn spend_tx_rbf_large(prev_txid: TxId, value_out: u64) -> Transaction {
         let mut spk = vec![0x00, 0x14];
         spk.extend_from_slice(&[0u8; 20]);
         Transaction {
             version: 1,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: prev_txid, vout: 0 },
+                previous_output: OutPoint {
+                    txid: prev_txid,
+                    vout: 0,
+                },
                 script_sig: Script::new(),
                 sequence: 0xfffffffd,
                 witness: vec![],
             }],
             outputs: vec![
-                TxOut { value: value_out / 3, script_pubkey: Script::from_bytes(spk.clone()) },
-                TxOut { value: value_out / 3, script_pubkey: Script::from_bytes(spk.clone()) },
-                TxOut { value: value_out / 3, script_pubkey: Script::from_bytes(spk) },
+                TxOut {
+                    value: value_out / 3,
+                    script_pubkey: Script::from_bytes(spk.clone()),
+                },
+                TxOut {
+                    value: value_out / 3,
+                    script_pubkey: Script::from_bytes(spk.clone()),
+                },
+                TxOut {
+                    value: value_out / 3,
+                    script_pubkey: Script::from_bytes(spk),
+                },
             ],
             lock_time: 0,
         }
@@ -821,18 +897,38 @@ mod tests {
         let mut mp = Mempool::new();
         let prev_txid_a = Hash256([50; 32]);
         let prev_txid_b = Hash256([51; 32]);
-        let outpoint_a = OutPoint { txid: prev_txid_a, vout: 0 };
-        let outpoint_b = OutPoint { txid: prev_txid_b, vout: 0 };
+        let outpoint_a = OutPoint {
+            txid: prev_txid_a,
+            vout: 0,
+        };
+        let outpoint_b = OutPoint {
+            txid: prev_txid_b,
+            vout: 0,
+        };
 
         let mut chain = UtxoSet::new();
-        chain.insert(outpoint_a.clone(), Utxo {
-            txout: TxOut { value: 10_0000, script_pubkey: Script::from_bytes(vec![0x51]) },
-            is_coinbase: false, height: 100,
-        });
-        chain.insert(outpoint_b.clone(), Utxo {
-            txout: TxOut { value: 10_0000, script_pubkey: Script::from_bytes(vec![0x51]) },
-            is_coinbase: false, height: 100,
-        });
+        chain.insert(
+            outpoint_a.clone(),
+            Utxo {
+                txout: TxOut {
+                    value: 10_0000,
+                    script_pubkey: Script::from_bytes(vec![0x51]),
+                },
+                is_coinbase: false,
+                height: 100,
+            },
+        );
+        chain.insert(
+            outpoint_b.clone(),
+            Utxo {
+                txout: TxOut {
+                    value: 10_0000,
+                    script_pubkey: Script::from_bytes(vec![0x51]),
+                },
+                is_coinbase: false,
+                height: 100,
+            },
+        );
 
         // P2WPKH scriptPubKey
         let mut spk = vec![0x00, 0x14];
@@ -842,12 +938,23 @@ mod tests {
         let original = Transaction {
             version: 1,
             inputs: vec![
-                TxIn { previous_output: outpoint_a.clone(), script_sig: Script::new(),
-                        sequence: 0xfffffffd, witness: vec![] },
-                TxIn { previous_output: outpoint_b.clone(), script_sig: Script::new(),
-                        sequence: 0xfffffffd, witness: vec![] },
+                TxIn {
+                    previous_output: outpoint_a.clone(),
+                    script_sig: Script::new(),
+                    sequence: 0xfffffffd,
+                    witness: vec![],
+                },
+                TxIn {
+                    previous_output: outpoint_b.clone(),
+                    script_sig: Script::new(),
+                    sequence: 0xfffffffd,
+                    witness: vec![],
+                },
             ],
-            outputs: vec![TxOut { value: 10_0000, script_pubkey: Script::from_bytes(spk.clone()) }],
+            outputs: vec![TxOut {
+                value: 10_0000,
+                script_pubkey: Script::from_bytes(spk.clone()),
+            }],
             lock_time: 0,
         };
         let orig_fee = 10_0000u64; // 100000 sat
@@ -859,11 +966,16 @@ mod tests {
         // So rate is higher, but absolute fee 90000 < 100000 → reject
         let replacement = Transaction {
             version: 1,
-            inputs: vec![
-                TxIn { previous_output: outpoint_a, script_sig: Script::new(),
-                        sequence: 0xfffffffd, witness: vec![] },
-            ],
-            outputs: vec![TxOut { value: 1_0000, script_pubkey: Script::from_bytes(spk) }],
+            inputs: vec![TxIn {
+                previous_output: outpoint_a,
+                script_sig: Script::new(),
+                sequence: 0xfffffffd,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value: 1_0000,
+                script_pubkey: Script::from_bytes(spk),
+            }],
             lock_time: 0,
         };
         let _repl_fee = 9_0000u64; // 90000 sat < 100000 sat
@@ -878,7 +990,10 @@ mod tests {
     fn rbf_absolute_fee_sufficient_accepted() {
         let mut mp = Mempool::new();
         let prev_txid = Hash256([51; 32]);
-        let outpoint = OutPoint { txid: prev_txid, vout: 0 };
+        let outpoint = OutPoint {
+            txid: prev_txid,
+            vout: 0,
+        };
         let chain = utxo_set_with(outpoint, 50_0000_0000);
 
         let original = spend_tx_rbf(prev_txid, 49_9999_0000); // fee = 10000 sat

@@ -14,11 +14,7 @@ use rand::RngCore;
 use secp256k1::{Keypair, Secp256k1, SecretKey};
 
 use rbtc_crypto::sighash::{sighash_taproot, SighashType};
-use rbtc_primitives::{
-    hash::Hash256,
-    script::Script,
-    transaction::TxOut,
-};
+use rbtc_primitives::{hash::Hash256, script::Script, transaction::TxOut};
 use rbtc_wallet::address::taproot_output_key;
 
 use crate::{
@@ -36,11 +32,15 @@ impl Psbt {
         let pubkey = secp256k1::PublicKey::from_secret_key(&secp, secret_key);
         let pubkey_bytes = pubkey.serialize().to_vec(); // 33-byte compressed
 
-        let sighash_type = self.inputs.get(index)
+        let sighash_type = self
+            .inputs
+            .get(index)
             .and_then(|i| i.sighash_type)
             .unwrap_or(1); // SIGHASH_ALL
 
-        if let Some(txout) = self.inputs.get(index)
+        if let Some(txout) = self
+            .inputs
+            .get(index)
             .and_then(|i| i.witness_utxo.as_ref())
             .cloned()
         {
@@ -58,8 +58,12 @@ impl Psbt {
                 sighash_type,
             )?;
             let sig_bytes = ecdsa_sign(&secp, secret_key, &sighash, sighash_type);
-            self.inputs[index].partial_sigs.insert(pubkey_bytes, sig_bytes);
-        } else if self.inputs.get(index)
+            self.inputs[index]
+                .partial_sigs
+                .insert(pubkey_bytes, sig_bytes);
+        } else if self
+            .inputs
+            .get(index)
             .and_then(|i| i.non_witness_utxo.as_ref())
             .is_some()
         {
@@ -71,7 +75,9 @@ impl Psbt {
                 sighash_type,
             )?;
             let sig_bytes = ecdsa_sign(&secp, secret_key, &sighash, sighash_type);
-            self.inputs[index].partial_sigs.insert(pubkey_bytes, sig_bytes);
+            self.inputs[index]
+                .partial_sigs
+                .insert(pubkey_bytes, sig_bytes);
         } else {
             return Err(PsbtError::MissingField("witness_utxo or non_witness_utxo"));
         }
@@ -96,12 +102,9 @@ impl Psbt {
         // Collect all prevouts from witness_utxo fields (required for Taproot sighash)
         let mut prevouts: Vec<TxOut> = Vec::with_capacity(self.inputs.len());
         for inp in self.inputs.iter() {
-            let txout = inp
-                .witness_utxo
-                .clone()
-                .ok_or(PsbtError::MissingField(
-                    "witness_utxo required for all inputs when signing Taproot",
-                ))?;
+            let txout = inp.witness_utxo.clone().ok_or(PsbtError::MissingField(
+                "witness_utxo required for all inputs when signing Taproot",
+            ))?;
             prevouts.push(txout);
         }
 
@@ -118,9 +121,9 @@ impl Psbt {
             index,
             &prevouts,
             sighash_type,
-            None,  // key-path spend: no leaf hash
-            None,  // no annex
-            0,     // key_version = 0
+            None,     // key-path spend: no leaf hash
+            None,     // no annex
+            0,        // key_version = 0
             u32::MAX, // code_separator_pos
         );
 
@@ -194,7 +197,10 @@ fn compute_p2wpkh_sighash(
     let hash_seq = sha256d(&seq_buf);
     buf.extend_from_slice(&hash_seq.0);
     // outpoint
-    let inp = tx.inputs.get(input_index).ok_or(PsbtError::MissingField("input"))?;
+    let inp = tx
+        .inputs
+        .get(input_index)
+        .ok_or(PsbtError::MissingField("input"))?;
     inp.previous_output.txid.0.encode(&mut buf).ok();
     inp.previous_output.vout.encode(&mut buf).ok();
     // script_code
@@ -275,12 +281,18 @@ mod tests {
         let tx = Transaction {
             version: 2,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: Hash256([1; 32]), vout: 0 },
+                previous_output: OutPoint {
+                    txid: Hash256([1; 32]),
+                    vout: 0,
+                },
                 script_sig: Script::new(),
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 49_000, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: 49_000,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         };
         let mut psbt = Psbt::create(tx);
@@ -297,7 +309,7 @@ mod tests {
     #[test]
     fn sign_input_adds_partial_sig() {
         let mut psbt = make_psbt();
-        let secp = Secp256k1::new();
+        let _secp = Secp256k1::new();
         let sk = SecretKey::from_byte_array([1u8; 32]).unwrap();
         psbt.sign_input(0, &sk).unwrap();
         assert_eq!(psbt.inputs[0].partial_sigs.len(), 1);
@@ -317,12 +329,18 @@ mod tests {
         let tx = Transaction {
             version: 2,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: Hash256([1; 32]), vout: 0 },
+                previous_output: OutPoint {
+                    txid: Hash256([1; 32]),
+                    vout: 0,
+                },
                 script_sig: Script::new(),
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 49_000, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: 49_000,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         };
         let mut psbt = Psbt::create(tx);

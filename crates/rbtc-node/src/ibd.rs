@@ -161,7 +161,10 @@ impl IbdState {
 }
 
 /// Build a block locator from the active chain (exponential backoff)
-pub fn build_locator(best_height: u32, get_hash_at: impl Fn(u32) -> Option<BlockHash>) -> Vec<BlockHash> {
+pub fn build_locator(
+    best_height: u32,
+    get_hash_at: impl Fn(u32) -> Option<BlockHash>,
+) -> Vec<BlockHash> {
     let mut locator = Vec::new();
     let mut step = 1u32;
     let mut height = best_height;

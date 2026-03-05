@@ -22,10 +22,10 @@
 //! ```
 
 pub mod error;
-pub mod types;
-pub mod serialize;
 pub mod roles;
+pub mod serialize;
 pub mod signer;
+pub mod types;
 
-pub use types::{Psbt, PsbtGlobal, PsbtInput, PsbtOutput};
 pub use error::{PsbtError, Result};
+pub use types::{Psbt, PsbtGlobal, PsbtInput, PsbtOutput};

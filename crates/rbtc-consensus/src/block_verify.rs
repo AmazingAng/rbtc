@@ -1,28 +1,27 @@
-use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
-use std::time::Instant;
+use rayon::prelude::*;
+use rbtc_crypto::{merkle_root, sha256d};
 use rbtc_primitives::{
     block::Block,
     codec::Encodable,
-    constants::{MAX_BLOCK_SIGOPS_COST, MAX_BLOCK_WEIGHT, MAX_FUTURE_BLOCK_TIME, WITNESS_SCALE_FACTOR},
+    constants::{
+        MAX_BLOCK_SIGOPS_COST, MAX_BLOCK_WEIGHT, MAX_FUTURE_BLOCK_TIME, WITNESS_SCALE_FACTOR,
+    },
     hash::Hash256,
     transaction::OutPoint,
     Network,
 };
-use rbtc_crypto::{merkle_root, sha256d};
 use rbtc_script::ScriptFlags;
-use rayon::prelude::*;
+use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
+use std::time::Instant;
 use tracing::debug;
 
 use crate::{
     error::ConsensusError,
     script_exec_cache::metrics_snapshot as script_cache_metrics,
     tx_verify::{
-        block_subsidy,
-        load_transaction_inputs,
-        verify_coinbase,
-        verify_transaction_scripts_with_prevouts,
-        verify_transaction_with_lock_rules_preloaded,
+        block_subsidy, load_transaction_inputs, verify_coinbase,
+        verify_transaction_scripts_with_prevouts, verify_transaction_with_lock_rules_preloaded,
         MedianTimeProvider,
     },
     utxo::{Utxo, UtxoLookup},
@@ -44,12 +43,8 @@ static SCRIPT_PRECHECK_POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new
 fn precheck_pool() -> Option<&'static rayon::ThreadPool> {
     SCRIPT_PRECHECK_POOL
         .get_or_init(|| {
-            let Some(raw) = std::env::var("RBTC_SCRIPT_THREADS").ok() else {
-                return None;
-            };
-            let Ok(n) = raw.parse::<usize>() else {
-                return None;
-            };
+            let raw = std::env::var("RBTC_SCRIPT_THREADS").ok()?;
+            let n = raw.parse::<usize>().ok()?;
             if n == 0 {
                 return None;
             }
@@ -67,11 +62,15 @@ impl<U: UtxoLookup> UtxoLookup for BlockUtxoView<'_, U> {
         if self.spent_in_block.contains(outpoint) {
             return None;
         }
-        self.in_block.get(outpoint).cloned().or_else(|| self.base.get_utxo(outpoint))
+        self.in_block
+            .get(outpoint)
+            .cloned()
+            .or_else(|| self.base.get_utxo(outpoint))
     }
 
     fn has_unspent_txid(&self, txid: &rbtc_primitives::hash::TxId) -> bool {
-        self.in_block.keys().any(|outpoint| &outpoint.txid == txid) || self.base.has_unspent_txid(txid)
+        self.in_block.keys().any(|outpoint| &outpoint.txid == txid)
+            || self.base.has_unspent_txid(txid)
     }
 }
 
@@ -118,7 +117,12 @@ pub fn verify_block_with_options(
     // ── Header checks ────────────────────────────────────────────────────
     if ctx.network != Network::Signet {
         // Signet blocks do not require PoW; they are authenticated by the challenge script.
-        verify_block_header(header, ctx.expected_bits, ctx.median_time_past, ctx.network_time)?;
+        verify_block_header(
+            header,
+            ctx.expected_bits,
+            ctx.median_time_past,
+            ctx.network_time,
+        )?;
     } else {
         // For signet we still check nBits and timestamps, but not PoW.
         if header.bits != ctx.expected_bits {
@@ -127,7 +131,11 @@ pub fn verify_block_with_options(
         if header.time <= ctx.median_time_past {
             return Err(ConsensusError::TimestampTooOld);
         }
-        if header.time > ctx.network_time.saturating_add(MAX_FUTURE_BLOCK_TIME as u32) {
+        if header.time
+            > ctx
+                .network_time
+                .saturating_add(MAX_FUTURE_BLOCK_TIME as u32)
+        {
             return Err(ConsensusError::TimestampTooNew);
         }
     }
@@ -211,20 +219,22 @@ pub fn verify_block_with_options(
     for txid in non_coinbase_txids {
         in_block_txids.insert(*txid);
     }
-    let precheck_candidates: Vec<(usize, &rbtc_primitives::transaction::Transaction)> = non_coinbase
-        .iter()
-        .enumerate()
-        .filter_map(|(pos, tx)| {
-            let references_in_block_tx = tx.inputs.iter().any(|input| {
-                in_block_txids.contains(&input.previous_output.txid)
-            });
-            if references_in_block_tx {
-                None
-            } else {
-                Some((pos, tx))
-            }
-        })
-        .collect();
+    let precheck_candidates: Vec<(usize, &rbtc_primitives::transaction::Transaction)> =
+        non_coinbase
+            .iter()
+            .enumerate()
+            .filter_map(|(pos, tx)| {
+                let references_in_block_tx = tx
+                    .inputs
+                    .iter()
+                    .any(|input| in_block_txids.contains(&input.previous_output.txid));
+                if references_in_block_tx {
+                    None
+                } else {
+                    Some((pos, tx))
+                }
+            })
+            .collect();
     let mut prechecked_inputs: HashMap<usize, Vec<Utxo>> = HashMap::new();
     if !skip_script_verification {
         let flags = ctx.flags;
@@ -240,11 +250,12 @@ pub fn verify_block_with_options(
                 })
                 .collect::<Vec<Result<(usize, Vec<Utxo>), ConsensusError>>>()
         };
-        let precheck_results: Vec<Result<(usize, Vec<Utxo>), ConsensusError>> = if let Some(pool) = precheck_pool() {
-            pool.install(run_precheck)
-        } else {
-            run_precheck()
-        };
+        let precheck_results: Vec<Result<(usize, Vec<Utxo>), ConsensusError>> =
+            if let Some(pool) = precheck_pool() {
+                pool.install(run_precheck)
+            } else {
+                run_precheck()
+            };
         for item in precheck_results {
             let (pos, loaded) = item?;
             prechecked_inputs.insert(pos, loaded);
@@ -301,29 +312,40 @@ pub fn verify_block_with_options(
         // Mark inputs as spent in block-local view to enforce no cross-tx
         // double-spends, matching Core's ConnectBlock semantics.
         for input in &tx.inputs {
-            block_view.spent_in_block.insert(input.previous_output.clone());
+            block_view
+                .spent_in_block
+                .insert(input.previous_output.clone());
         }
 
         // Add this transaction's outputs to the in-block view so that
         // subsequent transactions in the same block can spend them.
         let txid = compute_txid(tx);
         for (vout, txout) in tx.outputs.iter().enumerate() {
-            let outpoint = rbtc_primitives::transaction::OutPoint { txid, vout: vout as u32 };
-            block_view.in_block.insert(outpoint, Utxo {
-                txout: txout.clone(),
-                is_coinbase: false,
-                height: ctx.height,
-            });
+            let outpoint = rbtc_primitives::transaction::OutPoint {
+                txid,
+                vout: vout as u32,
+            };
+            block_view.in_block.insert(
+                outpoint,
+                Utxo {
+                    txout: txout.clone(),
+                    is_coinbase: false,
+                    height: ctx.height,
+                },
+            );
         }
     }
 
     let total_sigops = coinbase_sigops + non_coinbase_sigops;
     if total_sigops > MAX_BLOCK_SIGOPS_COST {
-        return Err(ConsensusError::TooManySignatureOps(total_sigops, MAX_BLOCK_SIGOPS_COST));
+        return Err(ConsensusError::TooManySignatureOps(
+            total_sigops,
+            MAX_BLOCK_SIGOPS_COST,
+        ));
     }
 
     // Check coinbase value does not exceed subsidy + fees
-    let max_allowed = subsidy.checked_add(total_fees).unwrap_or(u64::MAX);
+    let max_allowed = subsidy.saturating_add(total_fees);
     let coinbase_out: u64 = block.transactions[0].outputs.iter().map(|o| o.value).sum();
     if coinbase_out > max_allowed {
         return Err(ConsensusError::BadCoinbaseAmount(coinbase_out, max_allowed));
@@ -451,7 +473,7 @@ fn parse_witness_program(script: &rbtc_primitives::script::Script) -> Option<(u8
         _ => return None,
     };
     let program_len = bytes[1] as usize;
-    if program_len < 2 || program_len > 40 || program_len + 2 != bytes.len() {
+    if !(2..=40).contains(&program_len) || program_len + 2 != bytes.len() {
         return None;
     }
     Some((version, bytes[2..].to_vec()))
@@ -518,7 +540,9 @@ fn extract_last_push_data(script: &rbtc_primitives::script::Script) -> Option<Ve
                 if pc + 3 >= bytes.len() {
                     return None;
                 }
-                let len = u32::from_le_bytes([bytes[pc], bytes[pc + 1], bytes[pc + 2], bytes[pc + 3]]) as usize;
+                let len =
+                    u32::from_le_bytes([bytes[pc], bytes[pc + 1], bytes[pc + 2], bytes[pc + 3]])
+                        as usize;
                 pc += 4;
                 if pc + len > bytes.len() {
                     return None;
@@ -554,8 +578,8 @@ fn verify_witness_commitment(block: &Block) -> Result<(), ConsensusError> {
         return Ok(());
     }
 
-    let commitment_output = commitment_output
-        .ok_or(ConsensusError::BadCoinbaseWitnessCommitment)?;
+    let commitment_output =
+        commitment_output.ok_or(ConsensusError::BadCoinbaseWitnessCommitment)?;
 
     let expected_commitment = &commitment_output.script_pubkey.as_bytes()[6..38];
 
@@ -724,12 +748,7 @@ fn extract_signet_solution(
 /// This is the virtual transaction output that the signet signer must spend.
 /// Commits to the block header with nonce=0 and the signet output stripped
 /// from the coinbase.
-fn signet_txid_to_spend(
-    block: &Block,
-    challenge: &[u8],
-) -> rbtc_primitives::hash::Hash256 {
-    use rbtc_primitives::codec::Encodable;
-
+fn signet_txid_to_spend(block: &Block, challenge: &[u8]) -> rbtc_primitives::hash::Hash256 {
     // Build a modified header with nonce=0
     let mut modified_header = block.header.clone();
     modified_header.nonce = 0;
@@ -762,7 +781,8 @@ fn signet_txid_to_spend(
     }
 
     // Recompute merkle root with modified coinbase
-    let mut txids: Vec<rbtc_primitives::hash::Hash256> = Vec::with_capacity(block.transactions.len());
+    let mut txids: Vec<rbtc_primitives::hash::Hash256> =
+        Vec::with_capacity(block.transactions.len());
     let mut buf = Vec::new();
     modified_coinbase.encode_legacy(&mut buf).ok();
     txids.push(sha256d(&buf));
@@ -812,11 +832,8 @@ fn signet_txid_to_spend(
 ///
 /// Returns Ok(()) if the block satisfies the signet challenge, or if the
 /// network is not signet.
-pub fn verify_signet_block_solution(
-    block: &Block,
-    challenge: &[u8],
-) -> Result<(), ConsensusError> {
-    use rbtc_script::{ScriptContext, ScriptFlags, verify_input};
+pub fn verify_signet_block_solution(block: &Block, challenge: &[u8]) -> Result<(), ConsensusError> {
+    use rbtc_script::{verify_input, ScriptContext, ScriptFlags};
 
     // Genesis block is exempt from signet challenge
     if block.header.prev_block == Hash256::ZERO {
@@ -827,8 +844,8 @@ pub fn verify_signet_block_solution(
         return Err(ConsensusError::SignetChallengeFailed("no coinbase".into()));
     }
 
-    let (solution_sig, solution_witness) =
-        extract_signet_solution(&block.transactions[0]).ok_or_else(|| {
+    let (solution_sig, solution_witness) = extract_signet_solution(&block.transactions[0])
+        .ok_or_else(|| {
             ConsensusError::SignetChallengeFailed("no signet solution in coinbase".into())
         })?;
 
@@ -908,13 +925,13 @@ pub fn encode_block_header(header: &rbtc_primitives::block::BlockHeader) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utxo::UtxoSet;
     use rbtc_primitives::block::{Block, BlockHeader};
     use rbtc_primitives::hash::Hash256;
     use rbtc_primitives::script::Script;
     use rbtc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
     use rbtc_primitives::Network;
     use rbtc_script::ScriptFlags;
-    use crate::utxo::UtxoSet;
 
     struct TestMtpProvider;
     impl MedianTimeProvider for TestMtpProvider {
@@ -959,7 +976,10 @@ mod tests {
     #[test]
     fn verify_block_empty_txs() {
         let h = header_with_valid_pow(0x207fffff);
-        let block = Block { header: h, transactions: vec![] };
+        let block = Block {
+            header: h,
+            transactions: vec![],
+        };
         let ctx = BlockValidationContext {
             block: &block,
             height: 0,
@@ -982,16 +1002,25 @@ mod tests {
         let non_cb = Transaction {
             version: 1,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: Hash256([1; 32]), vout: 0 },
+                previous_output: OutPoint {
+                    txid: Hash256([1; 32]),
+                    vout: 0,
+                },
                 script_sig: Script::new(),
                 sequence: 0,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 0, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: 0,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         };
         assert!(!non_cb.is_coinbase());
-        let block = Block { header: h, transactions: vec![non_cb] };
+        let block = Block {
+            header: h,
+            transactions: vec![non_cb],
+        };
         let ctx = BlockValidationContext {
             block: &block,
             height: 0,
@@ -1018,11 +1047,17 @@ mod tests {
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: 50_0000_0000,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         };
         let h = header_with_valid_pow(0x207fffff);
-        let block = Block { header: h, transactions: vec![coinbase.clone(), coinbase] };
+        let block = Block {
+            header: h,
+            transactions: vec![coinbase.clone(), coinbase],
+        };
         let ctx = BlockValidationContext {
             block: &block,
             height: 0,
@@ -1049,12 +1084,18 @@ mod tests {
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: 50_0000_0000,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         };
         let mut h = header_with_valid_pow(0x207fffff);
         h.merkle_root = Hash256([0xff; 32]); // wrong root
-        let block = Block { header: h, transactions: vec![coinbase] };
+        let block = Block {
+            header: h,
+            transactions: vec![coinbase],
+        };
         let ctx = BlockValidationContext {
             block: &block,
             height: 0,
@@ -1081,7 +1122,10 @@ mod tests {
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 100_0000_0000, script_pubkey: Script::new() }], // > subsidy
+            outputs: vec![TxOut {
+                value: 100_0000_0000,
+                script_pubkey: Script::new(),
+            }], // > subsidy
             lock_time: 0,
         };
         let mut buf = Vec::new();
@@ -1098,7 +1142,10 @@ mod tests {
                 break;
             }
         }
-        let block = Block { header: h, transactions: vec![coinbase] };
+        let block = Block {
+            header: h,
+            transactions: vec![coinbase],
+        };
         let ctx = BlockValidationContext {
             block: &block,
             height: 0,
@@ -1112,7 +1159,10 @@ mod tests {
         };
         let r = verify_block(&ctx, &UtxoSet::new());
         assert!(r.is_err());
-        assert!(matches!(r.unwrap_err(), ConsensusError::BadCoinbaseAmount(_, _)));
+        assert!(matches!(
+            r.unwrap_err(),
+            ConsensusError::BadCoinbaseAmount(_, _)
+        ));
     }
 
     #[test]
@@ -1125,7 +1175,10 @@ mod tests {
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: 50_0000_0000,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         };
         let mut buf = Vec::new();
@@ -1143,7 +1196,10 @@ mod tests {
                 break;
             }
         }
-        let block = Block { header: h, transactions: vec![coinbase] };
+        let block = Block {
+            header: h,
+            transactions: vec![coinbase],
+        };
         let ctx = BlockValidationContext {
             block: &block,
             height: 0,
@@ -1206,7 +1262,10 @@ mod tests {
         let spend = Transaction {
             version: 1,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: Hash256([1; 32]), vout: 0 },
+                previous_output: OutPoint {
+                    txid: Hash256([1; 32]),
+                    vout: 0,
+                },
                 script_sig: Script::new(),
                 sequence: 0xffff_ffff,
                 witness: vec![vec![1u8]],
@@ -1219,7 +1278,10 @@ mod tests {
             transactions: vec![coinbase, spend],
         };
         let r = verify_witness_commitment(&block);
-        assert!(matches!(r, Err(ConsensusError::BadCoinbaseWitnessReservedValue)));
+        assert!(matches!(
+            r,
+            Err(ConsensusError::BadCoinbaseWitnessReservedValue)
+        ));
     }
 
     #[test]
@@ -1245,7 +1307,10 @@ mod tests {
         let spend = Transaction {
             version: 1,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: Hash256([2; 32]), vout: 0 },
+                previous_output: OutPoint {
+                    txid: Hash256([2; 32]),
+                    vout: 0,
+                },
                 script_sig: Script::new(),
                 sequence: 0xffff_ffff,
                 witness: vec![vec![2u8]],
@@ -1258,7 +1323,10 @@ mod tests {
             transactions: vec![coinbase, spend],
         };
         let r = verify_witness_commitment(&block);
-        assert!(matches!(r, Err(ConsensusError::BadCoinbaseWitnessCommitment)));
+        assert!(matches!(
+            r,
+            Err(ConsensusError::BadCoinbaseWitnessCommitment)
+        ));
     }
 
     #[test]
@@ -1271,18 +1339,27 @@ mod tests {
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: 50_0000_0000,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         };
         let spend = Transaction {
             version: 1,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: Hash256([3; 32]), vout: 0 },
+                previous_output: OutPoint {
+                    txid: Hash256([3; 32]),
+                    vout: 0,
+                },
                 script_sig: Script::new(),
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 1_000, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: 1_000,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         };
         let txid = compute_txid(&spend);
@@ -1290,7 +1367,10 @@ mod tests {
         utxos.insert(
             OutPoint { txid, vout: 0 },
             Utxo {
-                txout: TxOut { value: 123, script_pubkey: Script::new() },
+                txout: TxOut {
+                    value: 123,
+                    script_pubkey: Script::new(),
+                },
                 is_coinbase: false,
                 height: 1,
             },
@@ -1319,18 +1399,27 @@ mod tests {
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: 50_0000_0000,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         };
         let spend = Transaction {
             version: 1,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: Hash256([4; 32]), vout: 0 },
+                previous_output: OutPoint {
+                    txid: Hash256([4; 32]),
+                    vout: 0,
+                },
                 script_sig: Script::new(),
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 1_000, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: 1_000,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         };
         let block = Block {
@@ -1358,18 +1447,27 @@ mod tests {
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: 50_0000_0000,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         };
         let spend = Transaction {
             version: 1,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: Hash256([5; 32]), vout: 0 },
+                previous_output: OutPoint {
+                    txid: Hash256([5; 32]),
+                    vout: 0,
+                },
                 script_sig: Script::new(),
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 1_000, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: 1_000,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         };
         let txid = compute_txid(&spend);
@@ -1377,7 +1475,10 @@ mod tests {
         utxos.insert(
             OutPoint { txid, vout: 0 },
             Utxo {
-                txout: TxOut { value: 123, script_pubkey: Script::new() },
+                txout: TxOut {
+                    value: 123,
+                    script_pubkey: Script::new(),
+                },
                 is_coinbase: false,
                 height: 1,
             },
@@ -1409,18 +1510,27 @@ mod tests {
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: 50_0000_0000,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         };
         let spend = Transaction {
             version: 1,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: Hash256([6; 32]), vout: 0 },
+                previous_output: OutPoint {
+                    txid: Hash256([6; 32]),
+                    vout: 0,
+                },
                 script_sig: Script::new(),
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 1_000, script_pubkey: Script::new() }], // only vout=0
+            outputs: vec![TxOut {
+                value: 1_000,
+                script_pubkey: Script::new(),
+            }], // only vout=0
             lock_time: 0,
         };
         let txid = compute_txid(&spend);
@@ -1428,7 +1538,10 @@ mod tests {
         utxos.insert(
             OutPoint { txid, vout: 1 }, // only vout=1 exists
             Utxo {
-                txout: TxOut { value: 123, script_pubkey: Script::new() },
+                txout: TxOut {
+                    value: 123,
+                    script_pubkey: Script::new(),
+                },
                 is_coinbase: false,
                 height: 1,
             },
@@ -1464,7 +1577,10 @@ mod tests {
                 sequence: 0xffff_ffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: 50_0000_0000,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         };
 
@@ -1472,7 +1588,10 @@ mod tests {
         let tx1 = Transaction {
             version: 1,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: funding_txid, vout: 0 },
+                previous_output: OutPoint {
+                    txid: funding_txid,
+                    vout: 0,
+                },
                 script_sig: Script::new(),
                 sequence: 0xffff_ffff,
                 witness: vec![],
@@ -1487,7 +1606,10 @@ mod tests {
         let tx2 = Transaction {
             version: 1,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: tx1id, vout: 0 },
+                previous_output: OutPoint {
+                    txid: tx1id,
+                    vout: 0,
+                },
                 script_sig: Script::new(),
                 sequence: 0xffff_ffff,
                 witness: vec![],
@@ -1518,9 +1640,15 @@ mod tests {
 
         let mut utxos = UtxoSet::new();
         utxos.insert(
-            OutPoint { txid: funding_txid, vout: 0 },
+            OutPoint {
+                txid: funding_txid,
+                vout: 0,
+            },
             Utxo {
-                txout: TxOut { value: 5_000, script_pubkey: Script::from_bytes(vec![0x51]) },
+                txout: TxOut {
+                    value: 5_000,
+                    script_pubkey: Script::from_bytes(vec![0x51]),
+                },
                 is_coinbase: false,
                 height: 0,
             },
@@ -1552,12 +1680,18 @@ mod tests {
                 sequence: 0xffff_ffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: 50_0000_0000,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         };
 
         let funding_txid = Hash256([0x22; 32]);
-        let shared_input = OutPoint { txid: funding_txid, vout: 0 };
+        let shared_input = OutPoint {
+            txid: funding_txid,
+            vout: 0,
+        };
         let tx1 = Transaction {
             version: 1,
             inputs: vec![TxIn {
@@ -1587,7 +1721,11 @@ mod tests {
             lock_time: 0,
         };
 
-        let txids = vec![compute_txid(&coinbase), compute_txid(&tx1), compute_txid(&tx2)];
+        let txids = vec![
+            compute_txid(&coinbase),
+            compute_txid(&tx1),
+            compute_txid(&tx2),
+        ];
         let merkle = rbtc_crypto::merkle_root(&txids).unwrap();
         let mut h = header_with_bits(0x207fffff);
         h.merkle_root = merkle;
@@ -1606,9 +1744,15 @@ mod tests {
 
         let mut utxos = UtxoSet::new();
         utxos.insert(
-            OutPoint { txid: funding_txid, vout: 0 },
+            OutPoint {
+                txid: funding_txid,
+                vout: 0,
+            },
             Utxo {
-                txout: TxOut { value: 5_000, script_pubkey: Script::from_bytes(vec![0x51]) },
+                txout: TxOut {
+                    value: 5_000,
+                    script_pubkey: Script::from_bytes(vec![0x51]),
+                },
                 is_coinbase: false,
                 height: 0,
             },
@@ -1640,13 +1784,19 @@ mod tests {
                 sequence: 0xffff_ffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: 50_0000_0000,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         };
         let tx = Transaction {
             version: 1,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: Hash256([0x33; 32]), vout: 0 },
+                previous_output: OutPoint {
+                    txid: Hash256([0x33; 32]),
+                    vout: 0,
+                },
                 script_sig: Script::new(),
                 sequence: 0xffff_ffff,
                 witness: vec![],
@@ -1659,7 +1809,11 @@ mod tests {
         };
         let tx_dup = tx.clone();
 
-        let txids = vec![compute_txid(&coinbase), compute_txid(&tx), compute_txid(&tx_dup)];
+        let txids = vec![
+            compute_txid(&coinbase),
+            compute_txid(&tx),
+            compute_txid(&tx_dup),
+        ];
         let merkle = rbtc_crypto::merkle_root(&txids).unwrap();
         let mut h = header_with_bits(0x207fffff);
         h.merkle_root = merkle;
@@ -1713,11 +1867,7 @@ mod tests {
     }
 
     /// Build a valid block with correct merkle root and PoW for testing.
-    fn make_valid_block(
-        txs: Vec<Transaction>,
-        bits: u32,
-        time: u32,
-    ) -> Block {
+    fn make_valid_block(txs: Vec<Transaction>, bits: u32, time: u32) -> Block {
         let txids: Vec<Hash256> = txs.iter().map(compute_txid).collect();
         let merkle = rbtc_crypto::merkle_root(&txids).unwrap_or(Hash256::ZERO);
         let mut h = header_with_bits(bits);
@@ -1728,7 +1878,10 @@ mod tests {
             let enc = encode_block_header(&h);
             let hash = sha256d(&enc);
             if h.meets_target(&hash) {
-                return Block { header: h, transactions: txs };
+                return Block {
+                    header: h,
+                    transactions: txs,
+                };
             }
         }
         panic!("failed to find valid PoW");
@@ -1748,26 +1901,41 @@ mod tests {
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: 50_0000_0000,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         };
         let spend = Transaction {
             version: 1,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: coinbase_txid, vout: 0 },
+                previous_output: OutPoint {
+                    txid: coinbase_txid,
+                    vout: 0,
+                },
                 script_sig: Script::new(),
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 1000, script_pubkey: Script::from_bytes(vec![0x51]) }],
+            outputs: vec![TxOut {
+                value: 1000,
+                script_pubkey: Script::from_bytes(vec![0x51]),
+            }],
             lock_time: 0,
         };
         let block = make_valid_block(vec![coinbase, spend], 0x207fffff, 100000);
         let mut utxos = UtxoSet::new();
         utxos.insert(
-            OutPoint { txid: coinbase_txid, vout: 0 },
+            OutPoint {
+                txid: coinbase_txid,
+                vout: 0,
+            },
             Utxo {
-                txout: TxOut { value: 5_000, script_pubkey: Script::from_bytes(vec![0x51]) },
+                txout: TxOut {
+                    value: 5_000,
+                    script_pubkey: Script::from_bytes(vec![0x51]),
+                },
                 is_coinbase: true,
                 height: 1, // created at height 1
             },
@@ -1799,26 +1967,41 @@ mod tests {
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: 50_0000_0000,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         };
         let spend = Transaction {
             version: 1,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: coinbase_txid, vout: 0 },
+                previous_output: OutPoint {
+                    txid: coinbase_txid,
+                    vout: 0,
+                },
                 script_sig: Script::new(),
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 1000, script_pubkey: Script::from_bytes(vec![0x51]) }],
+            outputs: vec![TxOut {
+                value: 1000,
+                script_pubkey: Script::from_bytes(vec![0x51]),
+            }],
             lock_time: 0,
         };
         let block = make_valid_block(vec![coinbase, spend], 0x207fffff, 100000);
         let mut utxos = UtxoSet::new();
         utxos.insert(
-            OutPoint { txid: coinbase_txid, vout: 0 },
+            OutPoint {
+                txid: coinbase_txid,
+                vout: 0,
+            },
             Utxo {
-                txout: TxOut { value: 5_000, script_pubkey: Script::from_bytes(vec![0x51]) },
+                txout: TxOut {
+                    value: 5_000,
+                    script_pubkey: Script::from_bytes(vec![0x51]),
+                },
                 is_coinbase: true,
                 height: 1,
             },
@@ -1852,13 +2035,19 @@ mod tests {
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: 50_0000_0000,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         };
         let block = make_valid_block(vec![coinbase], 0x207fffff, 100000);
         let weight = block.weight();
         // Verify our block weight is well under the limit (sanity check)
-        assert!(weight < MAX_BLOCK_WEIGHT, "test setup: weight {weight} should be under limit");
+        assert!(
+            weight < MAX_BLOCK_WEIGHT,
+            "test setup: weight {weight} should be under limit"
+        );
         let ctx = BlockValidationContext {
             block: &block,
             height: 0,
@@ -1885,7 +2074,10 @@ mod tests {
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 0, script_pubkey: huge_script }],
+            outputs: vec![TxOut {
+                value: 0,
+                script_pubkey: huge_script,
+            }],
             lock_time: 0,
         };
         // Don't use make_valid_block; just build the header manually since PoW
@@ -1903,8 +2095,15 @@ mod tests {
                 break;
             }
         }
-        let block = Block { header: h, transactions: vec![coinbase] };
-        assert!(block.weight() > MAX_BLOCK_WEIGHT, "test setup: weight {} should exceed limit", block.weight());
+        let block = Block {
+            header: h,
+            transactions: vec![coinbase],
+        };
+        assert!(
+            block.weight() > MAX_BLOCK_WEIGHT,
+            "test setup: weight {} should exceed limit",
+            block.weight()
+        );
         let ctx = BlockValidationContext {
             block: &block,
             height: 0,
@@ -1933,7 +2132,10 @@ mod tests {
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: 50_0000_0000,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         };
         let block = make_valid_block(vec![coinbase], 0x207fffff, 100000);
@@ -1963,7 +2165,10 @@ mod tests {
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: 50_0000_0000,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         };
         let block = make_valid_block(vec![coinbase], 0x207fffff, 100000);
@@ -2003,7 +2208,10 @@ mod tests {
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: block_subsidy(height), script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: block_subsidy(height),
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         };
         let block = make_valid_block(vec![coinbase], 0x207fffff, 100000);
@@ -2035,7 +2243,10 @@ mod tests {
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: subsidy, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: subsidy,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         };
         let block = make_valid_block(vec![coinbase], 0x207fffff, 100000);
@@ -2066,7 +2277,10 @@ mod tests {
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: subsidy + 1, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: subsidy + 1,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         };
         let block = make_valid_block(vec![coinbase], 0x207fffff, 100000);
@@ -2099,27 +2313,42 @@ mod tests {
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: subsidy + fee, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: subsidy + fee,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         };
         let funding_txid = Hash256([0xcc; 32]);
         let spend = Transaction {
             version: 1,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: funding_txid, vout: 0 },
+                previous_output: OutPoint {
+                    txid: funding_txid,
+                    vout: 0,
+                },
                 script_sig: Script::new(),
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 10_000 - fee, script_pubkey: Script::from_bytes(vec![0x51]) }],
+            outputs: vec![TxOut {
+                value: 10_000 - fee,
+                script_pubkey: Script::from_bytes(vec![0x51]),
+            }],
             lock_time: 0,
         };
         let block = make_valid_block(vec![coinbase, spend], 0x207fffff, 100000);
         let mut utxos = UtxoSet::new();
         utxos.insert(
-            OutPoint { txid: funding_txid, vout: 0 },
+            OutPoint {
+                txid: funding_txid,
+                vout: 0,
+            },
             Utxo {
-                txout: TxOut { value: 10_000, script_pubkey: Script::from_bytes(vec![0x51]) },
+                txout: TxOut {
+                    value: 10_000,
+                    script_pubkey: Script::from_bytes(vec![0x51]),
+                },
                 is_coinbase: false,
                 height: 0,
             },
@@ -2152,7 +2381,10 @@ mod tests {
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: 50_0000_0000,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         };
         let txid = compute_txid(&coinbase);
@@ -2172,32 +2404,51 @@ mod tests {
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: 50_0000_0000,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         };
         let tx2 = Transaction {
             version: 1,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: Hash256([0xdd; 32]), vout: 0 },
+                previous_output: OutPoint {
+                    txid: Hash256([0xdd; 32]),
+                    vout: 0,
+                },
                 script_sig: Script::new(),
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 1000, script_pubkey: Script::from_bytes(vec![0x51]) }],
+            outputs: vec![TxOut {
+                value: 1000,
+                script_pubkey: Script::from_bytes(vec![0x51]),
+            }],
             lock_time: 0,
         };
         let tx3 = Transaction {
             version: 2,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: Hash256([0xee; 32]), vout: 0 },
+                previous_output: OutPoint {
+                    txid: Hash256([0xee; 32]),
+                    vout: 0,
+                },
                 script_sig: Script::new(),
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 2000, script_pubkey: Script::from_bytes(vec![0x51]) }],
+            outputs: vec![TxOut {
+                value: 2000,
+                script_pubkey: Script::from_bytes(vec![0x51]),
+            }],
             lock_time: 0,
         };
-        let txids = vec![compute_txid(&coinbase), compute_txid(&tx2), compute_txid(&tx3)];
+        let txids = vec![
+            compute_txid(&coinbase),
+            compute_txid(&tx2),
+            compute_txid(&tx3),
+        ];
         let root = rbtc_crypto::merkle_root(&txids).unwrap();
 
         // Manually compute: H01 = hash(tx0 || tx1), H22 = hash(tx2 || tx2), root = hash(H01 || H22)
@@ -2228,7 +2479,10 @@ mod tests {
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: 50_0000_0000,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         };
         let block = make_valid_block(vec![coinbase], 0x207fffff, 100000);
@@ -2257,7 +2511,10 @@ mod tests {
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: 50_0000_0000,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         };
         let block = make_valid_block(vec![coinbase], 0x207fffff, 100000);
@@ -2302,39 +2559,63 @@ mod tests {
         let tx1 = Transaction {
             version: 1,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: funding1, vout: 0 },
+                previous_output: OutPoint {
+                    txid: funding1,
+                    vout: 0,
+                },
                 script_sig: Script::new(),
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 4_000, script_pubkey: Script::from_bytes(vec![0x51]) }],
+            outputs: vec![TxOut {
+                value: 4_000,
+                script_pubkey: Script::from_bytes(vec![0x51]),
+            }],
             lock_time: 0,
         };
         let tx2 = Transaction {
             version: 1,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: funding2, vout: 0 },
+                previous_output: OutPoint {
+                    txid: funding2,
+                    vout: 0,
+                },
                 script_sig: Script::new(),
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 3_000, script_pubkey: Script::from_bytes(vec![0x51]) }],
+            outputs: vec![TxOut {
+                value: 3_000,
+                script_pubkey: Script::from_bytes(vec![0x51]),
+            }],
             lock_time: 0,
         };
         let block = make_valid_block(vec![coinbase, tx1, tx2], 0x207fffff, 100000);
         let mut utxos = UtxoSet::new();
         utxos.insert(
-            OutPoint { txid: funding1, vout: 0 },
+            OutPoint {
+                txid: funding1,
+                vout: 0,
+            },
             Utxo {
-                txout: TxOut { value: 5_000, script_pubkey: Script::from_bytes(vec![0x51]) },
+                txout: TxOut {
+                    value: 5_000,
+                    script_pubkey: Script::from_bytes(vec![0x51]),
+                },
                 is_coinbase: false,
                 height: 0,
             },
         );
         utxos.insert(
-            OutPoint { txid: funding2, vout: 0 },
+            OutPoint {
+                txid: funding2,
+                vout: 0,
+            },
             Utxo {
-                txout: TxOut { value: 5_000, script_pubkey: Script::from_bytes(vec![0x51]) },
+                txout: TxOut {
+                    value: 5_000,
+                    script_pubkey: Script::from_bytes(vec![0x51]),
+                },
                 is_coinbase: false,
                 height: 0,
             },
@@ -2366,27 +2647,42 @@ mod tests {
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: 50_0000_0000,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         };
         // Output > input → negative fee
         let spend = Transaction {
             version: 1,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: funding, vout: 0 },
+                previous_output: OutPoint {
+                    txid: funding,
+                    vout: 0,
+                },
                 script_sig: Script::new(),
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 10_000, script_pubkey: Script::from_bytes(vec![0x51]) }],
+            outputs: vec![TxOut {
+                value: 10_000,
+                script_pubkey: Script::from_bytes(vec![0x51]),
+            }],
             lock_time: 0,
         };
         let block = make_valid_block(vec![coinbase, spend], 0x207fffff, 100000);
         let mut utxos = UtxoSet::new();
         utxos.insert(
-            OutPoint { txid: funding, vout: 0 },
+            OutPoint {
+                txid: funding,
+                vout: 0,
+            },
             Utxo {
-                txout: TxOut { value: 5_000, script_pubkey: Script::from_bytes(vec![0x51]) },
+                txout: TxOut {
+                    value: 5_000,
+                    script_pubkey: Script::from_bytes(vec![0x51]),
+                },
                 is_coinbase: false,
                 height: 0,
             },
@@ -2421,7 +2717,10 @@ mod tests {
         // Verify PoW
         let header_bytes = encode_block_header(&genesis);
         let hash = sha256d(&header_bytes);
-        assert!(genesis.meets_target(&hash), "genesis block must meet its own target");
+        assert!(
+            genesis.meets_target(&hash),
+            "genesis block must meet its own target"
+        );
 
         // Verify hash matches known genesis hash
         let hash_hex = hash.to_hex();
@@ -2443,9 +2742,10 @@ mod tests {
             }],
             outputs: vec![TxOut {
                 value: 5_000_000_000,
-                script_pubkey: Script::from_bytes(vec![0x76, 0xa9, 0x14,
-                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                    0x88, 0xac]),
+                script_pubkey: Script::from_bytes(vec![
+                    0x76, 0xa9, 0x14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0x88, 0xac,
+                ]),
             }],
             lock_time: 0,
         };
@@ -2480,8 +2780,14 @@ mod tests {
                 witness: Vec::new(),
             }],
             outputs: vec![
-                TxOut { value: 5_000_000_000, script_pubkey: Script::new() },
-                TxOut { value: 0, script_pubkey: Script::from_bytes(spk) },
+                TxOut {
+                    value: 5_000_000_000,
+                    script_pubkey: Script::new(),
+                },
+                TxOut {
+                    value: 0,
+                    script_pubkey: Script::from_bytes(spk),
+                },
             ],
             lock_time: 0,
         };
@@ -2531,7 +2837,10 @@ mod tests {
                     sequence: 0xffffffff,
                     witness: Vec::new(),
                 }],
-                outputs: vec![TxOut { value: 0, script_pubkey: Script::new() }],
+                outputs: vec![TxOut {
+                    value: 0,
+                    script_pubkey: Script::new(),
+                }],
                 lock_time: 0,
             }],
         };
@@ -2557,7 +2866,10 @@ mod tests {
         let funding_txid = Hash256([0xaa; 32]);
         let mut utxos = UtxoSet::new();
         utxos.insert(
-            OutPoint { txid: funding_txid, vout: 0 },
+            OutPoint {
+                txid: funding_txid,
+                vout: 0,
+            },
             Utxo {
                 txout: TxOut {
                     value: 5_000,
@@ -2578,18 +2890,27 @@ mod tests {
                 sequence: 0xffff_ffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: 50_0000_0000,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         };
         let bad_tx = Transaction {
             version: 1,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: funding_txid, vout: 0 },
+                previous_output: OutPoint {
+                    txid: funding_txid,
+                    vout: 0,
+                },
                 script_sig: Script::new(), // empty — invalid for OP_CHECKSIG
                 sequence: 0xffff_ffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 4_000, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: 4_000,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         };
 
@@ -2601,9 +2922,14 @@ mod tests {
             h.nonce = nonce;
             let enc = encode_block_header(&h);
             let hash = sha256d(&enc);
-            if h.meets_target(&hash) { break; }
+            if h.meets_target(&hash) {
+                break;
+            }
         }
-        let block = Block { header: h, transactions: vec![coinbase, bad_tx] };
+        let block = Block {
+            header: h,
+            transactions: vec![coinbase, bad_tx],
+        };
         let ctx = BlockValidationContext {
             block: &block,
             height: 1,
@@ -2618,7 +2944,10 @@ mod tests {
 
         // Without skip: should FAIL script verification
         let result_normal = verify_block_with_options(&ctx, &utxos, false);
-        assert!(result_normal.is_err(), "should fail without skip_script_verification");
+        assert!(
+            result_normal.is_err(),
+            "should fail without skip_script_verification"
+        );
 
         // With skip (assumevalid): should PASS
         let fees = verify_block_with_options(&ctx, &utxos, true).unwrap();
@@ -2637,13 +2966,19 @@ mod tests {
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: 50_0000_0000,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         };
         // Deliberately wrong merkle root
         let mut h = header_with_valid_pow(0x207fffff);
         h.merkle_root = Hash256([0xff; 32]);
-        let block = Block { header: h, transactions: vec![coinbase] };
+        let block = Block {
+            header: h,
+            transactions: vec![coinbase],
+        };
         let ctx = BlockValidationContext {
             block: &block,
             height: 0,
@@ -2656,7 +2991,10 @@ mod tests {
             signet_challenge: None,
         };
         let result = verify_block_with_options(&ctx, &UtxoSet::new(), true);
-        assert!(result.is_err(), "bad merkle root should still be rejected with skip_script");
+        assert!(
+            result.is_err(),
+            "bad merkle root should still be rejected with skip_script"
+        );
         assert!(matches!(result.unwrap_err(), ConsensusError::BadMerkleRoot));
     }
 }

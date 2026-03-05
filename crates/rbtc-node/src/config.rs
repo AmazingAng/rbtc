@@ -133,10 +133,10 @@ impl Args {
         }
         let home = dirs_home();
         match self.network {
-            Network::Mainnet  => home.join(".rbtc"),
+            Network::Mainnet => home.join(".rbtc"),
             Network::Testnet4 => home.join(".rbtc").join("testnet4"),
-            Network::Regtest  => home.join(".rbtc").join("regtest"),
-            Network::Signet   => home.join(".rbtc").join("signet"),
+            Network::Regtest => home.join(".rbtc").join("regtest"),
+            Network::Signet => home.join(".rbtc").join("signet"),
         }
     }
 }

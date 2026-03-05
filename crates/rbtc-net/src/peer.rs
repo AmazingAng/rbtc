@@ -38,8 +38,13 @@ pub enum PeerEvent {
         /// BIP155: peer signaled sendaddrv2 during handshake
         prefers_addrv2: bool,
     },
-    Message { peer_id: u64, message: NetworkMessage },
-    Disconnected { peer_id: u64 },
+    Message {
+        peer_id: u64,
+        message: NetworkMessage,
+    },
+    Disconnected {
+        peer_id: u64,
+    },
 }
 
 /// Commands sent from peer manager to a peer
@@ -90,7 +95,16 @@ pub async fn run_peer(
     event_tx: mpsc::UnboundedSender<PeerEvent>,
     mut cmd_rx: mpsc::UnboundedReceiver<PeerCommand>,
 ) {
-    let result = run_peer_inner(id, addr, stream, network, best_height, &event_tx, &mut cmd_rx).await;
+    let result = run_peer_inner(
+        id,
+        addr,
+        stream,
+        network,
+        best_height,
+        &event_tx,
+        &mut cmd_rx,
+    )
+    .await;
     if let Err(e) = result {
         debug!("peer {id} ({addr}): disconnected: {e}");
     }
@@ -139,9 +153,10 @@ async fn run_peer_inner(
                     // Reject peers with protocol version too old to support
                     // modern features (SegWit, compact blocks, etc.)
                     if peer_version < 70015 {
-                        return Err(NetError::HandshakeFailed(
-                            format!("peer protocol version {} too old (minimum 70015)", peer_version),
-                        ));
+                        return Err(NetError::HandshakeFailed(format!(
+                            "peer protocol version {} too old (minimum 70015)",
+                            peer_version
+                        )));
                     }
                     // BIP339: send wtxidrelay before verack
                     let wtxid = Message::new(magic, NetworkMessage::WtxidRelay).encode_to_bytes();
@@ -166,18 +181,22 @@ async fn run_peer_inner(
             }
         }
         Ok::<(), NetError>(())
-    }).await.map_err(|_| NetError::HandshakeFailed("timeout".into()))??;
+    })
+    .await
+    .map_err(|_| NetError::HandshakeFailed("timeout".into()))??;
 
     info!("peer {id} ({addr}) handshake complete: version={peer_version} height={peer_height} ua={peer_ua}");
 
-    event_tx.send(PeerEvent::Ready {
-        peer_id: id,
-        addr,
-        best_height: peer_height,
-        user_agent: peer_ua,
-        wtxid_relay: peer_wtxid_relay,
-        prefers_addrv2: peer_sendaddrv2,
-    }).map_err(|_| NetError::ChannelError)?;
+    event_tx
+        .send(PeerEvent::Ready {
+            peer_id: id,
+            addr,
+            best_height: peer_height,
+            user_agent: peer_ua,
+            wtxid_relay: peer_wtxid_relay,
+            prefers_addrv2: peer_sendaddrv2,
+        })
+        .map_err(|_| NetError::ChannelError)?;
 
     // Send sendheaders (prefer headers over inv for new blocks)
     let sh = Message::new(magic, NetworkMessage::SendHeaders).encode_to_bytes();
@@ -237,10 +256,10 @@ async fn run_peer_inner(
                     let ping = Message::new(magic, NetworkMessage::Ping(nonce)).encode_to_bytes();
                     write_half.write_all(&ping).await?;
                 }
-                if let Some(_) = pending_ping {
-                    if last_ping.elapsed() > PING_INTERVAL + PING_TIMEOUT {
-                        return Err(NetError::ConnectionClosed);
-                    }
+                if pending_ping.is_some()
+                    && last_ping.elapsed() > PING_INTERVAL + PING_TIMEOUT
+                {
+                    return Err(NetError::ConnectionClosed);
                 }
             }
         }

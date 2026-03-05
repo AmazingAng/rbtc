@@ -8,8 +8,8 @@ use std::hash::Hasher;
 
 use siphasher::sip::SipHasher24;
 
-use rbtc_primitives::block::Block;
 use rbtc_crypto::sha256d;
+use rbtc_primitives::block::Block;
 
 /// Golomb-Rice parameter P for basic filters.
 pub const BASIC_FILTER_P: u8 = 19;
@@ -44,6 +44,7 @@ fn golomb_rice_encode(bits: &mut BitWriter, p: u8, x: u64) {
 }
 
 /// Bit writer that accumulates a bitstream into bytes.
+#[derive(Default)]
 pub struct BitWriter {
     data: Vec<u8>,
     current: u8,
@@ -52,7 +53,7 @@ pub struct BitWriter {
 
 impl BitWriter {
     pub fn new() -> Self {
-        Self { data: Vec::new(), current: 0, bits_used: 0 }
+        Self::default()
     }
 
     pub fn write_bit(&mut self, bit: u8) {
@@ -184,7 +185,9 @@ mod tests {
                 version: 1,
                 prev_block: rbtc_primitives::hash::Hash256::ZERO,
                 merkle_root: rbtc_primitives::hash::Hash256::ZERO,
-                time: 0, bits: 0, nonce: 0,
+                time: 0,
+                bits: 0,
+                nonce: 0,
             },
             transactions: vec![],
         };

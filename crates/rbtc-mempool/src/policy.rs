@@ -52,27 +52,46 @@ fn count_script_sigops(script: &[u8]) -> u32 {
         let op = script[i];
         match op {
             // Push data opcodes: skip their payload
-            0x01..=0x4b => { i += 1 + op as usize; continue; }
-            0x4c => { // OP_PUSHDATA1
-                if i + 1 < script.len() { i += 2 + script[i + 1] as usize; } else { break; }
+            0x01..=0x4b => {
+                i += 1 + op as usize;
                 continue;
             }
-            0x4d => { // OP_PUSHDATA2
+            0x4c => {
+                // OP_PUSHDATA1
+                if i + 1 < script.len() {
+                    i += 2 + script[i + 1] as usize;
+                } else {
+                    break;
+                }
+                continue;
+            }
+            0x4d => {
+                // OP_PUSHDATA2
                 if i + 2 < script.len() {
                     let len = u16::from_le_bytes([script[i + 1], script[i + 2]]) as usize;
                     i += 3 + len;
-                } else { break; }
+                } else {
+                    break;
+                }
                 continue;
             }
-            0x4e => { // OP_PUSHDATA4
+            0x4e => {
+                // OP_PUSHDATA4
                 if i + 4 < script.len() {
-                    let len = u32::from_le_bytes([script[i+1], script[i+2], script[i+3], script[i+4]]) as usize;
+                    let len = u32::from_le_bytes([
+                        script[i + 1],
+                        script[i + 2],
+                        script[i + 3],
+                        script[i + 4],
+                    ]) as usize;
                     i += 5 + len;
-                } else { break; }
+                } else {
+                    break;
+                }
                 continue;
             }
-            0xac | 0xad => count += 1,                // OP_CHECKSIG, OP_CHECKSIGVERIFY
-            0xae | 0xaf => count += 20,               // OP_CHECKMULTISIG, OP_CHECKMULTISIGVERIFY
+            0xac | 0xad => count += 1,  // OP_CHECKSIG, OP_CHECKSIGVERIFY
+            0xae | 0xaf => count += 20, // OP_CHECKMULTISIG, OP_CHECKMULTISIGVERIFY
             _ => {}
         }
         i += 1;
@@ -359,14 +378,20 @@ mod tests {
     fn p2wpkh_output(value: u64) -> TxOut {
         let mut s = vec![0x00, 0x14];
         s.extend_from_slice(&[0u8; 20]);
-        TxOut { value, script_pubkey: Script::from_bytes(s) }
+        TxOut {
+            value,
+            script_pubkey: Script::from_bytes(s),
+        }
     }
 
     fn op_return_output(data: &[u8]) -> TxOut {
         let mut s = vec![0x6a];
         s.push(data.len() as u8);
         s.extend_from_slice(data);
-        TxOut { value: 0, script_pubkey: Script::from_bytes(s) }
+        TxOut {
+            value: 0,
+            script_pubkey: Script::from_bytes(s),
+        }
     }
 
     #[test]

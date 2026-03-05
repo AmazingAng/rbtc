@@ -97,7 +97,7 @@ impl Wallet {
     ) -> Result<Self, WalletError> {
         let seed = mnemonic.to_seed(bip39_passphrase);
         let master = ExtendedPrivKey::from_seed(&seed)?;
-        let mut wallet = Self::new_inner(master, network, db)?;
+        let wallet = Self::new_inner(master, network, db)?;
         wallet.save_encrypted_master(encryption_passphrase)?;
         Ok(wallet)
     }
@@ -109,9 +109,7 @@ impl Wallet {
         db: std::sync::Arc<Database>,
     ) -> Result<Self, WalletError> {
         let store = WalletStore::new(&db);
-        let enc_data = store
-            .load_encrypted_xprv()?
-            .ok_or(WalletError::NotLoaded)?;
+        let enc_data = store.load_encrypted_xprv()?.ok_or(WalletError::NotLoaded)?;
         let master_seed = decrypt_data(passphrase, &enc_data)?;
         let master = ExtendedPrivKey::from_seed(&master_seed)?;
         Self::new_inner(master, network, db)
@@ -126,11 +124,7 @@ impl Wallet {
     }
 
     /// Import a single WIF private key into the wallet (no HD derivation).
-    pub fn import_wif(
-        &mut self,
-        wif: &str,
-        label: &str,
-    ) -> Result<String, WalletError> {
+    pub fn import_wif(&mut self, wif: &str, label: &str) -> Result<String, WalletError> {
         let (sk, _net) = from_wif(wif)?;
         let secp = secp256k1::Secp256k1::signing_only();
         let pk = secp256k1::PublicKey::from_secret_key(&secp, &sk);
@@ -172,8 +166,7 @@ impl Wallet {
         let type_key = type_key(addr_type);
         let index = *self.next_index.get(&type_key).unwrap_or(&0);
 
-        let (address, spk, pubkey_bytes, path_str) =
-            self.derive_address(addr_type, index)?;
+        let (address, spk, pubkey_bytes, path_str) = self.derive_address(addr_type, index)?;
 
         *self.next_index.entry(type_key).or_insert(0) = index + 1;
 
@@ -310,7 +303,10 @@ impl Wallet {
                 let spk_bytes = output.script_pubkey.as_bytes().to_vec();
                 if let Some(address) = self.script_to_addr.get(&spk_bytes) {
                     let address = address.clone();
-                    let outpoint = OutPoint { txid, vout: vout as u32 };
+                    let outpoint = OutPoint {
+                        txid,
+                        vout: vout as u32,
+                    };
                     let addr_type = self
                         .addresses
                         .get(&address)
@@ -333,12 +329,7 @@ impl Wallet {
                     );
 
                     // Persist
-                    store
-                        .put_utxo(
-                            &outpoint,
-                            &to_stored_utxo(&utxo),
-                        )
-                        .ok();
+                    store.put_utxo(&outpoint, &to_stored_utxo(&utxo)).ok();
 
                     self.utxos.insert(outpoint, utxo);
                 }
@@ -376,16 +367,22 @@ impl Wallet {
         fee_rate: f64,
         change_addr_type: AddressType,
     ) -> Result<(Transaction, u64), WalletError> {
-        let dest_spk =
-            crate::address::address_to_script(dest_address)?;
+        let dest_spk = crate::address::address_to_script(dest_address)?;
 
-        let available: Vec<WalletUtxo> =
-            self.utxos.values().filter(|u| u.confirmed).cloned().collect();
+        let available: Vec<WalletUtxo> = self
+            .utxos
+            .values()
+            .filter(|u| u.confirmed)
+            .cloned()
+            .collect();
 
         let (selected, fee) = CoinSelector::select(&available, amount_sat, fee_rate)?;
 
         if fee >= amount_sat {
-            return Err(WalletError::FeeTooHigh { fee, value: amount_sat });
+            return Err(WalletError::FeeTooHigh {
+                fee,
+                value: amount_sat,
+            });
         }
 
         let total_in: u64 = selected.iter().map(|u| u.value).sum();
@@ -411,7 +408,7 @@ impl Wallet {
             .map(|utxo| {
                 let sk = self
                     .privkey_for_address(&utxo.address)
-                    .unwrap_or_else(|_| SecretKey::from_slice(&[1u8; 32]).unwrap());
+                    .unwrap_or_else(|_| SecretKey::from_byte_array([1u8; 32]).unwrap());
                 SigningInput {
                     outpoint: utxo.outpoint.clone(),
                     value: utxo.value,
@@ -436,7 +433,7 @@ impl Wallet {
                 if let Some(utxo) = self.utxos.get(&inp.previous_output) {
                     let sk = self
                         .privkey_for_address(&utxo.address)
-                        .unwrap_or_else(|_| SecretKey::from_slice(&[1u8; 32]).unwrap());
+                        .unwrap_or_else(|_| SecretKey::from_byte_array([1u8; 32]).unwrap());
                     SigningInput {
                         outpoint: inp.previous_output.clone(),
                         value: utxo.value,
@@ -450,7 +447,7 @@ impl Wallet {
                         outpoint: inp.previous_output.clone(),
                         value: 0,
                         script_pubkey: Script::new(),
-                        secret_key: SecretKey::from_slice(&[1u8; 32]).unwrap(),
+                        secret_key: SecretKey::from_byte_array([1u8; 32]).unwrap(),
                         witness_script: None,
                     }
                 }
@@ -485,15 +482,14 @@ impl Wallet {
 
         // Restore address index
         let idx = store.load_address_index()?;
-        self.next_index
-            .insert("segwit".to_string(), idx);
+        self.next_index.insert("segwit".to_string(), idx);
 
         // Restore known addresses
         for stored in store.iter_addresses() {
             let addr_type = match stored.addr_type.as_str() {
-                "legacy"  => AddressType::Legacy,
+                "legacy" => AddressType::Legacy,
                 "taproot" => AddressType::Taproot,
-                _         => AddressType::SegWit,
+                _ => AddressType::SegWit,
             };
             if let Ok(pub_bytes) = hex::decode(&stored.pubkey_hex) {
                 if let Ok(spk) = self.script_from_pubkey(addr_type, &pub_bytes) {
@@ -548,7 +544,10 @@ impl Wallet {
                 self.utxos.insert(
                     outpoint,
                     WalletUtxo {
-                        outpoint: OutPoint { txid, vout: stored_utxo.vout },
+                        outpoint: OutPoint {
+                            txid,
+                            vout: stored_utxo.vout,
+                        },
                         value: stored_utxo.value,
                         script_pubkey: Script::from_bytes(spk_bytes),
                         height: stored_utxo.height,
@@ -578,7 +577,10 @@ impl Wallet {
     }
 
     fn privkey_for_address(&self, address: &str) -> Result<SecretKey, WalletError> {
-        let info = self.addresses.get(address).ok_or(WalletError::AddressNotFound)?;
+        let info = self
+            .addresses
+            .get(address)
+            .ok_or(WalletError::AddressNotFound)?;
         if info.derivation_path.starts_with("imported:") {
             // Look up the persisted WIF key
             let store = WalletStore::new(&self.db);
@@ -605,8 +607,8 @@ impl Wallet {
         };
 
         let (purpose, path_str) = match addr_type {
-            AddressType::Legacy  => (44u32, format!("m/44'/{coin_type}'/0'/0/{index}")),
-            AddressType::SegWit  => (84u32, format!("m/84'/{coin_type}'/0'/0/{index}")),
+            AddressType::Legacy => (44u32, format!("m/44'/{coin_type}'/0'/0/{index}")),
+            AddressType::SegWit => (84u32, format!("m/84'/{coin_type}'/0'/0/{index}")),
             AddressType::Taproot => (86u32, format!("m/86'/{coin_type}'/0'/0/{index}")),
         };
         let _ = purpose;
@@ -645,8 +647,8 @@ impl Wallet {
         let pubkey =
             secp256k1::PublicKey::from_slice(pub_bytes).map_err(|_| WalletError::InvalidKey)?;
         match addr_type {
-            AddressType::Legacy  => Ok(p2pkh_script(&pubkey)),
-            AddressType::SegWit  => Ok(p2wpkh_script(&pubkey)),
+            AddressType::Legacy => Ok(p2pkh_script(&pubkey)),
+            AddressType::SegWit => Ok(p2wpkh_script(&pubkey)),
             AddressType::Taproot => {
                 // For Taproot, re-derive the tweaked output key from the pubkey.
                 // We need the secret key for tweaking, so this path is approximate.
@@ -725,8 +727,8 @@ fn unix_now() -> u64 {
 
 fn type_key_str(addr_type: AddressType) -> &'static str {
     match addr_type {
-        AddressType::Legacy  => "legacy",
-        AddressType::SegWit  => "segwit",
+        AddressType::Legacy => "legacy",
+        AddressType::SegWit => "segwit",
         AddressType::Taproot => "taproot",
     }
 }
@@ -766,7 +768,10 @@ mod tests {
         let (_dir, db) = open_db();
         let mut w = test_wallet(db);
         let addr = w.new_address(AddressType::SegWit).unwrap();
-        assert!(addr.starts_with("bcrt1q"), "expected bcrt1q prefix, got {addr}");
+        assert!(
+            addr.starts_with("bcrt1q"),
+            "expected bcrt1q prefix, got {addr}"
+        );
     }
 
     #[test]
@@ -783,7 +788,10 @@ mod tests {
         let (_dir, db) = open_db();
         let mut w = test_wallet(db);
         let addr = w.new_address(AddressType::Taproot).unwrap();
-        assert!(addr.starts_with("bcrt1p"), "expected bcrt1p prefix, got {addr}");
+        assert!(
+            addr.starts_with("bcrt1p"),
+            "expected bcrt1p prefix, got {addr}"
+        );
     }
 
     #[test]

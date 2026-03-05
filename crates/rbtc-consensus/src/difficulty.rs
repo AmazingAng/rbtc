@@ -38,7 +38,7 @@ fn scale_target(target: &[u8; 32], numerator: u64, denominator: u64) -> [u8; 32]
     // result = target * numerator / denominator using schoolbook big-int arithmetic.
     let mut src = [0u64; 4];
     for i in 0..4 {
-        let chunk = &target[i*8..(i+1)*8];
+        let chunk = &target[i * 8..(i + 1) * 8];
         src[i] = u64::from_le_bytes(chunk.try_into().unwrap());
     }
 
@@ -63,7 +63,7 @@ fn scale_target(target: &[u8; 32], numerator: u64, denominator: u64) -> [u8; 32]
     // Convert back to bytes (little-endian)
     let mut out = [0u8; 32];
     for i in 0..4 {
-        out[i*8..(i+1)*8].copy_from_slice(&product[i].to_le_bytes());
+        out[i * 8..(i + 1) * 8].copy_from_slice(&product[i].to_le_bytes());
     }
     out
 }
@@ -83,7 +83,7 @@ fn target_gt(a: &[u8; 32], b: &[u8; 32]) -> bool {
 
 /// Check if a difficulty adjustment is due at this height
 pub fn is_adjustment_height(height: u32) -> bool {
-    height > 0 && height % DIFFICULTY_ADJUSTMENT_INTERVAL as u32 == 0
+    height > 0 && height.is_multiple_of(DIFFICULTY_ADJUSTMENT_INTERVAL as u32)
 }
 
 /// Maximum allowed target (minimum difficulty) – Bitcoin mainnet value.
@@ -107,7 +107,11 @@ pub fn bits_to_work(bits: u32) -> u128 {
     for i in (16..32).rev() {
         val = val.saturating_mul(256).saturating_add(target[i] as u128);
     }
-    if val == 0 { u128::MAX } else { u128::MAX / val }
+    if val == 0 {
+        u128::MAX
+    } else {
+        u128::MAX / val
+    }
 }
 
 #[cfg(test)]

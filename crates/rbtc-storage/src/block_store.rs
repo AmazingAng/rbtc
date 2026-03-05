@@ -5,7 +5,10 @@ use rbtc_primitives::{
 };
 
 use crate::{
-    db::{Database, CF_BLOCK_DATA, CF_BLOCK_INDEX, CF_BLOCK_FILTERS, CF_FILTER_HEADERS, CF_HEIGHT_INDEX, CF_UNDO},
+    db::{
+        Database, CF_BLOCK_DATA, CF_BLOCK_FILTERS, CF_BLOCK_INDEX, CF_FILTER_HEADERS,
+        CF_HEIGHT_INDEX, CF_UNDO,
+    },
     error::{Result, StorageError},
 };
 
@@ -36,18 +39,24 @@ impl StoredBlockIndex {
 
     pub fn decode_bytes(bytes: &[u8]) -> Result<Self> {
         let mut cur = std::io::Cursor::new(bytes);
-        let header = BlockHeader::decode(&mut cur)
-            .map_err(|e| StorageError::Decode(e.to_string()))?;
-        let height = u32::decode(&mut cur)
-            .map_err(|e| StorageError::Decode(e.to_string()))?;
-        let chainwork_lo = u64::decode(&mut cur)
-            .map_err(|e| StorageError::Decode(e.to_string()))?;
-        let chainwork_hi = u64::decode(&mut cur)
-            .map_err(|e| StorageError::Decode(e.to_string()))?;
+        let header =
+            BlockHeader::decode(&mut cur).map_err(|e| StorageError::Decode(e.to_string()))?;
+        let height = u32::decode(&mut cur).map_err(|e| StorageError::Decode(e.to_string()))?;
+        let chainwork_lo =
+            u64::decode(&mut cur).map_err(|e| StorageError::Decode(e.to_string()))?;
+        let chainwork_hi =
+            u64::decode(&mut cur).map_err(|e| StorageError::Decode(e.to_string()))?;
         let mut status_byte = [0u8; 1];
         use std::io::Read;
-        cur.read_exact(&mut status_byte).map_err(|e| StorageError::Decode(e.to_string()))?;
-        Ok(Self { header, height, chainwork_lo, chainwork_hi, status: status_byte[0] })
+        cur.read_exact(&mut status_byte)
+            .map_err(|e| StorageError::Decode(e.to_string()))?;
+        Ok(Self {
+            header,
+            height,
+            chainwork_lo,
+            chainwork_hi,
+            status: status_byte[0],
+        })
     }
 }
 
@@ -69,7 +78,8 @@ impl<'db> BlockStore<'db> {
     }
 
     pub fn put_index(&self, hash: &BlockHash, index: &StoredBlockIndex) -> Result<()> {
-        self.db.put_cf(CF_BLOCK_INDEX, &hash.0, &index.encode_bytes())
+        self.db
+            .put_cf(CF_BLOCK_INDEX, &hash.0, &index.encode_bytes())
     }
 
     pub fn get_block(&self, hash: &BlockHash) -> Result<Option<Block>> {
@@ -89,10 +99,17 @@ impl<'db> BlockStore<'db> {
     }
 
     /// Atomically write a block header + block data
-    pub fn put_block_atomic(&self, hash: &BlockHash, index: &StoredBlockIndex, block: &Block) -> Result<()> {
+    pub fn put_block_atomic(
+        &self,
+        hash: &BlockHash,
+        index: &StoredBlockIndex,
+        block: &Block,
+    ) -> Result<()> {
         let mut batch = self.db.new_batch();
-        self.db.batch_put_cf(&mut batch, CF_BLOCK_INDEX, &hash.0, &index.encode_bytes())?;
-        self.db.batch_put_cf(&mut batch, CF_BLOCK_DATA, &hash.0, &block.encode_to_vec())?;
+        self.db
+            .batch_put_cf(&mut batch, CF_BLOCK_INDEX, &hash.0, &index.encode_bytes())?;
+        self.db
+            .batch_put_cf(&mut batch, CF_BLOCK_DATA, &hash.0, &block.encode_to_vec())?;
         self.db.write_batch(batch)
     }
 
@@ -127,7 +144,8 @@ impl<'db> BlockStore<'db> {
 
     /// Store a height → block hash mapping.
     pub fn put_height_hash(&self, height: u32, hash: &BlockHash) -> Result<()> {
-        self.db.put_cf(CF_HEIGHT_INDEX, &height.to_le_bytes(), &hash.0)
+        self.db
+            .put_cf(CF_HEIGHT_INDEX, &height.to_le_bytes(), &hash.0)
     }
 
     /// Look up the block hash at a given height.
@@ -138,7 +156,9 @@ impl<'db> BlockStore<'db> {
                 arr.copy_from_slice(&bytes);
                 Ok(Some(Hash256(arr)))
             }
-            Some(_) => Err(StorageError::Corruption("invalid height index entry".into())),
+            Some(_) => Err(StorageError::Corruption(
+                "invalid height index entry".into(),
+            )),
             None => Ok(None),
         }
     }
@@ -155,7 +175,8 @@ impl<'db> BlockStore<'db> {
         height: u32,
         hash: &BlockHash,
     ) -> Result<()> {
-        self.db.batch_put_cf(batch, CF_HEIGHT_INDEX, &height.to_le_bytes(), &hash.0)
+        self.db
+            .batch_put_cf(batch, CF_HEIGHT_INDEX, &height.to_le_bytes(), &hash.0)
     }
 
     // ── Undo data (spent UTXOs per block, needed for reorg) ───────────────────
@@ -190,7 +211,12 @@ impl<'db> BlockStore<'db> {
     }
 
     /// Store a BIP157 filter header (32-byte hash).
-    pub fn put_filter_header(&self, filter_type: u8, hash: &BlockHash, header: &[u8; 32]) -> Result<()> {
+    pub fn put_filter_header(
+        &self,
+        filter_type: u8,
+        hash: &BlockHash,
+        header: &[u8; 32],
+    ) -> Result<()> {
         let mut key = Vec::with_capacity(33);
         key.push(filter_type);
         key.extend_from_slice(&hash.0);
@@ -208,7 +234,9 @@ impl<'db> BlockStore<'db> {
                 arr.copy_from_slice(&bytes);
                 Ok(Some(arr))
             }
-            Some(_) => Err(StorageError::Corruption("invalid filter header length".into())),
+            Some(_) => Err(StorageError::Corruption(
+                "invalid filter header length".into(),
+            )),
             None => Ok(None),
         }
     }
@@ -255,10 +283,10 @@ impl<'db> BlockStore<'db> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::Database;
     use rbtc_primitives::hash::Hash256;
     use rbtc_primitives::transaction::Transaction;
     use tempfile::TempDir;
-    use crate::db::Database;
 
     #[test]
     fn block_store_put_get_index() {
@@ -292,8 +320,8 @@ mod tests {
         let db = Database::open(dir.path()).unwrap();
         let store = BlockStore::new(&db);
         let hash: BlockHash = Hash256([2; 32]);
-        use rbtc_primitives::transaction::{OutPoint, TxIn, TxOut};
         use rbtc_primitives::script::Script;
+        use rbtc_primitives::transaction::{OutPoint, TxIn, TxOut};
         let block = Block {
             header: BlockHeader {
                 version: 1,
@@ -311,7 +339,10 @@ mod tests {
                     sequence: 0xffffffff,
                     witness: vec![],
                 }],
-                outputs: vec![TxOut { value: 0, script_pubkey: Script::new() }],
+                outputs: vec![TxOut {
+                    value: 0,
+                    script_pubkey: Script::new(),
+                }],
                 lock_time: 0,
             }],
         };
@@ -381,8 +412,8 @@ mod tests {
             chainwork_hi: 0,
             status: 0,
         };
-        use rbtc_primitives::transaction::{OutPoint, TxIn, TxOut};
         use rbtc_primitives::script::Script;
+        use rbtc_primitives::transaction::{OutPoint, TxIn, TxOut};
         let block = Block {
             header: index.header.clone(),
             transactions: vec![Transaction {
@@ -393,7 +424,10 @@ mod tests {
                     sequence: 0xffffffff,
                     witness: vec![],
                 }],
-                outputs: vec![TxOut { value: 0, script_pubkey: Script::new() }],
+                outputs: vec![TxOut {
+                    value: 0,
+                    script_pubkey: Script::new(),
+                }],
                 lock_time: 0,
             }],
         };
@@ -418,8 +452,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Database::open(dir.path()).unwrap();
         let store = BlockStore::new(&db);
-        use rbtc_primitives::transaction::{OutPoint, TxIn, TxOut};
         use rbtc_primitives::script::Script;
+        use rbtc_primitives::transaction::{OutPoint, TxIn, TxOut};
         let hash: BlockHash = Hash256([20; 32]);
         let index = StoredBlockIndex {
             header: BlockHeader {
@@ -445,7 +479,10 @@ mod tests {
                     sequence: 0xffffffff,
                     witness: vec![],
                 }],
-                outputs: vec![TxOut { value: 0, script_pubkey: Script::new() }],
+                outputs: vec![TxOut {
+                    value: 0,
+                    script_pubkey: Script::new(),
+                }],
                 lock_time: 0,
             }],
         };

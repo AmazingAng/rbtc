@@ -1,7 +1,10 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rbtc_crypto::sha256d;
-use rbtc_primitives::{block::{Block, BlockHeader}, codec::Encodable};
+use rbtc_primitives::{
+    block::{Block, BlockHeader},
+    codec::Encodable,
+};
 
 use crate::template::BlockTemplate;
 
@@ -36,12 +39,11 @@ pub fn mine_block(template: &BlockTemplate) -> Block {
         let merkle_root = template.compute_merkle_root(extra_nonce);
 
         let mut time = now_secs();
-        let mut iters: u64 = 0;
 
-        for nonce in 0u32..=u32::MAX {
+        for (iters, nonce) in (0u32..=u32::MAX).enumerate() {
             // Refresh the timestamp every 1 000 000 iterations so we don't
             // produce a stale block time for slow miners.
-            if iters > 0 && iters % 1_000_000 == 0 {
+            if iters > 0 && iters.is_multiple_of(1_000_000) {
                 time = now_secs();
             }
 
@@ -64,8 +66,6 @@ pub fn mine_block(template: &BlockTemplate) -> Block {
                 block.header.nonce = nonce;
                 return block;
             }
-
-            iters += 1;
         }
 
         // All 2^32 nonces exhausted → increment extra_nonce and retry.
@@ -78,9 +78,9 @@ pub fn mine_block(template: &BlockTemplate) -> Block {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rbtc_primitives::{hash::Hash256, script::Script};
     use crate::template::BlockTemplate;
     use rbtc_consensus::chain::header_hash;
+    use rbtc_primitives::{hash::Hash256, script::Script};
 
     fn regtest_template() -> BlockTemplate {
         BlockTemplate::new(

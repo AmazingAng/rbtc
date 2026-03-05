@@ -292,9 +292,18 @@ mod tests {
             threshold: 1,
             min_activation_height: 0,
         };
-        let chain = MockChain { versions: vec![], mtps: vec![] };
-        assert_eq!(deployment_state(&d, 0, Network::Mainnet, &chain), ThresholdState::Active);
-        assert_eq!(deployment_state(&d, 100_000, Network::Mainnet, &chain), ThresholdState::Active);
+        let chain = MockChain {
+            versions: vec![],
+            mtps: vec![],
+        };
+        assert_eq!(
+            deployment_state(&d, 0, Network::Mainnet, &chain),
+            ThresholdState::Active
+        );
+        assert_eq!(
+            deployment_state(&d, 100_000, Network::Mainnet, &chain),
+            ThresholdState::Active
+        );
     }
 
     #[test]
@@ -307,8 +316,14 @@ mod tests {
             threshold: 1,
             min_activation_height: 0,
         };
-        let chain = MockChain { versions: vec![], mtps: vec![] };
-        assert_eq!(deployment_state(&d, 0, Network::Mainnet, &chain), ThresholdState::Failed);
+        let chain = MockChain {
+            versions: vec![],
+            mtps: vec![],
+        };
+        assert_eq!(
+            deployment_state(&d, 0, Network::Mainnet, &chain),
+            ThresholdState::Failed
+        );
     }
 
     #[test]
@@ -326,7 +341,10 @@ mod tests {
         let versions = vec![0x20000001i32; 300];
         let chain = MockChain { versions, mtps };
 
-        assert_eq!(deployment_state(&d, 144, Network::Regtest, &chain), ThresholdState::Defined);
+        assert_eq!(
+            deployment_state(&d, 144, Network::Regtest, &chain),
+            ThresholdState::Defined
+        );
     }
 
     #[test]
@@ -347,7 +365,10 @@ mod tests {
         let chain = MockChain { versions, mtps };
 
         // At height 288 (start of period 2), we check state
-        assert_eq!(deployment_state(&d, 288, Network::Regtest, &chain), ThresholdState::Started);
+        assert_eq!(
+            deployment_state(&d, 288, Network::Regtest, &chain),
+            ThresholdState::Started
+        );
     }
 
     #[test]
@@ -374,10 +395,16 @@ mod tests {
         // - Period 1: MTP[143]=500k < start → DEFINED
         // - Period 2: MTP[287]=1.5M >= start → STARTED
         // - Period 3: count period 2, all signal → LOCKED_IN
-        assert_eq!(deployment_state(&d, 432, Network::Regtest, &chain), ThresholdState::LockedIn);
+        assert_eq!(
+            deployment_state(&d, 432, Network::Regtest, &chain),
+            ThresholdState::LockedIn
+        );
 
         // At height 576 (period 4): LOCKED_IN → ACTIVE
-        assert_eq!(deployment_state(&d, 576, Network::Regtest, &chain), ThresholdState::Active);
+        assert_eq!(
+            deployment_state(&d, 576, Network::Regtest, &chain),
+            ThresholdState::Active
+        );
     }
 
     #[test]
@@ -399,7 +426,10 @@ mod tests {
         let versions = vec![1i32; 432]; // no signaling (no BIP9 top bits)
         let chain = MockChain { versions, mtps };
 
-        assert_eq!(deployment_state(&d, 432, Network::Regtest, &chain), ThresholdState::Failed);
+        assert_eq!(
+            deployment_state(&d, 432, Network::Regtest, &chain),
+            ThresholdState::Failed
+        );
     }
 
     #[test]
@@ -421,10 +451,16 @@ mod tests {
 
         // Period 2 (height 288): would be LOCKED_IN
         // Period 3 (height 432): still LOCKED_IN because 432 < 576
-        assert_eq!(deployment_state(&d, 432, Network::Regtest, &chain), ThresholdState::LockedIn);
+        assert_eq!(
+            deployment_state(&d, 432, Network::Regtest, &chain),
+            ThresholdState::LockedIn
+        );
 
         // Period 4 (height 576): LOCKED_IN → ACTIVE (576 >= min_activation)
-        assert_eq!(deployment_state(&d, 576, Network::Regtest, &chain), ThresholdState::Active);
+        assert_eq!(
+            deployment_state(&d, 576, Network::Regtest, &chain),
+            ThresholdState::Active
+        );
     }
 
     #[test]
@@ -439,7 +475,10 @@ mod tests {
     #[test]
     fn regtest_deployments_always_active() {
         let deps = deployments(Network::Regtest);
-        let chain = MockChain { versions: vec![], mtps: vec![] };
+        let chain = MockChain {
+            versions: vec![],
+            mtps: vec![],
+        };
         for d in &deps {
             assert_eq!(
                 deployment_state(d, 0, Network::Regtest, &chain),
@@ -453,7 +492,10 @@ mod tests {
     #[test]
     fn signet_deployments_always_active() {
         let deps = deployments(Network::Signet);
-        let chain = MockChain { versions: vec![], mtps: vec![] };
+        let chain = MockChain {
+            versions: vec![],
+            mtps: vec![],
+        };
         for d in &deps {
             assert_eq!(
                 deployment_state(d, 0, Network::Signet, &chain),

@@ -30,24 +30,28 @@ pub enum MempoolError {
     V3Policy(String),
 
     // ── RBF (BIP125) ──────────────────────────────────────────────────────────
-
-    #[error("conflicting transaction in mempool (input already spent) and original does not signal RBF")]
+    #[error(
+        "conflicting transaction in mempool (input already spent) and original does not signal RBF"
+    )]
     RbfNotSignaling,
 
-    #[error("RBF replacement fee rate {0} sat/vbyte insufficient (original {1} + relay {2} required)")]
+    #[error(
+        "RBF replacement fee rate {0} sat/vbyte insufficient (original {1} + relay {2} required)"
+    )]
     RbfInsufficientFee(u64, u64, u64),
 
     #[error("RBF replacement would evict too many transactions ({0} > 100)")]
     TooManyReplacements(usize),
 
-    #[error("RBF replacement absolute fee {0} sat too low (must exceed {1} sat total of replaced txs)")]
+    #[error(
+        "RBF replacement absolute fee {0} sat too low (must exceed {1} sat total of replaced txs)"
+    )]
     RbfAbsoluteFeeTooLow(u64, u64),
 
     #[error("conflicting transaction in mempool (no RBF)")]
     ConflictingTx,
 
     // ── Eviction ──────────────────────────────────────────────────────────────
-
     #[error("mempool is full and incoming transaction fee rate is below eviction threshold")]
     MempoolFull,
 

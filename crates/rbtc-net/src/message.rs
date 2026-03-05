@@ -1,12 +1,12 @@
 use std::io::{Read, Write};
 
+use rbtc_crypto::sha256d;
 use rbtc_primitives::{
     block::{Block, BlockHeader},
     codec::{decode_list, encode_list, Decodable, Encodable, VarInt},
     hash::{BlockHash, Hash256},
     transaction::Transaction,
 };
-use rbtc_crypto::sha256d;
 
 use crate::error::{NetError, Result};
 
@@ -16,11 +16,11 @@ const MAX_MESSAGE_SIZE: u32 = 32 * 1024 * 1024;
 // ── Service flag constants (Bitcoin Core `protocol.h`) ──────────────────────
 
 /// Full node — can serve full blocks.
-pub const NODE_NETWORK: u64         = 1 << 0;
+pub const NODE_NETWORK: u64 = 1 << 0;
 /// BIP111 — supports bloom filtering (deprecated since Core v0.19, NOT set).
-pub const NODE_BLOOM: u64           = 1 << 2;
+pub const NODE_BLOOM: u64 = 1 << 2;
 /// BIP144 — supports segregated witness.
-pub const NODE_WITNESS: u64         = 1 << 3;
+pub const NODE_WITNESS: u64 = 1 << 3;
 /// BIP157 — can serve compact block filters.
 pub const NODE_COMPACT_FILTERS: u64 = 1 << 6;
 /// BIP159 — limited node (pruned, only recent blocks).
@@ -32,12 +32,26 @@ pub const LOCAL_SERVICES: u64 = NODE_NETWORK | NODE_WITNESS;
 /// Format service flags as a human-readable string for logging.
 pub fn service_flags_to_string(flags: u64) -> String {
     let mut names = Vec::new();
-    if flags & NODE_NETWORK != 0         { names.push("NODE_NETWORK"); }
-    if flags & NODE_BLOOM != 0           { names.push("NODE_BLOOM"); }
-    if flags & NODE_WITNESS != 0         { names.push("NODE_WITNESS"); }
-    if flags & NODE_COMPACT_FILTERS != 0 { names.push("NODE_COMPACT_FILTERS"); }
-    if flags & NODE_NETWORK_LIMITED != 0 { names.push("NODE_NETWORK_LIMITED"); }
-    if names.is_empty() { "NONE".to_string() } else { names.join("|") }
+    if flags & NODE_NETWORK != 0 {
+        names.push("NODE_NETWORK");
+    }
+    if flags & NODE_BLOOM != 0 {
+        names.push("NODE_BLOOM");
+    }
+    if flags & NODE_WITNESS != 0 {
+        names.push("NODE_WITNESS");
+    }
+    if flags & NODE_COMPACT_FILTERS != 0 {
+        names.push("NODE_COMPACT_FILTERS");
+    }
+    if flags & NODE_NETWORK_LIMITED != 0 {
+        names.push("NODE_NETWORK_LIMITED");
+    }
+    if names.is_empty() {
+        "NONE".to_string()
+    } else {
+        names.join("|")
+    }
 }
 
 /// Bitcoin P2P message
@@ -178,7 +192,10 @@ impl Decodable for Inventory {
     fn decode<R: Read>(r: &mut R) -> rbtc_primitives::codec::Result<Self> {
         let t = u32::decode(r)?;
         let hash = Hash256(<[u8; 32]>::decode(r)?);
-        Ok(Self { inv_type: InvType::from_u32(t), hash })
+        Ok(Self {
+            inv_type: InvType::from_u32(t),
+            hash,
+        })
     }
 }
 
@@ -231,7 +248,7 @@ impl VersionMessage {
         self.recv_services.encode(&mut buf).ok();
         buf.extend_from_slice(&self.recv_addr);
         buf.extend_from_slice(&self.recv_port.to_be_bytes()); // port is big-endian!
-        // from addr
+                                                              // from addr
         self.from_services.encode(&mut buf).ok();
         buf.extend_from_slice(&self.from_addr);
         buf.extend_from_slice(&self.from_port.to_be_bytes());
@@ -251,29 +268,43 @@ impl VersionMessage {
         let timestamp = i64::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
         let recv_services = u64::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
         let mut recv_addr = [0u8; 16];
-        std::io::Read::read_exact(&mut cur, &mut recv_addr).map_err(|e| NetError::Decode(e.to_string()))?;
+        std::io::Read::read_exact(&mut cur, &mut recv_addr)
+            .map_err(|e| NetError::Decode(e.to_string()))?;
         let mut port_bytes = [0u8; 2];
-        std::io::Read::read_exact(&mut cur, &mut port_bytes).map_err(|e| NetError::Decode(e.to_string()))?;
+        std::io::Read::read_exact(&mut cur, &mut port_bytes)
+            .map_err(|e| NetError::Decode(e.to_string()))?;
         let recv_port = u16::from_be_bytes(port_bytes);
         let from_services = u64::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
         let mut from_addr = [0u8; 16];
-        std::io::Read::read_exact(&mut cur, &mut from_addr).map_err(|e| NetError::Decode(e.to_string()))?;
+        std::io::Read::read_exact(&mut cur, &mut from_addr)
+            .map_err(|e| NetError::Decode(e.to_string()))?;
         let mut from_port_bytes = [0u8; 2];
-        std::io::Read::read_exact(&mut cur, &mut from_port_bytes).map_err(|e| NetError::Decode(e.to_string()))?;
+        std::io::Read::read_exact(&mut cur, &mut from_port_bytes)
+            .map_err(|e| NetError::Decode(e.to_string()))?;
         let from_port = u16::from_be_bytes(from_port_bytes);
         let nonce = u64::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
-        let VarInt(ua_len) = VarInt::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
+        let VarInt(ua_len) =
+            VarInt::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
         let mut ua_bytes = vec![0u8; ua_len as usize];
-        std::io::Read::read_exact(&mut cur, &mut ua_bytes).map_err(|e| NetError::Decode(e.to_string()))?;
+        std::io::Read::read_exact(&mut cur, &mut ua_bytes)
+            .map_err(|e| NetError::Decode(e.to_string()))?;
         let user_agent = String::from_utf8_lossy(&ua_bytes).into_owned();
         let start_height = i32::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
         let relay_byte = u8::decode(&mut cur).unwrap_or(1);
 
         Ok(Self {
-            version, services, timestamp,
-            recv_services, recv_addr, recv_port,
-            from_services, from_addr, from_port,
-            nonce, user_agent, start_height,
+            version,
+            services,
+            timestamp,
+            recv_services,
+            recv_addr,
+            recv_port,
+            from_services,
+            from_addr,
+            from_port,
+            nonce,
+            user_agent,
+            start_height,
             relay: relay_byte != 0,
         })
     }
@@ -299,7 +330,9 @@ impl GetBlocksMessage {
     fn encode_payload(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         self.version.encode(&mut buf).ok();
-        VarInt(self.locator_hashes.len() as u64).encode(&mut buf).ok();
+        VarInt(self.locator_hashes.len() as u64)
+            .encode(&mut buf)
+            .ok();
         for h in &self.locator_hashes {
             h.0.encode(&mut buf).ok();
         }
@@ -310,14 +343,19 @@ impl GetBlocksMessage {
     fn decode_payload(data: &[u8]) -> Result<Self> {
         let mut cur = std::io::Cursor::new(data);
         let version = u32::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
-        let VarInt(count) = VarInt::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
+        let VarInt(count) =
+            VarInt::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
         let mut locator_hashes = Vec::with_capacity(count as usize);
         for _ in 0..count {
             let h = <[u8; 32]>::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
             locator_hashes.push(Hash256(h));
         }
         let stop = <[u8; 32]>::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
-        Ok(Self { version, locator_hashes, stop_hash: Hash256(stop) })
+        Ok(Self {
+            version,
+            locator_hashes,
+            stop_hash: Hash256(stop),
+        })
     }
 }
 
@@ -341,7 +379,8 @@ impl HeadersMessage {
 
     fn decode_payload(data: &[u8]) -> Result<Self> {
         let mut cur = std::io::Cursor::new(data);
-        let VarInt(count) = VarInt::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
+        let VarInt(count) =
+            VarInt::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
         let mut headers = Vec::with_capacity(count.min(2000) as usize);
         for _ in 0..count {
             let h = BlockHeader::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
@@ -372,9 +411,9 @@ pub struct AddrMessage {
 pub enum Addrv2NetId {
     Ipv4 = 1,
     Ipv6 = 2,
-    TorV2 = 3,   // deprecated
+    TorV2 = 3, // deprecated
     TorV3 = 4,
-    I2p   = 5,
+    I2p = 5,
     Cjdns = 6,
 }
 
@@ -394,11 +433,11 @@ impl Addrv2NetId {
     /// Expected address length for this network type.
     pub fn addr_len(&self) -> Option<usize> {
         match self {
-            Self::Ipv4  => Some(4),
-            Self::Ipv6  => Some(16),
+            Self::Ipv4 => Some(4),
+            Self::Ipv6 => Some(16),
             Self::TorV2 => Some(10),
             Self::TorV3 => Some(32),
-            Self::I2p   => Some(32),
+            Self::I2p => Some(32),
             Self::Cjdns => Some(16),
         }
     }
@@ -408,7 +447,7 @@ impl Addrv2NetId {
 #[derive(Debug, Clone)]
 pub struct Addrv2Entry {
     pub timestamp: u32,
-    pub services: u64,  // CompactSize-encoded in wire format
+    pub services: u64, // CompactSize-encoded in wire format
     pub net_id: u8,
     pub addr: Vec<u8>,
     pub port: u16,
@@ -437,20 +476,31 @@ impl Addrv2Message {
 
     fn decode_payload(data: &[u8]) -> Result<Self> {
         let mut cur = std::io::Cursor::new(data);
-        let VarInt(count) = VarInt::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
+        let VarInt(count) =
+            VarInt::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
         let count = count.min(1000) as usize; // BIP155: max 1000 entries
         let mut addrs = Vec::with_capacity(count);
         for _ in 0..count {
             let timestamp = u32::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
-            let VarInt(services) = VarInt::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
+            let VarInt(services) =
+                VarInt::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
             let net_id = u8::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
-            let VarInt(addr_len) = VarInt::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
+            let VarInt(addr_len) =
+                VarInt::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
             let mut addr = vec![0u8; addr_len as usize];
-            std::io::Read::read_exact(&mut cur, &mut addr).map_err(|e| NetError::Decode(e.to_string()))?;
+            std::io::Read::read_exact(&mut cur, &mut addr)
+                .map_err(|e| NetError::Decode(e.to_string()))?;
             let mut port_bytes = [0u8; 2];
-            std::io::Read::read_exact(&mut cur, &mut port_bytes).map_err(|e| NetError::Decode(e.to_string()))?;
+            std::io::Read::read_exact(&mut cur, &mut port_bytes)
+                .map_err(|e| NetError::Decode(e.to_string()))?;
             let port = u16::from_be_bytes(port_bytes);
-            addrs.push(Addrv2Entry { timestamp, services, net_id, addr, port });
+            addrs.push(Addrv2Entry {
+                timestamp,
+                services,
+                net_id,
+                addr,
+                port,
+            });
         }
         Ok(Self { addrs })
     }
@@ -483,7 +533,11 @@ impl GetCFiltersMessage {
         let start_height = u32::from_le_bytes(data[1..5].try_into().unwrap());
         let mut stop_hash = [0u8; 32];
         stop_hash.copy_from_slice(&data[5..37]);
-        Ok(Self { filter_type, start_height, stop_hash: Hash256(stop_hash) })
+        Ok(Self {
+            filter_type,
+            start_height,
+            stop_hash: Hash256(stop_hash),
+        })
     }
 }
 
@@ -512,7 +566,11 @@ impl CFilterMessage {
         let mut block_hash = [0u8; 32];
         block_hash.copy_from_slice(&data[1..33]);
         let filter = data[33..].to_vec();
-        Ok(Self { filter_type, block_hash: Hash256(block_hash), filter })
+        Ok(Self {
+            filter_type,
+            block_hash: Hash256(block_hash),
+            filter,
+        })
     }
 }
 
@@ -531,7 +589,9 @@ impl CFHeadersMessage {
         buf.push(self.filter_type);
         buf.extend_from_slice(&self.stop_hash.0);
         buf.extend_from_slice(&self.prev_filter_header.0);
-        VarInt(self.filter_hashes.len() as u64).encode(&mut buf).ok();
+        VarInt(self.filter_hashes.len() as u64)
+            .encode(&mut buf)
+            .ok();
         for h in &self.filter_hashes {
             buf.extend_from_slice(&h.0);
         }
@@ -548,7 +608,8 @@ impl CFHeadersMessage {
         let mut prev_filter_header = [0u8; 32];
         prev_filter_header.copy_from_slice(&data[33..65]);
         let mut cur = std::io::Cursor::new(&data[65..]);
-        let VarInt(count) = VarInt::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
+        let VarInt(count) =
+            VarInt::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
         let mut filter_hashes = Vec::with_capacity(count.min(2000) as usize);
         for _ in 0..count {
             let h = <[u8; 32]>::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
@@ -585,7 +646,10 @@ impl GetCFCheckptMessage {
         let filter_type = data[0];
         let mut stop_hash = [0u8; 32];
         stop_hash.copy_from_slice(&data[1..33]);
-        Ok(Self { filter_type, stop_hash: Hash256(stop_hash) })
+        Ok(Self {
+            filter_type,
+            stop_hash: Hash256(stop_hash),
+        })
     }
 }
 
@@ -602,7 +666,9 @@ impl CFCheckptMessage {
         let mut buf = Vec::with_capacity(33 + self.filter_headers.len() * 32 + 3);
         buf.push(self.filter_type);
         buf.extend_from_slice(&self.stop_hash.0);
-        VarInt(self.filter_headers.len() as u64).encode(&mut buf).ok();
+        VarInt(self.filter_headers.len() as u64)
+            .encode(&mut buf)
+            .ok();
         for h in &self.filter_headers {
             buf.extend_from_slice(&h.0);
         }
@@ -617,7 +683,8 @@ impl CFCheckptMessage {
         let mut stop_hash = [0u8; 32];
         stop_hash.copy_from_slice(&data[1..33]);
         let mut cur = std::io::Cursor::new(&data[33..]);
-        let VarInt(count) = VarInt::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
+        let VarInt(count) =
+            VarInt::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
         let mut filter_headers = Vec::with_capacity(count.min(2000) as usize);
         for _ in 0..count {
             let h = <[u8; 32]>::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
@@ -657,7 +724,11 @@ pub enum NetworkMessage {
     /// BIP152: response with missing transactions
     BlockTxn(crate::compact::BlockTxn),
     GetAddr,
-    Reject { message: String, code: u8, reason: String },
+    Reject {
+        message: String,
+        code: u8,
+        reason: String,
+    },
     /// BIP339: signal wtxid-based tx relay (sent before verack)
     WtxidRelay,
     /// BIP155: signal preference for addrv2 messages (sent before verack)
@@ -678,7 +749,10 @@ pub enum NetworkMessage {
     GetCFCheckpt(GetCFCheckptMessage),
     /// BIP157: compact filter header checkpoints response
     CFCheckpt(CFCheckptMessage),
-    Unknown { command: String, data: Vec<u8> },
+    Unknown {
+        command: String,
+        data: Vec<u8>,
+    },
 }
 
 impl NetworkMessage {
@@ -764,7 +838,11 @@ impl NetworkMessage {
             Self::CmpctBlock(cb) => cb.encode_payload(),
             Self::GetBlockTxn(gbt) => gbt.encode_payload(),
             Self::BlockTxn(bt) => bt.encode_payload(),
-            Self::Reject { message, code, reason } => {
+            Self::Reject {
+                message,
+                code,
+                reason,
+            } => {
                 let mut buf = Vec::new();
                 VarInt(message.len() as u64).encode(&mut buf).ok();
                 buf.extend_from_slice(message.as_bytes());
@@ -779,9 +857,7 @@ impl NetworkMessage {
 
     pub fn decode_payload(command: &str, data: &[u8]) -> Result<Self> {
         let msg = match command {
-            "version" => Self::Version(
-                VersionMessage::decode_payload(data)?
-            ),
+            "version" => Self::Version(VersionMessage::decode_payload(data)?),
             "verack" => Self::Verack,
             "ping" => {
                 if data.len() >= 8 {
@@ -816,8 +892,8 @@ impl NetworkMessage {
                 Self::NotFound(items)
             }
             "block" => {
-                let block = Block::decode_from_slice(data)
-                    .map_err(|e| NetError::Decode(e.to_string()))?;
+                let block =
+                    Block::decode_from_slice(data).map_err(|e| NetError::Decode(e.to_string()))?;
                 Self::Block(block)
             }
             "tx" => {
@@ -857,7 +933,10 @@ impl NetworkMessage {
                 let bt = crate::compact::BlockTxn::decode_payload(data)?;
                 Self::BlockTxn(bt)
             }
-            _ => Self::Unknown { command: command.to_string(), data: data.to_vec() },
+            _ => Self::Unknown {
+                command: command.to_string(),
+                data: data.to_vec(),
+            },
         };
         Ok(msg)
     }
@@ -940,7 +1019,7 @@ mod tests {
                 Addrv2Entry {
                     timestamp: 1700000000,
                     services: LOCAL_SERVICES,
-                    net_id: 1,      // IPv4
+                    net_id: 1, // IPv4
                     addr: vec![127, 0, 0, 1],
                     port: 8333,
                 },
@@ -988,7 +1067,10 @@ mod tests {
 
     #[test]
     fn service_flags_to_string_display() {
-        assert_eq!(service_flags_to_string(LOCAL_SERVICES), "NODE_NETWORK|NODE_WITNESS");
+        assert_eq!(
+            service_flags_to_string(LOCAL_SERVICES),
+            "NODE_NETWORK|NODE_WITNESS"
+        );
         assert_eq!(service_flags_to_string(0), "NONE");
         assert_eq!(
             service_flags_to_string(NODE_NETWORK | NODE_WITNESS | NODE_COMPACT_FILTERS),

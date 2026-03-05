@@ -45,7 +45,9 @@ impl UtxoLookup for UtxoSet {
 
 impl UtxoSet {
     pub fn new() -> Self {
-        Self { coins: HashMap::new() }
+        Self {
+            coins: HashMap::new(),
+        }
     }
 
     pub fn get(&self, outpoint: &OutPoint) -> Option<&Utxo> {
@@ -60,10 +62,17 @@ impl UtxoSet {
     pub fn add_tx(&mut self, txid: TxId, tx: &Transaction, height: u32) {
         let is_coinbase = tx.is_coinbase();
         for (vout, txout) in tx.outputs.iter().enumerate() {
-            let outpoint = OutPoint { txid, vout: vout as u32 };
+            let outpoint = OutPoint {
+                txid,
+                vout: vout as u32,
+            };
             self.coins.insert(
                 outpoint,
-                Utxo { txout: txout.clone(), is_coinbase, height },
+                Utxo {
+                    txout: txout.clone(),
+                    is_coinbase,
+                    height,
+                },
             );
         }
     }
@@ -94,12 +103,25 @@ impl UtxoSet {
     }
 
     /// Undo a block (for reorg): remove outputs, re-add inputs
-    pub fn disconnect_block(&mut self, txids: &[TxId], txs: &[Transaction], undo: Vec<Vec<(OutPoint, Utxo)>>) {
+    pub fn disconnect_block(
+        &mut self,
+        txids: &[TxId],
+        txs: &[Transaction],
+        undo: Vec<Vec<(OutPoint, Utxo)>>,
+    ) {
         // Process in reverse order
-        for ((txid, tx), spent) in txids.iter().zip(txs.iter()).rev().zip(undo.into_iter().rev()) {
+        for ((txid, tx), spent) in txids
+            .iter()
+            .zip(txs.iter())
+            .rev()
+            .zip(undo.into_iter().rev())
+        {
             // Remove outputs we added
             for vout in 0..tx.outputs.len() {
-                self.coins.remove(&OutPoint { txid: *txid, vout: vout as u32 });
+                self.coins.remove(&OutPoint {
+                    txid: *txid,
+                    vout: vout as u32,
+                });
             }
             // Restore spent inputs
             for (outpoint, utxo) in spent {
@@ -159,7 +181,10 @@ mod tests {
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: 50_0000_0000,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         }
     }
@@ -198,7 +223,10 @@ mod tests {
                 sequence: 0,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 1000, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: 1000,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         };
         let spent = set.spend_tx(&spend_tx);
@@ -216,24 +244,38 @@ mod tests {
             version: 1,
             inputs: vec![
                 TxIn {
-                    previous_output: OutPoint { txid: txid1, vout: 0 },
+                    previous_output: OutPoint {
+                        txid: txid1,
+                        vout: 0,
+                    },
                     script_sig: Script::new(),
                     sequence: 0,
                     witness: vec![],
                 },
                 TxIn {
-                    previous_output: OutPoint { txid: txid2, vout: 99 },
+                    previous_output: OutPoint {
+                        txid: txid2,
+                        vout: 99,
+                    },
                     script_sig: Script::new(),
                     sequence: 0,
                     witness: vec![],
                 },
             ],
-            outputs: vec![TxOut { value: 500, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: 500,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         };
         let spent = set.spend_tx(&spend_tx);
         assert_eq!(spent.len(), 1);
-        assert!(set.get(&OutPoint { txid: txid1, vout: 0 }).is_none());
+        assert!(set
+            .get(&OutPoint {
+                txid: txid1,
+                vout: 0
+            })
+            .is_none());
     }
 
     #[test]
@@ -245,7 +287,10 @@ mod tests {
         let tx2 = Transaction {
             version: 1,
             inputs: vec![],
-            outputs: vec![TxOut { value: 1000, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: 1000,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         };
         set.connect_block(&[txid1, txid2], &[cb.clone(), tx2.clone()], 1);
@@ -257,9 +302,15 @@ mod tests {
     #[test]
     fn utxo_set_insert() {
         let mut set = UtxoSet::new();
-        let op = OutPoint { txid: Hash256([5; 32]), vout: 1 };
+        let op = OutPoint {
+            txid: Hash256([5; 32]),
+            vout: 1,
+        };
         let utxo = Utxo {
-            txout: TxOut { value: 500, script_pubkey: Script::new() },
+            txout: TxOut {
+                value: 500,
+                script_pubkey: Script::new(),
+            },
             is_coinbase: false,
             height: 10,
         };
@@ -278,12 +329,18 @@ mod tests {
         let tx2 = Transaction {
             version: 1,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: txid1, vout: 0 },
+                previous_output: OutPoint {
+                    txid: txid1,
+                    vout: 0,
+                },
                 script_sig: Script::new(),
                 sequence: 0,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 500, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: 500,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         };
         set.add_tx(txid1, &cb, 0);

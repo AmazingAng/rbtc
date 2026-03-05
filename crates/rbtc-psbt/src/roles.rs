@@ -25,12 +25,16 @@ impl Psbt {
         let unsigned_tx = Transaction {
             version: tx.version,
             lock_time: tx.lock_time,
-            inputs: tx.inputs.into_iter().map(|inp| TxIn {
-                previous_output: inp.previous_output,
-                script_sig: Script::new(),
-                sequence: inp.sequence,
-                witness: vec![],
-            }).collect(),
+            inputs: tx
+                .inputs
+                .into_iter()
+                .map(|inp| TxIn {
+                    previous_output: inp.previous_output,
+                    script_sig: Script::new(),
+                    sequence: inp.sequence,
+                    witness: vec![],
+                })
+                .collect(),
             outputs: tx.outputs,
         };
 
@@ -128,8 +132,12 @@ impl Psbt {
             }
         }
         for (dst, src) in self.outputs.iter_mut().zip(other.outputs.into_iter()) {
-            if dst.redeem_script.is_none() { dst.redeem_script = src.redeem_script; }
-            if dst.witness_script.is_none() { dst.witness_script = src.witness_script; }
+            if dst.redeem_script.is_none() {
+                dst.redeem_script = src.redeem_script;
+            }
+            if dst.witness_script.is_none() {
+                dst.witness_script = src.witness_script;
+            }
             for (k, v) in src.unknown {
                 dst.unknown.entry(k).or_insert(v);
             }
@@ -221,12 +229,18 @@ mod tests {
         Transaction {
             version: 2,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: Hash256([0xaa; 32]), vout: 0 },
+                previous_output: OutPoint {
+                    txid: Hash256([0xaa; 32]),
+                    vout: 0,
+                },
                 script_sig: Script::new(),
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 10_000, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: 10_000,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         }
     }
@@ -236,12 +250,18 @@ mod tests {
         let tx = Transaction {
             version: 1,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: Hash256::ZERO, vout: 0 },
+                previous_output: OutPoint {
+                    txid: Hash256::ZERO,
+                    vout: 0,
+                },
                 script_sig: Script::from_bytes(vec![1, 2, 3]),
                 sequence: 0,
                 witness: vec![vec![4, 5]],
             }],
-            outputs: vec![TxOut { value: 0, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: 0,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         };
         let psbt = Psbt::create(tx);

@@ -64,7 +64,8 @@ fn strip_codeseparators(script: &Script) -> Script {
                     out.extend_from_slice(&bytes[i..]);
                     break;
                 }
-                let len = u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]) as usize;
+                let len = u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]])
+                    as usize;
                 out.push(bytes[i]);
                 out.push(bytes[i + 1]);
                 out.push(bytes[i + 2]);
@@ -163,7 +164,9 @@ pub fn sighash_legacy_with_u32(
         (0..tx.inputs.len()).collect()
     };
 
-    VarInt(inputs_to_sign.len() as u64).encode(&mut buf).unwrap();
+    VarInt(inputs_to_sign.len() as u64)
+        .encode(&mut buf)
+        .unwrap();
 
     for &i in &inputs_to_sign {
         let input = &tx.inputs[i];
@@ -178,7 +181,11 @@ pub fn sighash_legacy_with_u32(
 
         // Sequence: zeroed for SIGHASH_NONE/SINGLE unless it's the current input
         let seq = if base == 2 || base == 3 {
-            if i == input_index { input.sequence } else { 0 }
+            if i == input_index {
+                input.sequence
+            } else {
+                0
+            }
         } else {
             input.sequence
         };
@@ -310,6 +317,7 @@ pub fn sighash_segwit_v0_with_u32(
 }
 
 /// BIP341 sighash for Taproot (SegWit v1) inputs
+#[allow(clippy::too_many_arguments)]
 pub fn sighash_taproot(
     tx: &Transaction,
     input_index: usize,
@@ -395,7 +403,10 @@ pub fn sighash_taproot(
         let input = &tx.inputs[input_index];
         input.previous_output.encode(&mut buf).unwrap();
         prevouts[input_index].value.encode(&mut buf).unwrap();
-        prevouts[input_index].script_pubkey.encode(&mut buf).unwrap();
+        prevouts[input_index]
+            .script_pubkey
+            .encode(&mut buf)
+            .unwrap();
         input.sequence.encode(&mut buf).unwrap();
     } else {
         (input_index as u32).encode(&mut buf).unwrap();
@@ -405,7 +416,9 @@ pub fn sighash_taproot(
         // BIP341 annex hash: SHA256(compact_size || annex), where annex
         // already includes the 0x50 tag byte in witness data.
         let mut annex_ser = Vec::new();
-        VarInt(annex_data.len() as u64).encode(&mut annex_ser).unwrap();
+        VarInt(annex_data.len() as u64)
+            .encode(&mut annex_ser)
+            .unwrap();
         annex_ser.extend_from_slice(annex_data);
         let mut h = Sha256::new();
         h.update(&annex_ser);
@@ -434,9 +447,9 @@ pub fn sighash_taproot(
 mod tests {
     use super::*;
     use crate::sig::verify_schnorr;
-    use rbtc_primitives::transaction::{OutPoint, TxIn, TxOut};
-    use rbtc_primitives::hash::Hash256;
     use rbtc_primitives::codec::Decodable;
+    use rbtc_primitives::hash::Hash256;
+    use rbtc_primitives::transaction::{OutPoint, TxIn, TxOut};
     use std::io::Cursor;
 
     fn decode_hex(s: &str) -> Vec<u8> {
@@ -454,14 +467,15 @@ mod tests {
     fn sample_tx() -> Transaction {
         Transaction {
             version: 1,
-            inputs: vec![
-                TxIn {
-                    previous_output: OutPoint { txid: Hash256([0; 32]), vout: 0 },
-                    script_sig: Script::new(),
-                    sequence: 0xffffffff,
-                    witness: vec![],
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Hash256([0; 32]),
+                    vout: 0,
                 },
-            ],
+                script_sig: Script::new(),
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
             outputs: vec![TxOut {
                 value: 1000,
                 script_pubkey: Script::new(),
@@ -476,9 +490,18 @@ mod tests {
         assert_eq!(SighashType::from_u32(1), Some(SighashType::All));
         assert_eq!(SighashType::from_u32(2), Some(SighashType::None));
         assert_eq!(SighashType::from_u32(3), Some(SighashType::Single));
-        assert_eq!(SighashType::from_u32(0x81), Some(SighashType::AllAnyoneCanPay));
-        assert_eq!(SighashType::from_u32(0x82), Some(SighashType::NoneAnyoneCanPay));
-        assert_eq!(SighashType::from_u32(0x83), Some(SighashType::SingleAnyoneCanPay));
+        assert_eq!(
+            SighashType::from_u32(0x81),
+            Some(SighashType::AllAnyoneCanPay)
+        );
+        assert_eq!(
+            SighashType::from_u32(0x82),
+            Some(SighashType::NoneAnyoneCanPay)
+        );
+        assert_eq!(
+            SighashType::from_u32(0x83),
+            Some(SighashType::SingleAnyoneCanPay)
+        );
         assert_eq!(SighashType::from_u32(99), None);
     }
 
@@ -561,7 +584,10 @@ mod tests {
     #[test]
     fn sighash_taproot_default() {
         let tx = sample_tx();
-        let prevouts = vec![TxOut { value: 1000, script_pubkey: Script::new() }];
+        let prevouts = vec![TxOut {
+            value: 1000,
+            script_pubkey: Script::new(),
+        }];
         let h = sighash_taproot(
             &tx,
             0,
@@ -578,7 +604,10 @@ mod tests {
     #[test]
     fn sighash_taproot_with_annex() {
         let tx = sample_tx();
-        let prevouts = vec![TxOut { value: 1000, script_pubkey: Script::new() }];
+        let prevouts = vec![TxOut {
+            value: 1000,
+            script_pubkey: Script::new(),
+        }];
         let annex = vec![0x50];
         let h = sighash_taproot(
             &tx,
@@ -596,7 +625,10 @@ mod tests {
     #[test]
     fn sighash_taproot_with_leaf_hash() {
         let tx = sample_tx();
-        let prevouts = vec![TxOut { value: 1000, script_pubkey: Script::new() }];
+        let prevouts = vec![TxOut {
+            value: 1000,
+            script_pubkey: Script::new(),
+        }];
         let leaf = [1u8; 32];
         let h = sighash_taproot(
             &tx,
@@ -614,7 +646,10 @@ mod tests {
     #[test]
     fn sighash_taproot_anyone_can_pay() {
         let tx = sample_tx();
-        let prevouts = vec![TxOut { value: 1000, script_pubkey: Script::new() }];
+        let prevouts = vec![TxOut {
+            value: 1000,
+            script_pubkey: Script::new(),
+        }];
         let h = sighash_taproot(
             &tx,
             0,
@@ -631,7 +666,10 @@ mod tests {
     #[test]
     fn sighash_taproot_single() {
         let tx = sample_tx();
-        let prevouts = vec![TxOut { value: 1000, script_pubkey: Script::new() }];
+        let prevouts = vec![TxOut {
+            value: 1000,
+            script_pubkey: Script::new(),
+        }];
         let h = sighash_taproot(
             &tx,
             0,
@@ -648,18 +686,12 @@ mod tests {
     #[test]
     fn sighash_taproot_scriptpath_codesep_affects_hash() {
         let tx = sample_tx();
-        let prevouts = vec![TxOut { value: 1000, script_pubkey: Script::new() }];
+        let prevouts = vec![TxOut {
+            value: 1000,
+            script_pubkey: Script::new(),
+        }];
         let leaf = [7u8; 32];
-        let h1 = sighash_taproot(
-            &tx,
-            0,
-            &prevouts,
-            SighashType::All,
-            Some(&leaf),
-            None,
-            0,
-            0,
-        );
+        let h1 = sighash_taproot(&tx, 0, &prevouts, SighashType::All, Some(&leaf), None, 0, 0);
         let h2 = sighash_taproot(
             &tx,
             0,
@@ -679,39 +711,48 @@ mod tests {
             version: 2,
             inputs: vec![
                 TxIn {
-                    previous_output: OutPoint { txid: Hash256([1; 32]), vout: 1 },
+                    previous_output: OutPoint {
+                        txid: Hash256([1; 32]),
+                        vout: 1,
+                    },
                     script_sig: Script::new(),
                     sequence: 0x11223344,
                     witness: vec![],
                 },
                 TxIn {
-                    previous_output: OutPoint { txid: Hash256([2; 32]), vout: 2 },
+                    previous_output: OutPoint {
+                        txid: Hash256([2; 32]),
+                        vout: 2,
+                    },
                     script_sig: Script::new(),
                     sequence: 0x55667788,
                     witness: vec![],
                 },
             ],
             outputs: vec![
-                TxOut { value: 111, script_pubkey: Script::from_bytes(vec![0x51]) },
-                TxOut { value: 222, script_pubkey: Script::from_bytes(vec![0x51, 0x51]) },
+                TxOut {
+                    value: 111,
+                    script_pubkey: Script::from_bytes(vec![0x51]),
+                },
+                TxOut {
+                    value: 222,
+                    script_pubkey: Script::from_bytes(vec![0x51, 0x51]),
+                },
             ],
             lock_time: 3,
         };
         let prevouts = vec![
-            TxOut { value: 777, script_pubkey: Script::from_bytes(vec![0x51, 0x21]) },
-            TxOut { value: 888, script_pubkey: Script::from_bytes(vec![0x51, 0x22, 0x23]) },
+            TxOut {
+                value: 777,
+                script_pubkey: Script::from_bytes(vec![0x51, 0x21]),
+            },
+            TxOut {
+                value: 888,
+                script_pubkey: Script::from_bytes(vec![0x51, 0x22, 0x23]),
+            },
         ];
 
-        let got = sighash_taproot(
-            &tx,
-            1,
-            &prevouts,
-            SighashType::All,
-            None,
-            None,
-            0,
-            u32::MAX,
-        );
+        let got = sighash_taproot(&tx, 1, &prevouts, SighashType::All, None, None, 0, u32::MAX);
 
         let mut msg = Vec::new();
         msg.push(0u8); // epoch
@@ -761,20 +802,32 @@ mod tests {
         let tx1 = Transaction {
             version: 2,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: Hash256([9; 32]), vout: 0 },
+                previous_output: OutPoint {
+                    txid: Hash256([9; 32]),
+                    vout: 0,
+                },
                 script_sig: Script::new(),
                 sequence: 0xabcdef01,
                 witness: vec![],
             }],
             outputs: vec![
-                TxOut { value: 100, script_pubkey: Script::from_bytes(vec![0x51]) },
-                TxOut { value: 200, script_pubkey: Script::from_bytes(vec![0x51, 0x51]) },
+                TxOut {
+                    value: 100,
+                    script_pubkey: Script::from_bytes(vec![0x51]),
+                },
+                TxOut {
+                    value: 200,
+                    script_pubkey: Script::from_bytes(vec![0x51, 0x51]),
+                },
             ],
             lock_time: 42,
         };
         let mut tx2 = tx1.clone();
         tx2.outputs[1].value = 201;
-        let prevouts = vec![TxOut { value: 12345, script_pubkey: Script::from_bytes(vec![0x51, 0x20]) }];
+        let prevouts = vec![TxOut {
+            value: 12345,
+            script_pubkey: Script::from_bytes(vec![0x51, 0x20]),
+        }];
 
         let h1 = sighash_taproot(
             &tx1,
@@ -809,21 +862,21 @@ mod tests {
         let prevouts = vec![
             TxOut {
                 value: 20_000,
-                script_pubkey: Script::from_bytes(
-                    decode_hex("5120bb7e66771403f65424a570b6a4cdb3528f964204a2b72744d82f1002bfb1598b"),
-                ),
+                script_pubkey: Script::from_bytes(decode_hex(
+                    "5120bb7e66771403f65424a570b6a4cdb3528f964204a2b72744d82f1002bfb1598b",
+                )),
             },
             TxOut {
                 value: 10_000,
-                script_pubkey: Script::from_bytes(
-                    decode_hex("51208102001190c6aad9a015dff1540dc9a7bda31613b8ab05a58268c4bff53fae82"),
-                ),
+                script_pubkey: Script::from_bytes(decode_hex(
+                    "51208102001190c6aad9a015dff1540dc9a7bda31613b8ab05a58268c4bff53fae82",
+                )),
             },
             TxOut {
                 value: 5_928,
-                script_pubkey: Script::from_bytes(
-                    decode_hex("5120bb7e66771403f65424a570b6a4cdb3528f964204a2b72744d82f1002bfb1598b"),
-                ),
+                script_pubkey: Script::from_bytes(decode_hex(
+                    "5120bb7e66771403f65424a570b6a4cdb3528f964204a2b72744d82f1002bfb1598b",
+                )),
             },
         ];
 
@@ -844,7 +897,8 @@ mod tests {
         );
 
         // x-only output key from prevout scriptPubKey (OP_1 0x20 <32-byte key>)
-        let output_key = decode_hex("8102001190c6aad9a015dff1540dc9a7bda31613b8ab05a58268c4bff53fae82");
+        let output_key =
+            decode_hex("8102001190c6aad9a015dff1540dc9a7bda31613b8ab05a58268c4bff53fae82");
         assert!(verify_schnorr(&output_key, sig, &h.0).is_ok());
     }
 }

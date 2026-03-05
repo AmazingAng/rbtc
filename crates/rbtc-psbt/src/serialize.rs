@@ -50,7 +50,10 @@ fn decode_txout(data: &[u8]) -> Result<TxOut> {
     let mut cur = std::io::Cursor::new(data);
     let value = u64::decode(&mut cur).map_err(|e| PsbtError::Decode(e.to_string()))?;
     let script_pubkey = Script::decode(&mut cur).map_err(|e| PsbtError::Decode(e.to_string()))?;
-    Ok(TxOut { value, script_pubkey })
+    Ok(TxOut {
+        value,
+        script_pubkey,
+    })
 }
 
 // ── Encoding ──────────────────────────────────────────────────────────────────
@@ -98,30 +101,13 @@ impl Psbt {
 
         let mut pos = 5usize;
 
-        // Helper: read a varint-prefixed byte string
-        macro_rules! read_bytes {
-            () => {{
-                let mut cur = std::io::Cursor::new(&data[pos..]);
-                let VarInt(len) = VarInt::decode(&mut cur)
-                    .map_err(|e| PsbtError::Decode(e.to_string()))?;
-                let hdr_len = cur.position() as usize;
-                let start = pos + hdr_len;
-                let end = start + len as usize;
-                if end > data.len() {
-                    return Err(PsbtError::Decode("truncated".into()));
-                }
-                pos = end;
-                &data[start..end]
-            }};
-        }
-
         // Parse a complete key-value map; returns (keys, values) as byte vecs
-        let mut parse_map = |pos: &mut usize| -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let parse_map = |pos: &mut usize| -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
             let mut entries = Vec::new();
             loop {
                 let mut cur = std::io::Cursor::new(&data[*pos..]);
-                let VarInt(key_len) = VarInt::decode(&mut cur)
-                    .map_err(|e| PsbtError::Decode(e.to_string()))?;
+                let VarInt(key_len) =
+                    VarInt::decode(&mut cur).map_err(|e| PsbtError::Decode(e.to_string()))?;
                 let hdr = cur.position() as usize;
                 *pos += hdr;
                 if key_len == 0 {
@@ -136,8 +122,8 @@ impl Psbt {
 
                 // value
                 let mut vcur = std::io::Cursor::new(&data[*pos..]);
-                let VarInt(val_len) = VarInt::decode(&mut vcur)
-                    .map_err(|e| PsbtError::Decode(e.to_string()))?;
+                let VarInt(val_len) =
+                    VarInt::decode(&mut vcur).map_err(|e| PsbtError::Decode(e.to_string()))?;
                 let vhdr = vcur.position() as usize;
                 *pos += vhdr;
                 let val_start = *pos;
@@ -168,7 +154,9 @@ impl Psbt {
                 [0xfb] if value.len() == 4 => {
                     version = u32::from_le_bytes(value[..4].try_into().unwrap());
                 }
-                _ => { global_unknown.insert(key, value); }
+                _ => {
+                    global_unknown.insert(key, value);
+                }
             }
         }
 
@@ -176,7 +164,11 @@ impl Psbt {
         let input_count = unsigned_tx.inputs.len();
         let output_count = unsigned_tx.outputs.len();
 
-        let global = PsbtGlobal { unsigned_tx, version, unknown: global_unknown };
+        let global = PsbtGlobal {
+            unsigned_tx,
+            version,
+            unknown: global_unknown,
+        };
 
         // --- Per-input maps ---
         let mut inputs = Vec::with_capacity(input_count);
@@ -246,7 +238,9 @@ impl Psbt {
                     [0x14] => {
                         inp.tap_internal_key = Some(value);
                     }
-                    _ => { inp.unknown.insert(key, value); }
+                    _ => {
+                        inp.unknown.insert(key, value);
+                    }
                 }
             }
             inputs.push(inp);
@@ -259,8 +253,12 @@ impl Psbt {
             let mut out = PsbtOutput::default();
             for (key, value) in entries {
                 match key.as_slice() {
-                    [0x00] => { out.redeem_script = Some(Script::from_bytes(value)); }
-                    [0x01] => { out.witness_script = Some(Script::from_bytes(value)); }
+                    [0x00] => {
+                        out.redeem_script = Some(Script::from_bytes(value));
+                    }
+                    [0x01] => {
+                        out.witness_script = Some(Script::from_bytes(value));
+                    }
                     k if k.first() == Some(&0x02) && k.len() == 34 => {
                         let pubkey = k[1..].to_vec();
                         if value.len() >= 4 && (value.len() - 4) % 4 == 0 {
@@ -272,18 +270,26 @@ impl Psbt {
                             out.bip32_derivation.insert(pubkey, (fingerprint, path));
                         }
                     }
-                    _ => { out.unknown.insert(key, value); }
+                    _ => {
+                        out.unknown.insert(key, value);
+                    }
                 }
             }
             outputs.push(out);
         }
 
-        Ok(Psbt { global, inputs, outputs })
+        Ok(Psbt {
+            global,
+            inputs,
+            outputs,
+        })
     }
 
     /// Deserialize from Base64 string.
     pub fn from_base64(s: &str) -> Result<Self> {
-        let bytes = B64.decode(s.trim()).map_err(|e| PsbtError::Base64(e.to_string()))?;
+        let bytes = B64
+            .decode(s.trim())
+            .map_err(|e| PsbtError::Base64(e.to_string()))?;
         Self::deserialize(&bytes)
     }
 }
@@ -377,7 +383,10 @@ mod tests {
         Transaction {
             version: 2,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: Hash256([1; 32]), vout: 0 },
+                previous_output: OutPoint {
+                    txid: Hash256([1; 32]),
+                    vout: 0,
+                },
                 script_sig: Script::new(),
                 sequence: 0xffffffff,
                 witness: vec![],
@@ -418,10 +427,12 @@ mod tests {
         let pubkey = vec![0x02; 33];
         let fingerprint = vec![0xDE, 0xAD, 0xBE, 0xEF];
         let path = vec![44 | 0x80000000, 0 | 0x80000000, 0 | 0x80000000, 0, 0];
-        inp.bip32_derivation.insert(pubkey.clone(), (fingerprint.clone(), path.clone()));
+        inp.bip32_derivation
+            .insert(pubkey.clone(), (fingerprint.clone(), path.clone()));
 
         let mut out = PsbtOutput::default();
-        out.bip32_derivation.insert(pubkey.clone(), (fingerprint.clone(), path.clone()));
+        out.bip32_derivation
+            .insert(pubkey.clone(), (fingerprint.clone(), path.clone()));
         out.redeem_script = Some(Script::from_bytes(vec![0x51]));
 
         let psbt = Psbt {
@@ -437,12 +448,18 @@ mod tests {
         let decoded = Psbt::deserialize(&bytes).expect("decode failed");
 
         // Check input BIP32 derivation
-        let (fp, p) = decoded.inputs[0].bip32_derivation.get(&pubkey).expect("missing input bip32");
+        let (fp, p) = decoded.inputs[0]
+            .bip32_derivation
+            .get(&pubkey)
+            .expect("missing input bip32");
         assert_eq!(fp, &fingerprint);
         assert_eq!(p, &path);
 
         // Check output BIP32 derivation
-        let (fp, p) = decoded.outputs[0].bip32_derivation.get(&pubkey).expect("missing output bip32");
+        let (fp, p) = decoded.outputs[0]
+            .bip32_derivation
+            .get(&pubkey)
+            .expect("missing output bip32");
         assert_eq!(fp, &fingerprint);
         assert_eq!(p, &path);
 
@@ -464,9 +481,6 @@ mod tests {
         };
         let b64 = psbt.to_base64();
         let decoded = Psbt::from_base64(&b64).expect("base64 decode failed");
-        assert_eq!(
-            decoded.global.unsigned_tx.outputs[0].value,
-            50_000
-        );
+        assert_eq!(decoded.global.unsigned_tx.outputs[0].value, 50_000);
     }
 }

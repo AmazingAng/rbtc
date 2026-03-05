@@ -33,9 +33,7 @@ fn key_io_valid_addresses() {
             let expected_key = decode_hex(expected_hex);
             let is_compressed = meta["isCompressed"].as_bool().unwrap_or(true);
 
-            let decoded = bs58::decode(addr_or_wif)
-                .with_check(None)
-                .into_vec();
+            let decoded = bs58::decode(addr_or_wif).with_check(None).into_vec();
             match decoded {
                 Ok(bytes) => {
                     // WIF: version(1) + key(32) + [compressed_flag(1)] + checksum(removed by bs58)
@@ -82,9 +80,7 @@ fn key_io_valid_addresses() {
                     }
                 }
                 Err(e) => {
-                    failures.push(format!(
-                        "[{i}] address={addr_or_wif}: decode failed: {e}"
-                    ));
+                    failures.push(format!("[{i}] address={addr_or_wif}: decode failed: {e}"));
                 }
             }
         }
@@ -94,10 +90,7 @@ fn key_io_valid_addresses() {
         for f in &failures {
             eprintln!("  FAIL: {f}");
         }
-        panic!(
-            "{} / {total} key_io_valid cases failed",
-            failures.len()
-        );
+        panic!("{} / {total} key_io_valid cases failed", failures.len());
     }
 
     println!("key_io_valid.json: {total} cases all passed");
@@ -106,7 +99,8 @@ fn key_io_valid_addresses() {
 #[test]
 fn key_io_invalid() {
     let json_text = include_str!("data/key_io_invalid.json");
-    let data: Vec<Vec<String>> = serde_json::from_str(json_text).expect("parse key_io_invalid.json");
+    let data: Vec<Vec<String>> =
+        serde_json::from_str(json_text).expect("parse key_io_invalid.json");
 
     let mut total = 0usize;
     let mut false_ok = Vec::<String>::new();
@@ -121,7 +115,10 @@ fn key_io_invalid() {
         // Should fail as address
         let addr_ok = address_to_script(invalid_str).is_ok();
         // Should fail as WIF
-        let wif_ok = bs58::decode(invalid_str).with_check(None).into_vec().is_ok();
+        let _wif_ok = bs58::decode(invalid_str)
+            .with_check(None)
+            .into_vec()
+            .is_ok();
 
         if addr_ok {
             false_ok.push(format!(

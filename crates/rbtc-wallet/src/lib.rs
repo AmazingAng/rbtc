@@ -13,7 +13,7 @@ pub use descriptor::Descriptor;
 pub use error::WalletError;
 pub use hd::{DerivationPath, ExtendedPrivKey, ExtendedPubKey, HARDENED};
 pub use mnemonic::Mnemonic;
-pub use tx_builder::{CoinSelector, SigningInput, TxBuilder, sign_transaction, estimate_vsize};
+pub use tx_builder::{estimate_vsize, sign_transaction, CoinSelector, SigningInput, TxBuilder};
 pub use wallet::{Wallet, WalletUtxo};
 pub use wallet_store::CF_WALLET;
 pub use wif::{from_wif, to_wif};

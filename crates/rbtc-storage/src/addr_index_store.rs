@@ -15,8 +15,8 @@
 //! returned in ascending (height, tx_offset) order thanks to big-endian
 //! encoding.
 
-use rocksdb::WriteBatch;
 use rbtc_primitives::hash::Hash256;
+use rocksdb::WriteBatch;
 
 use crate::{
     db::{Database, CF_ADDR_INDEX},
@@ -42,13 +42,7 @@ impl<'a> AddrIndexStore<'a> {
 
     /// Record that `txid` (at position `tx_offset` inside block at `height`)
     /// sends output to `script`.
-    pub fn put(
-        &self,
-        script: &[u8],
-        height: u32,
-        tx_offset: u32,
-        txid: &Hash256,
-    ) -> Result<()> {
+    pub fn put(&self, script: &[u8], height: u32, tx_offset: u32, txid: &Hash256) -> Result<()> {
         let key = make_addr_key(script, height, tx_offset);
         self.db.put_cf(CF_ADDR_INDEX, &key, &txid.0)
     }
@@ -72,8 +66,7 @@ impl<'a> AddrIndexStore<'a> {
                     "addr_index: key too short".to_string(),
                 ));
             }
-            let height =
-                u32::from_be_bytes(key[tail_start..tail_start + 4].try_into().unwrap());
+            let height = u32::from_be_bytes(key[tail_start..tail_start + 4].try_into().unwrap());
             let tx_offset =
                 u32::from_be_bytes(key[tail_start + 4..tail_start + 8].try_into().unwrap());
 
@@ -143,8 +136,8 @@ fn make_addr_prefix(script: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
     use crate::db::Database;
+    use tempfile::TempDir;
 
     fn make_hash(b: u8) -> Hash256 {
         Hash256([b; 32])
@@ -200,8 +193,12 @@ mod tests {
         let store = AddrIndexStore::new(&db);
         let script = b"\x76\xa9\x14\xcc";
         let mut batch = db.new_batch();
-        store.batch_put(&mut batch, script, 50, 0, &make_hash(0x50)).unwrap();
-        store.batch_put(&mut batch, script, 51, 1, &make_hash(0x51)).unwrap();
+        store
+            .batch_put(&mut batch, script, 50, 0, &make_hash(0x50))
+            .unwrap();
+        store
+            .batch_put(&mut batch, script, 51, 1, &make_hash(0x51))
+            .unwrap();
         db.write_batch(batch).unwrap();
         assert_eq!(store.iter_by_script(script).unwrap().len(), 2);
         let mut batch2 = db.new_batch();
@@ -216,7 +213,8 @@ mod tests {
         let db = Database::open(dir.path()).unwrap();
         // key = [1][0xdd][height_be][tx_offset_be] = 1+1+4+4 = 10 bytes
         let bad_key = vec![1u8, 0xdd, 0, 0, 0, 100, 0, 0, 0, 0];
-        db.put_cf(crate::db::CF_ADDR_INDEX, &bad_key, b"short").unwrap();
+        db.put_cf(crate::db::CF_ADDR_INDEX, &bad_key, b"short")
+            .unwrap();
         let store = AddrIndexStore::new(&db);
         let r = store.iter_by_script(&[0xdd]);
         assert!(r.is_err());
@@ -229,11 +227,8 @@ mod tests {
         let db = Database::open(dir.path()).unwrap();
         // prefix for script [0xee] is [1][0xee], len 2. key must have at least 2+8=10 bytes.
         let too_short_key = vec![1u8, 0xee, 0, 0]; // only 4 bytes
-        db.put_cf(
-            crate::db::CF_ADDR_INDEX,
-            &too_short_key,
-            &[0u8; 32],
-        ).unwrap();
+        db.put_cf(crate::db::CF_ADDR_INDEX, &too_short_key, &[0u8; 32])
+            .unwrap();
         let store = AddrIndexStore::new(&db);
         let r = store.iter_by_script(&[0xee]);
         assert!(r.is_err());

@@ -45,10 +45,7 @@ fn base58_encode_decode_json() {
         for f in &failures {
             eprintln!("  FAIL: {f}");
         }
-        panic!(
-            "{} / {total} base58 cases failed",
-            failures.len()
-        );
+        panic!("{} / {total} base58 cases failed", failures.len());
     }
 
     println!("base58_encode_decode.json: {total} cases all passed");

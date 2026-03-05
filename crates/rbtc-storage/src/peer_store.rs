@@ -23,7 +23,8 @@ impl<'a> PeerStore<'a> {
     /// Ban `ip` for `duration`.  The expiry timestamp is stored in CF_PEER_BANS.
     pub fn ban(&self, ip: IpAddr, duration: Duration) -> Result<()> {
         let expiry = unix_now() + duration.as_secs();
-        self.db.put_cf(CF_PEER_BANS, &ip_key(ip), &expiry.to_le_bytes())
+        self.db
+            .put_cf(CF_PEER_BANS, &ip_key(ip), &expiry.to_le_bytes())
     }
 
     /// Return true if `ip` is currently banned (expiry in the future).
@@ -69,7 +70,8 @@ impl<'a> PeerStore<'a> {
             let mut val = [0u8; 16];
             val[..8].copy_from_slice(&last_seen.to_le_bytes());
             val[8..].copy_from_slice(&services.to_le_bytes());
-            self.db.batch_put_cf(&mut batch, CF_PEER_ADDRS, &key, &val)?;
+            self.db
+                .batch_put_cf(&mut batch, CF_PEER_ADDRS, &key, &val)?;
         }
         self.db.write_batch(batch)
     }
@@ -167,7 +169,8 @@ mod tests {
         let ip: IpAddr = "5.6.7.8".parse().unwrap();
         // Write an already-expired ban directly
         let past_expiry: u64 = 1; // epoch + 1s, definitely in the past
-        db.put_cf(CF_PEER_BANS, &ip_key(ip), &past_expiry.to_le_bytes()).unwrap();
+        db.put_cf(CF_PEER_BANS, &ip_key(ip), &past_expiry.to_le_bytes())
+            .unwrap();
         assert!(!store.is_banned(ip));
         let count = store.expire_bans().unwrap();
         assert_eq!(count, 1);
@@ -179,7 +182,9 @@ mod tests {
         let store = PeerStore::new(&db);
         let addr1: SocketAddr = "1.2.3.4:8333".parse().unwrap();
         let addr2: SocketAddr = "[::1]:8333".parse().unwrap();
-        store.save_addrs(&[(addr1, 1000, 1), (addr2, 2000, 9)]).unwrap();
+        store
+            .save_addrs(&[(addr1, 1000, 1), (addr2, 2000, 9)])
+            .unwrap();
         let loaded = store.load_addrs().unwrap();
         assert_eq!(loaded.len(), 2);
         // Find addr1

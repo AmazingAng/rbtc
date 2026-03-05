@@ -18,7 +18,10 @@ impl Hash256 {
 
     pub fn from_slice(s: &[u8]) -> Result<Self, HashError> {
         if s.len() != 32 {
-            return Err(HashError::Length { expected: 32, got: s.len() });
+            return Err(HashError::Length {
+                expected: 32,
+                got: s.len(),
+            });
         }
         let mut arr = [0u8; 32];
         arr.copy_from_slice(s);
@@ -29,7 +32,10 @@ impl Hash256 {
     pub fn from_hex(s: &str) -> Result<Self, HashError> {
         let bytes = hex::decode(s)?;
         if bytes.len() != 32 {
-            return Err(HashError::Length { expected: 32, got: bytes.len() });
+            return Err(HashError::Length {
+                expected: 32,
+                got: bytes.len(),
+            });
         }
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&bytes);
@@ -77,7 +83,10 @@ impl Hash160 {
 
     pub fn from_slice(s: &[u8]) -> Result<Self, HashError> {
         if s.len() != 20 {
-            return Err(HashError::Length { expected: 20, got: s.len() });
+            return Err(HashError::Length {
+                expected: 20,
+                got: s.len(),
+            });
         }
         let mut arr = [0u8; 20];
         arr.copy_from_slice(s);
@@ -130,7 +139,13 @@ mod tests {
         assert!(Hash256::from_slice(&[0u8; 31]).is_err());
         assert!(Hash256::from_slice(&[0u8; 33]).is_err());
         let e = Hash256::from_slice(&[0u8; 0]).unwrap_err();
-        assert!(matches!(e, HashError::Length { expected: 32, got: 0 }));
+        assert!(matches!(
+            e,
+            HashError::Length {
+                expected: 32,
+                got: 0
+            }
+        ));
     }
 
     #[test]

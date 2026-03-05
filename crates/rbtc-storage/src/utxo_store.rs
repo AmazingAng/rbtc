@@ -1,10 +1,10 @@
-use rocksdb::WriteBatch;
 use rbtc_primitives::{
     codec::{Decodable, Encodable, VarInt},
     hash::{Hash256, TxId},
     script::Script,
     transaction::{OutPoint, TxOut},
 };
+use rocksdb::WriteBatch;
 
 use crate::{
     db::{Database, CF_UTXO},
@@ -22,7 +22,10 @@ pub struct StoredUtxo {
 
 impl StoredUtxo {
     pub fn to_txout(&self) -> TxOut {
-        TxOut { value: self.value, script_pubkey: self.script_pubkey.clone() }
+        TxOut {
+            value: self.value,
+            script_pubkey: self.script_pubkey.clone(),
+        }
     }
 
     fn encode_key(outpoint: &OutPoint) -> Vec<u8> {
@@ -44,12 +47,19 @@ impl StoredUtxo {
     pub fn decode_value(bytes: &[u8]) -> Result<Self> {
         let mut cur = std::io::Cursor::new(bytes);
         let value = u64::decode(&mut cur).map_err(|e| StorageError::Decode(e.to_string()))?;
-        let script_pubkey = Script::decode(&mut cur).map_err(|e| StorageError::Decode(e.to_string()))?;
+        let script_pubkey =
+            Script::decode(&mut cur).map_err(|e| StorageError::Decode(e.to_string()))?;
         let height = u32::decode(&mut cur).map_err(|e| StorageError::Decode(e.to_string()))?;
         let mut flag = [0u8; 1];
         use std::io::Read;
-        cur.read_exact(&mut flag).map_err(|e| StorageError::Decode(e.to_string()))?;
-        Ok(Self { value, script_pubkey, height, is_coinbase: flag[0] != 0 })
+        cur.read_exact(&mut flag)
+            .map_err(|e| StorageError::Decode(e.to_string()))?;
+        Ok(Self {
+            value,
+            script_pubkey,
+            height,
+            is_coinbase: flag[0] != 0,
+        })
     }
 }
 
@@ -112,7 +122,8 @@ impl<'db> UtxoStore<'db> {
         }
         for (outpoint, utxo) in to_add {
             let key = StoredUtxo::encode_key(outpoint);
-            self.db.batch_put_cf(batch, CF_UTXO, &key, &utxo.encode_value())?;
+            self.db
+                .batch_put_cf(batch, CF_UTXO, &key, &utxo.encode_value())?;
         }
         Ok(())
     }
@@ -152,13 +163,19 @@ impl<'db> UtxoStore<'db> {
             }
 
             for (vout, txout) in tx.outputs.iter().enumerate() {
-                let outpoint = OutPoint { txid: *txid, vout: vout as u32 };
-                to_add.push((outpoint, StoredUtxo {
-                    value: txout.value,
-                    script_pubkey: txout.script_pubkey.clone(),
-                    height,
-                    is_coinbase,
-                }));
+                let outpoint = OutPoint {
+                    txid: *txid,
+                    vout: vout as u32,
+                };
+                to_add.push((
+                    outpoint,
+                    StoredUtxo {
+                        value: txout.value,
+                        script_pubkey: txout.script_pubkey.clone(),
+                        height,
+                        is_coinbase,
+                    },
+                ));
             }
         }
 
@@ -177,7 +194,13 @@ impl<'db> UtxoStore<'db> {
                     txid_bytes.copy_from_slice(&k[..32]);
                     let vout = u32::from_le_bytes(k[32..36].try_into().ok()?);
                     let utxo = StoredUtxo::decode_value(&v).ok()?;
-                    Some((OutPoint { txid: Hash256(txid_bytes), vout }, utxo))
+                    Some((
+                        OutPoint {
+                            txid: Hash256(txid_bytes),
+                            vout,
+                        },
+                        utxo,
+                    ))
                 })
                 .collect(),
             Err(_) => Vec::new(),
@@ -196,7 +219,10 @@ impl<'db> UtxoStore<'db> {
 
         for (txid, tx) in txids.iter().zip(txs.iter()).rev() {
             for vout in 0..tx.outputs.len() {
-                to_remove.push(OutPoint { txid: *txid, vout: vout as u32 });
+                to_remove.push(OutPoint {
+                    txid: *txid,
+                    vout: vout as u32,
+                });
             }
         }
 
@@ -225,22 +251,30 @@ pub fn encode_block_undo(undo: &[Vec<(OutPoint, StoredUtxo)>]) -> Vec<u8> {
 /// Decode undo data encoded by `encode_block_undo`.
 pub fn decode_block_undo(bytes: &[u8]) -> Result<Vec<Vec<(OutPoint, StoredUtxo)>>> {
     let mut cur = std::io::Cursor::new(bytes);
-    let VarInt(num_txs) = VarInt::decode(&mut cur).map_err(|e| StorageError::Decode(e.to_string()))?;
+    let VarInt(num_txs) =
+        VarInt::decode(&mut cur).map_err(|e| StorageError::Decode(e.to_string()))?;
     let mut undo = Vec::with_capacity(num_txs as usize);
     for _ in 0..num_txs {
-        let VarInt(num_spent) = VarInt::decode(&mut cur).map_err(|e| StorageError::Decode(e.to_string()))?;
+        let VarInt(num_spent) =
+            VarInt::decode(&mut cur).map_err(|e| StorageError::Decode(e.to_string()))?;
         let mut tx_undo = Vec::with_capacity(num_spent as usize);
         for _ in 0..num_spent {
             let mut key = [0u8; 36];
             use std::io::Read;
-            cur.read_exact(&mut key).map_err(|e| StorageError::Decode(e.to_string()))?;
+            cur.read_exact(&mut key)
+                .map_err(|e| StorageError::Decode(e.to_string()))?;
             let mut txid_bytes = [0u8; 32];
             txid_bytes.copy_from_slice(&key[..32]);
             let vout = u32::from_le_bytes(key[32..36].try_into().unwrap());
-            let outpoint = OutPoint { txid: Hash256(txid_bytes), vout };
-            let VarInt(val_len) = VarInt::decode(&mut cur).map_err(|e| StorageError::Decode(e.to_string()))?;
+            let outpoint = OutPoint {
+                txid: Hash256(txid_bytes),
+                vout,
+            };
+            let VarInt(val_len) =
+                VarInt::decode(&mut cur).map_err(|e| StorageError::Decode(e.to_string()))?;
             let mut val = vec![0u8; val_len as usize];
-            cur.read_exact(&mut val).map_err(|e| StorageError::Decode(e.to_string()))?;
+            cur.read_exact(&mut val)
+                .map_err(|e| StorageError::Decode(e.to_string()))?;
             let utxo = StoredUtxo::decode_value(&val)?;
             tx_undo.push((outpoint, utxo));
         }
@@ -252,16 +286,19 @@ pub fn decode_block_undo(bytes: &[u8]) -> Result<Vec<Vec<(OutPoint, StoredUtxo)>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::Database;
     use rbtc_primitives::hash::Hash256;
     use tempfile::TempDir;
-    use crate::db::Database;
 
     #[test]
     fn utxo_store_put_get_delete() {
         let dir = TempDir::new().unwrap();
         let db = Database::open(dir.path()).unwrap();
         let store = UtxoStore::new(&db);
-        let outpoint = OutPoint { txid: Hash256([1; 32]), vout: 0 };
+        let outpoint = OutPoint {
+            txid: Hash256([1; 32]),
+            vout: 0,
+        };
         let utxo = StoredUtxo {
             value: 1000,
             script_pubkey: Script::new(),
@@ -281,7 +318,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Database::open(dir.path()).unwrap();
         let store = UtxoStore::new(&db);
-        let op = OutPoint { txid: Hash256([2; 32]), vout: 0 };
+        let op = OutPoint {
+            txid: Hash256([2; 32]),
+            vout: 0,
+        };
         let utxo = StoredUtxo {
             value: 2000,
             script_pubkey: Script::new(),
@@ -298,14 +338,19 @@ mod tests {
         let db = Database::open(dir.path()).unwrap();
         let store = UtxoStore::new(&db);
         let mut batch = db.new_batch();
-        let op = OutPoint { txid: Hash256([3; 32]), vout: 0 };
+        let op = OutPoint {
+            txid: Hash256([3; 32]),
+            vout: 0,
+        };
         let utxo = StoredUtxo {
             value: 3000,
             script_pubkey: Script::new(),
             height: 3,
             is_coinbase: false,
         };
-        store.fill_batch(&mut batch, &[(op.clone(), utxo)], &[]).unwrap();
+        store
+            .fill_batch(&mut batch, &[(op.clone(), utxo)], &[])
+            .unwrap();
         db.write_batch(batch).unwrap();
         assert_eq!(store.get(&op).unwrap().unwrap().value, 3000);
     }
@@ -325,11 +370,16 @@ mod tests {
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: 50_0000_0000,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         };
         let mut batch = db.new_batch();
-        store.connect_block_into_batch(&mut batch, &[txid], &[cb], 0).unwrap();
+        store
+            .connect_block_into_batch(&mut batch, &[txid], &[cb], 0)
+            .unwrap();
         db.write_batch(batch).unwrap();
         let all = store.iter_all();
         assert_eq!(all.len(), 1);
@@ -338,7 +388,10 @@ mod tests {
 
     #[test]
     fn encode_decode_block_undo_roundtrip() {
-        let op = OutPoint { txid: Hash256([7; 32]), vout: 1 };
+        let op = OutPoint {
+            txid: Hash256([7; 32]),
+            vout: 1,
+        };
         let utxo = StoredUtxo {
             value: 100,
             script_pubkey: Script::new(),

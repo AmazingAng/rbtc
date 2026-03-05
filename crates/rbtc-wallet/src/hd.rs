@@ -59,13 +59,17 @@ pub struct ExtendedPrivKey {
 impl ExtendedPrivKey {
     /// Derive the BIP32 master key from a 64-byte seed.
     pub fn from_seed(seed: &[u8]) -> Result<Self, WalletError> {
-        let mut mac = HmacSha512::new_from_slice(b"Bitcoin seed")
-            .expect("HMAC accepts any key length");
+        let mut mac =
+            HmacSha512::new_from_slice(b"Bitcoin seed").expect("HMAC accepts any key length");
         mac.update(seed);
         let result = mac.finalize().into_bytes();
 
-        let private_key =
-            SecretKey::from_slice(&result[..32]).map_err(|_| WalletError::InvalidKey)?;
+        let private_key = SecretKey::from_byte_array(
+            result[..32]
+                .try_into()
+                .map_err(|_| WalletError::InvalidKey)?,
+        )
+        .map_err(|_| WalletError::InvalidKey)?;
         let mut chaincode = [0u8; 32];
         chaincode.copy_from_slice(&result[32..]);
 
@@ -94,8 +98,8 @@ impl ExtendedPrivKey {
         }
         data.extend_from_slice(&index.to_be_bytes());
 
-        let mut mac = HmacSha512::new_from_slice(&self.chaincode)
-            .expect("HMAC accepts any key length");
+        let mut mac =
+            HmacSha512::new_from_slice(&self.chaincode).expect("HMAC accepts any key length");
         mac.update(&data);
         let result = mac.finalize().into_bytes();
 
@@ -181,8 +185,8 @@ impl ExtendedPubKey {
         let child_number = u32::from_be_bytes(decoded[9..13].try_into().unwrap());
         let mut chaincode = [0u8; 32];
         chaincode.copy_from_slice(&decoded[13..45]);
-        let public_key = PublicKey::from_slice(&decoded[45..78])
-            .map_err(|_| WalletError::InvalidKey)?;
+        let public_key =
+            PublicKey::from_slice(&decoded[45..78]).map_err(|_| WalletError::InvalidKey)?;
 
         Ok(Self {
             depth,
@@ -217,8 +221,8 @@ impl ExtendedPubKey {
         data.extend_from_slice(&pub_bytes);
         data.extend_from_slice(&index.to_be_bytes());
 
-        let mut mac = HmacSha512::new_from_slice(&self.chaincode)
-            .expect("HMAC accepts any key length");
+        let mut mac =
+            HmacSha512::new_from_slice(&self.chaincode).expect("HMAC accepts any key length");
         mac.update(&data);
         let result = mac.finalize().into_bytes();
 
@@ -257,9 +261,7 @@ mod tests {
     #[test]
     fn master_key_from_seed() {
         // BIP32 Test Vector 1
-        let seed = seed_from_hex(
-            "000102030405060708090a0b0c0d0e0f",
-        );
+        let seed = seed_from_hex("000102030405060708090a0b0c0d0e0f");
         let master = ExtendedPrivKey::from_seed(&seed).unwrap();
         assert_eq!(master.depth, 0);
         assert_eq!(master.child_number, 0);
@@ -275,7 +277,10 @@ mod tests {
         let child = master.derive_child(0 | HARDENED).unwrap();
         assert_eq!(child.depth, 1);
         assert_eq!(child.child_number, 0 | HARDENED);
-        assert_ne!(child.private_key.secret_bytes(), master.private_key.secret_bytes());
+        assert_ne!(
+            child.private_key.secret_bytes(),
+            master.private_key.secret_bytes()
+        );
     }
 
     #[test]
@@ -290,7 +295,10 @@ mod tests {
     #[test]
     fn parse_derivation_path() {
         let path = DerivationPath::parse("m/84'/0'/0'/0/0").unwrap();
-        assert_eq!(path.0, vec![84 | HARDENED, 0 | HARDENED, 0 | HARDENED, 0, 0]);
+        assert_eq!(
+            path.0,
+            vec![84 | HARDENED, 0 | HARDENED, 0 | HARDENED, 0, 0]
+        );
     }
 
     #[test]

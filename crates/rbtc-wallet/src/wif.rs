@@ -18,7 +18,7 @@ fn base58check_encode(payload: &[u8]) -> String {
 pub fn to_wif(key: &SecretKey, network: Network) -> String {
     let version = match network {
         Network::Mainnet => 0x80u8,
-        _                => 0xef,
+        _ => 0xef,
     };
     let key_bytes = key.secret_bytes();
     let mut payload = Vec::with_capacity(34);
@@ -44,13 +44,13 @@ pub fn from_wif(wif: &str) -> Result<(SecretKey, Network), WalletError> {
     let network = match version {
         0x80 => Network::Mainnet,
         0xef => Network::Regtest,
-        _    => return Err(WalletError::InvalidWif),
+        _ => return Err(WalletError::InvalidWif),
     };
 
     let key_bytes: &[u8; 32] = decoded[1..33]
         .try_into()
         .map_err(|_| WalletError::InvalidWif)?;
-    let key = SecretKey::from_slice(key_bytes).map_err(|_| WalletError::InvalidWif)?;
+    let key = SecretKey::from_byte_array(*key_bytes).map_err(|_| WalletError::InvalidWif)?;
     Ok((key, network))
 }
 
@@ -59,7 +59,7 @@ mod tests {
     use super::*;
 
     fn sample_key() -> SecretKey {
-        SecretKey::from_slice(&[1u8; 32]).unwrap()
+        SecretKey::from_byte_array([1u8; 32]).unwrap()
     }
 
     #[test]

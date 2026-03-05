@@ -36,7 +36,7 @@ impl Network {
     pub fn consensus_params(&self) -> ConsensusParams {
         match self {
             Network::Mainnet => ConsensusParams {
-                bip16_time: 1333238400,   // 2012-04-01
+                bip16_time: 1333238400, // 2012-04-01
                 bip34_height: 227_931,
                 bip66_height: 363_725,
                 bip65_height: 388_381,
@@ -52,7 +52,7 @@ impl Network {
             },
             Network::Testnet4 => ConsensusParams {
                 bip16_time: 1329264000,
-                bip34_height: 211_11,
+                bip34_height: 21_111,
                 bip66_height: 330_776,
                 bip65_height: 581_885,
                 bip112_height: 0,
@@ -91,20 +91,20 @@ impl Network {
     /// P2P magic bytes for this network
     pub fn magic(&self) -> [u8; 4] {
         match self {
-            Network::Mainnet  => [0xf9, 0xbe, 0xb4, 0xd9],
+            Network::Mainnet => [0xf9, 0xbe, 0xb4, 0xd9],
             Network::Testnet4 => [0x1c, 0x16, 0x3f, 0x28],
-            Network::Regtest  => [0xfa, 0xbf, 0xb5, 0xda],
-            Network::Signet   => [0x0a, 0x03, 0xcf, 0x40],
+            Network::Regtest => [0xfa, 0xbf, 0xb5, 0xda],
+            Network::Signet => [0x0a, 0x03, 0xcf, 0x40],
         }
     }
 
     /// Default P2P port
     pub fn default_port(&self) -> u16 {
         match self {
-            Network::Mainnet  => 8333,
+            Network::Mainnet => 8333,
             Network::Testnet4 => 48333,
-            Network::Regtest  => 18444,
-            Network::Signet   => 38333,
+            Network::Regtest => 18444,
+            Network::Signet => 38333,
         }
     }
 
@@ -119,11 +119,9 @@ impl Network {
                 "seed.bitcoin.jonasschnelli.ch",
                 "seed.btc.petertodd.net",
             ],
-            Network::Testnet4 => &[
-                "seed.testnet4.bitcoin.sprovoost.nl",
-            ],
+            Network::Testnet4 => &["seed.testnet4.bitcoin.sprovoost.nl"],
             Network::Regtest => &[],
-            Network::Signet  => &["seed.signet.bitcoin.sprovoost.nl"],
+            Network::Signet => &["seed.signet.bitcoin.sprovoost.nl"],
         }
     }
 
@@ -133,7 +131,7 @@ impl Network {
             Network::Mainnet => "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
             Network::Testnet4 => "00000000da84f2bafbbc53dee25a72ae507ff4914b867c565be350b0da8bf043",
             Network::Regtest => "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206",
-            Network::Signet  => "00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6",
+            Network::Signet => "00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6",
         }
     }
 
@@ -147,8 +145,9 @@ impl Network {
                 version: 1,
                 prev_block: Hash256::ZERO,
                 merkle_root: Hash256::from_hex(
-                    "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"
-                ).unwrap_or(Hash256::ZERO),
+                    "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b",
+                )
+                .unwrap_or(Hash256::ZERO),
                 time: 1231006505,
                 bits: 0x1d00ffff,
                 nonce: 2083236893,
@@ -157,8 +156,9 @@ impl Network {
                 version: 1,
                 prev_block: Hash256::ZERO,
                 merkle_root: Hash256::from_hex(
-                    "7aa0a7ae1e223414cb807e40cd57e667b718e42aaf9306db9102fe28912b7b4e"
-                ).unwrap_or(Hash256::ZERO),
+                    "7aa0a7ae1e223414cb807e40cd57e667b718e42aaf9306db9102fe28912b7b4e",
+                )
+                .unwrap_or(Hash256::ZERO),
                 time: 1714777860,
                 bits: 0x1d00ffff,
                 nonce: 393743547,
@@ -167,8 +167,9 @@ impl Network {
                 version: 1,
                 prev_block: Hash256::ZERO,
                 merkle_root: Hash256::from_hex(
-                    "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"
-                ).unwrap_or(Hash256::ZERO),
+                    "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b",
+                )
+                .unwrap_or(Hash256::ZERO),
                 time: 1296688602,
                 bits: 0x207fffff,
                 nonce: 2,
@@ -177,8 +178,9 @@ impl Network {
                 version: 1,
                 prev_block: Hash256::ZERO,
                 merkle_root: Hash256::from_hex(
-                    "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"
-                ).unwrap_or(Hash256::ZERO),
+                    "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b",
+                )
+                .unwrap_or(Hash256::ZERO),
                 time: 1598918400,
                 bits: 0x1e0377ae,
                 nonce: 52613770,
@@ -197,18 +199,12 @@ impl Network {
             Network::Signet => Some(&[
                 0x51, // OP_1
                 0x21, // OP_PUSHBYTES_33
-                0x03, 0xad, 0x5e, 0x0e, 0xda, 0xd1, 0x8c, 0xb1,
-                0xf0, 0xfc, 0x0d, 0x28, 0xa3, 0xd4, 0xf1, 0xf3,
-                0xe4, 0x45, 0x64, 0x03, 0x37, 0x48, 0x9a, 0xbb,
-                0x10, 0x40, 0x4f, 0x2d, 0x1e, 0x08, 0x6b, 0xe4,
-                0x30,
-                0x21, // OP_PUSHBYTES_33
-                0x03, 0x59, 0xef, 0x50, 0x21, 0x96, 0x4f, 0xe2,
-                0x2d, 0x6f, 0x8e, 0x05, 0xb2, 0x46, 0x3c, 0x95,
-                0x40, 0xce, 0x96, 0x88, 0x3f, 0xe3, 0xb2, 0x78,
-                0x76, 0x0f, 0x04, 0x8f, 0x51, 0x89, 0xf2, 0xe6,
-                0xc4,
-                0x52, // OP_2
+                0x03, 0xad, 0x5e, 0x0e, 0xda, 0xd1, 0x8c, 0xb1, 0xf0, 0xfc, 0x0d, 0x28, 0xa3, 0xd4,
+                0xf1, 0xf3, 0xe4, 0x45, 0x64, 0x03, 0x37, 0x48, 0x9a, 0xbb, 0x10, 0x40, 0x4f, 0x2d,
+                0x1e, 0x08, 0x6b, 0xe4, 0x30, 0x21, // OP_PUSHBYTES_33
+                0x03, 0x59, 0xef, 0x50, 0x21, 0x96, 0x4f, 0xe2, 0x2d, 0x6f, 0x8e, 0x05, 0xb2, 0x46,
+                0x3c, 0x95, 0x40, 0xce, 0x96, 0x88, 0x3f, 0xe3, 0xb2, 0x78, 0x76, 0x0f, 0x04, 0x8f,
+                0x51, 0x89, 0xf2, 0xe6, 0xc4, 0x52, // OP_2
                 0xae, // OP_CHECKMULTISIG
             ]),
             _ => None,
@@ -219,10 +215,10 @@ impl Network {
 impl std::fmt::Display for Network {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Network::Mainnet  => write!(f, "mainnet"),
+            Network::Mainnet => write!(f, "mainnet"),
             Network::Testnet4 => write!(f, "testnet4"),
-            Network::Regtest  => write!(f, "regtest"),
-            Network::Signet   => write!(f, "signet"),
+            Network::Regtest => write!(f, "regtest"),
+            Network::Signet => write!(f, "signet"),
         }
     }
 }
@@ -231,10 +227,10 @@ impl std::str::FromStr for Network {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "mainnet" | "main"     => Ok(Network::Mainnet),
+            "mainnet" | "main" => Ok(Network::Mainnet),
             "testnet4" | "testnet" => Ok(Network::Testnet4),
-            "regtest"              => Ok(Network::Regtest),
-            "signet"               => Ok(Network::Signet),
+            "regtest" => Ok(Network::Regtest),
+            "signet" => Ok(Network::Signet),
             other => Err(format!("unknown network: {other}")),
         }
     }

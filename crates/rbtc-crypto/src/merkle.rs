@@ -14,7 +14,7 @@ pub fn merkle_root(txids: &[Hash256]) -> Option<Hash256> {
 
     while current_level.len() > 1 {
         // If odd number of elements, duplicate the last one
-        if current_level.len() % 2 != 0 {
+        if !current_level.len().is_multiple_of(2) {
             let last = *current_level.last().unwrap();
             current_level.push(last);
         }
@@ -39,12 +39,16 @@ pub fn merkle_branch(txids: &[Hash256], index: usize) -> Vec<Hash256> {
     let mut idx = index;
 
     while current_level.len() > 1 {
-        if current_level.len() % 2 != 0 {
+        if !current_level.len().is_multiple_of(2) {
             let last = *current_level.last().unwrap();
             current_level.push(last);
         }
 
-        let sibling = if idx % 2 == 0 { idx + 1 } else { idx - 1 };
+        let sibling = if idx.is_multiple_of(2) {
+            idx + 1
+        } else {
+            idx - 1
+        };
         branch.push(current_level[sibling]);
 
         let mut next_level = Vec::with_capacity(current_level.len() / 2);

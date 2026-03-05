@@ -1,15 +1,15 @@
-use rbtc_primitives::{
-    constants::{MAX_SCRIPT_ELEMENT_SIZE, MAX_SCRIPT_SIZE},
-    script::Script,
-    transaction::{Transaction, TxOut},
-};
 use rbtc_crypto::{
     digest::{hash160, sha256, tagged_hash},
     sig::{verify_ecdsa_with_policy, verify_schnorr},
     sighash::{sighash_segwit_v0_with_u32, sighash_taproot, SighashType},
 };
+use rbtc_primitives::{
+    constants::{MAX_SCRIPT_ELEMENT_SIZE, MAX_SCRIPT_SIZE},
+    script::Script,
+    transaction::{Transaction, TxOut},
+};
 
-use crate::engine::{ScriptEngine, ScriptError, ScriptFlags, SigVersion, is_compressed_pubkey};
+use crate::engine::{is_compressed_pubkey, ScriptEngine, ScriptError, ScriptFlags, SigVersion};
 
 fn push_compact_size(dst: &mut Vec<u8>, n: usize) {
     match n {
@@ -138,7 +138,7 @@ fn parse_witness_program(script: &Script) -> Option<(u8, Vec<u8>)> {
         _ => return None,
     };
     let program_len = bytes[1] as usize;
-    if program_len < 2 || program_len > 40 || program_len + 2 != bytes.len() {
+    if !(2..=40).contains(&program_len) || program_len + 2 != bytes.len() {
         return None;
     }
     Some((version, bytes[2..].to_vec()))
@@ -219,8 +219,13 @@ fn verify_p2wpkh(ctx: &ScriptContext<'_>, pubkey_hash: &[u8; 20]) -> Result<(), 
         sighash_u32,
     );
 
-    verify_ecdsa_with_policy(pubkey, &sig[..sig.len() - 1], &hash.0, ctx.flags.verify_dersig)
-        .map_err(|_| ScriptError::SigCheckFailed)
+    verify_ecdsa_with_policy(
+        pubkey,
+        &sig[..sig.len() - 1],
+        &hash.0,
+        ctx.flags.verify_dersig,
+    )
+    .map_err(|_| ScriptError::SigCheckFailed)
 }
 
 /// Verify P2WSH (native SegWit v0, 32-byte script hash)
@@ -242,8 +247,11 @@ fn verify_p2wsh(ctx: &ScriptContext<'_>, script_hash: &[u8; 32]) -> Result<(), S
     let witness_script = Script::from_bytes(witness_script_bytes.clone());
 
     // Stack is all witness items except the last (the script itself)
-    let mut stack: Vec<Vec<u8>> = witness[..witness.len()-1].to_vec();
-    if stack.iter().any(|item| item.len() > MAX_SCRIPT_ELEMENT_SIZE) {
+    let mut stack: Vec<Vec<u8>> = witness[..witness.len() - 1].to_vec();
+    if stack
+        .iter()
+        .any(|item| item.len() > MAX_SCRIPT_ELEMENT_SIZE)
+    {
         return Err(ScriptError::PushSizeExceeded);
     }
 
@@ -272,9 +280,15 @@ fn verify_p2tr(ctx: &ScriptContext<'_>, output_key: &[u8; 32]) -> Result<(), Scr
 
     // Annex detection: last witness item starts with 0x50
     let (witness_without_annex, annex) = if witness.len() >= 2
-        && witness.last().map(|a| a.first() == Some(&0x50)).unwrap_or(false)
+        && witness
+            .last()
+            .map(|a| a.first() == Some(&0x50))
+            .unwrap_or(false)
     {
-        (&witness[..witness.len()-1], Some(witness.last().unwrap().as_slice()))
+        (
+            &witness[..witness.len() - 1],
+            Some(witness.last().unwrap().as_slice()),
+        )
     } else {
         (witness.as_slice(), None)
     };
@@ -303,8 +317,8 @@ fn verify_p2tr(ctx: &ScriptContext<'_>, output_key: &[u8; 32]) -> Result<(), Scr
 
     // Script path spend: witness = [inputs...] [script] [control_block]
     let control_block = witness_without_annex.last().unwrap();
-    let script_bytes = &witness_without_annex[witness_without_annex.len()-2];
-    let _inputs = &witness_without_annex[..witness_without_annex.len()-2];
+    let script_bytes = &witness_without_annex[witness_without_annex.len() - 2];
+    let _inputs = &witness_without_annex[..witness_without_annex.len() - 2];
 
     if control_block.is_empty() {
         return Err(ScriptError::Taproot("empty control block".into()));
@@ -321,7 +335,9 @@ fn verify_p2tr(ctx: &ScriptContext<'_>, output_key: &[u8; 32]) -> Result<(), Scr
     let mut merkle_node = leaf_hash.0;
     let path = &control_block[33..];
     for chunk in path.chunks(32) {
-        if chunk.len() != 32 { return Err(ScriptError::Taproot("invalid control block length".into())); }
+        if chunk.len() != 32 {
+            return Err(ScriptError::Taproot("invalid control block length".into()));
+        }
         let chunk_arr: [u8; 32] = chunk.try_into().unwrap();
         let mut branch_data = [0u8; 64];
         // Lexicographic ordering
@@ -428,7 +444,9 @@ fn verify_p2sh(
 
     // scriptSig must only contain push ops (policy rule made consensus by BIP16)
     if !is_push_only(&input.script_sig) {
-        return Err(ScriptError::ScriptFailed("P2SH: scriptSig not push-only".into()));
+        return Err(ScriptError::ScriptFailed(
+            "P2SH: scriptSig not push-only".into(),
+        ));
     }
 
     let mut stack: Vec<Vec<u8>> = Vec::new();
@@ -446,7 +464,9 @@ fn verify_p2sh(
     // Verify the redeem script hash
     let redeem_script_bytes = stack.last().ok_or(ScriptError::StackUnderflow)?.clone();
     if hash160(&redeem_script_bytes).0 != *expected_hash {
-        return Err(ScriptError::ScriptFailed("P2SH: redeem script hash mismatch".into()));
+        return Err(ScriptError::ScriptFailed(
+            "P2SH: redeem script hash mismatch".into(),
+        ));
     }
 
     let redeem_script = Script::from_bytes(redeem_script_bytes);
@@ -510,25 +530,38 @@ fn is_push_only(script: &Script) -> bool {
     let bytes = script.as_bytes();
     let mut pc = 0;
     while pc < bytes.len() {
-        let op = bytes[pc]; pc += 1;
+        let op = bytes[pc];
+        pc += 1;
         match op {
             0x00..=0x60 => {
                 // push ops (OP_0 through OP_16)
                 match op {
-                    0x4c => { if pc < bytes.len() { let l = bytes[pc] as usize; pc += 1 + l; } }
+                    0x4c => {
+                        if pc < bytes.len() {
+                            let l = bytes[pc] as usize;
+                            pc += 1 + l;
+                        }
+                    }
                     0x4d => {
                         if pc + 1 < bytes.len() {
-                            let l = u16::from_le_bytes([bytes[pc], bytes[pc+1]]) as usize;
+                            let l = u16::from_le_bytes([bytes[pc], bytes[pc + 1]]) as usize;
                             pc += 2 + l;
                         }
                     }
                     0x4e => {
                         if pc + 3 < bytes.len() {
-                            let l = u32::from_le_bytes([bytes[pc], bytes[pc+1], bytes[pc+2], bytes[pc+3]]) as usize;
+                            let l = u32::from_le_bytes([
+                                bytes[pc],
+                                bytes[pc + 1],
+                                bytes[pc + 2],
+                                bytes[pc + 3],
+                            ]) as usize;
                             pc += 4 + l;
                         }
                     }
-                    0x01..=0x4b => { pc += op as usize; }
+                    0x01..=0x4b => {
+                        pc += op as usize;
+                    }
                     _ => {}
                 }
             }
@@ -541,11 +574,11 @@ fn is_push_only(script: &Script) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde::Deserialize;
-    use secp256k1::{Parity, Scalar, Secp256k1, XOnlyPublicKey};
     use rbtc_primitives::codec::Decodable;
     use rbtc_primitives::hash::Hash256;
     use rbtc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
+    use secp256k1::{Parity, Scalar, Secp256k1, XOnlyPublicKey};
+    use serde::Deserialize;
     use std::io::Cursor;
 
     fn decode_hex(s: &str) -> Vec<u8> {
@@ -573,7 +606,10 @@ mod tests {
         let tx = rbtc_primitives::transaction::Transaction {
             version: 1,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: Hash256::ZERO, vout: 0 },
+                previous_output: OutPoint {
+                    txid: Hash256::ZERO,
+                    vout: 0,
+                },
                 script_sig: Script::from_bytes(vec![0x51]),
                 sequence: 0xffffffff,
                 witness: vec![],
@@ -589,7 +625,10 @@ mod tests {
             tx: &tx,
             input_index: 0,
             prevout: &prevout,
-            flags: ScriptFlags { verify_cleanstack: false, ..ScriptFlags::default() },
+            flags: ScriptFlags {
+                verify_cleanstack: false,
+                ..ScriptFlags::default()
+            },
             all_prevouts: &[prevout.clone()],
         };
         assert!(verify_input(&ctx).is_ok());
@@ -600,7 +639,10 @@ mod tests {
         let tx = rbtc_primitives::transaction::Transaction {
             version: 1,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: Hash256::ZERO, vout: 0 },
+                previous_output: OutPoint {
+                    txid: Hash256::ZERO,
+                    vout: 0,
+                },
                 script_sig: Script::from_bytes(vec![0x51, 0x51]),
                 sequence: 0xffffffff,
                 witness: vec![],
@@ -621,7 +663,10 @@ mod tests {
         };
         let r = verify_input(&ctx);
         assert!(r.is_err());
-        assert!(matches!(r.unwrap_err(), crate::engine::ScriptError::CleanStack));
+        assert!(matches!(
+            r.unwrap_err(),
+            crate::engine::ScriptError::CleanStack
+        ));
     }
 
     #[test]
@@ -662,8 +707,10 @@ mod tests {
         let spend_hex = "01000000017047d51eb2671f08be60033dc273da6bf165aeae6f0d2b2c901ccedc592fc84e000000008b48304502210085807b5a614a1a2faf0209c7d95bf046393c19bbbdb2ccafd8cf1e87b906429e02204405c1b759e7a44bdfdd053198f5307f07830e54110bac58c36b40a19ad8cd3a044104bb8f7ebe793c32e49c8f2b929b09ca09ee2b4f121b32c9dfca121450bc2b6762c75ece327c6724c30bfd14430ab4803371185e9060721deff8bdfa7f2ce5d751ffffffff0100710200000000001976a9141e2f6af9a8564c0cb58b8662dc2c63e70bd8b35288ac00000000";
         let prev_hex = "0100000001329846caf4e3eb2c9b78a8b0de8b5ef3240acc690247c3a382376584957d01fd000000008b483045022100ef20a65ed276ac219f9ebda34708c1290090a7dffaed96527a077cd4594e97a7022053945a0d02d4c71f48349ec6a9ac7c42be5e9cecf5ee896ff5fd86d21277d4590141049df8f56621346ecd7a1672269e2f3fffc940974514a86c4c70293a3b35df40d75ee1486965a0a1372af7070d7b49fec555fd84feab29453125422184792e9014ffffffff0250340300000000001976a914a7a120d4358dd1e8bc9566329ead42c4f394ccfc88ac01921600000000001976a91414bdd0c36e430f0fd14643f7df6ce02b53874e3c88ac00000000";
 
-        let spend = Transaction::decode(&mut Cursor::new(decode_hex(spend_hex))).expect("decode spend");
-        let prev = Transaction::decode(&mut Cursor::new(decode_hex(prev_hex))).expect("decode prev");
+        let spend =
+            Transaction::decode(&mut Cursor::new(decode_hex(spend_hex))).expect("decode spend");
+        let prev =
+            Transaction::decode(&mut Cursor::new(decode_hex(prev_hex))).expect("decode prev");
         let prevout = prev.outputs[0].clone();
         let ctx = ScriptContext {
             tx: &spend,
@@ -685,7 +732,10 @@ mod tests {
         let tx = Transaction {
             version: 2,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: Hash256::ZERO, vout: 0 },
+                previous_output: OutPoint {
+                    txid: Hash256::ZERO,
+                    vout: 0,
+                },
                 script_sig: Script::from_bytes(vec![0x51]),
                 sequence: 0xffff_ffff,
                 witness: vec![vec![1], vec![2]],
@@ -705,10 +755,16 @@ mod tests {
             tx: &tx,
             input_index: 0,
             prevout: &prevout,
-            flags: ScriptFlags { verify_witness: true, ..ScriptFlags::default() },
+            flags: ScriptFlags {
+                verify_witness: true,
+                ..ScriptFlags::default()
+            },
             all_prevouts: &[prevout.clone()],
         };
-        assert!(matches!(verify_input(&ctx), Err(ScriptError::WitnessMalleated)));
+        assert!(matches!(
+            verify_input(&ctx),
+            Err(ScriptError::WitnessMalleated)
+        ));
     }
 
     #[test]
@@ -731,7 +787,10 @@ mod tests {
         let tx = Transaction {
             version: 2,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: Hash256::ZERO, vout: 0 },
+                previous_output: OutPoint {
+                    txid: Hash256::ZERO,
+                    vout: 0,
+                },
                 script_sig: Script::from_bytes(sig),
                 sequence: 0xffff_ffff,
                 witness: vec![vec![0x01], vec![0x02]],
@@ -743,10 +802,17 @@ mod tests {
             tx: &tx,
             input_index: 0,
             prevout: &prevout,
-            flags: ScriptFlags { verify_p2sh: true, verify_witness: true, ..ScriptFlags::default() },
+            flags: ScriptFlags {
+                verify_p2sh: true,
+                verify_witness: true,
+                ..ScriptFlags::default()
+            },
             all_prevouts: &[prevout.clone()],
         };
-        assert!(matches!(verify_input(&ctx), Err(ScriptError::WitnessMalleatedP2sh)));
+        assert!(matches!(
+            verify_input(&ctx),
+            Err(ScriptError::WitnessMalleatedP2sh)
+        ));
     }
 
     #[test]
@@ -754,7 +820,10 @@ mod tests {
         let tx = Transaction {
             version: 1,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: Hash256::ZERO, vout: 0 },
+                previous_output: OutPoint {
+                    txid: Hash256::ZERO,
+                    vout: 0,
+                },
                 script_sig: Script::from_bytes(vec![0x51]),
                 sequence: 0xffff_ffff,
                 witness: vec![vec![0x01]],
@@ -762,15 +831,24 @@ mod tests {
             outputs: vec![],
             lock_time: 0,
         };
-        let prevout = TxOut { value: 1000, script_pubkey: Script::from_bytes(vec![0x51]) };
+        let prevout = TxOut {
+            value: 1000,
+            script_pubkey: Script::from_bytes(vec![0x51]),
+        };
         let ctx = ScriptContext {
             tx: &tx,
             input_index: 0,
             prevout: &prevout,
-            flags: ScriptFlags { verify_witness: true, ..ScriptFlags::default() },
+            flags: ScriptFlags {
+                verify_witness: true,
+                ..ScriptFlags::default()
+            },
             all_prevouts: &[prevout.clone()],
         };
-        assert!(matches!(verify_input(&ctx), Err(ScriptError::WitnessUnexpected)));
+        assert!(matches!(
+            verify_input(&ctx),
+            Err(ScriptError::WitnessUnexpected)
+        ));
     }
 
     #[test]
@@ -778,11 +856,17 @@ mod tests {
         // OP_2 <32-byte-program>, unknown version: consensus-valid by forward-compat.
         let mut spk = vec![0x52, 0x20];
         spk.extend_from_slice(&[0x33; 32]);
-        let prevout = TxOut { value: 1000, script_pubkey: Script::from_bytes(spk) };
+        let prevout = TxOut {
+            value: 1000,
+            script_pubkey: Script::from_bytes(spk),
+        };
         let tx = Transaction {
             version: 2,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: Hash256::ZERO, vout: 0 },
+                previous_output: OutPoint {
+                    txid: Hash256::ZERO,
+                    vout: 0,
+                },
                 script_sig: Script::new(),
                 sequence: 0xffff_ffff,
                 witness: vec![vec![1, 2, 3]],
@@ -794,7 +878,10 @@ mod tests {
             tx: &tx,
             input_index: 0,
             prevout: &prevout,
-            flags: ScriptFlags { verify_witness: true, ..ScriptFlags::default() },
+            flags: ScriptFlags {
+                verify_witness: true,
+                ..ScriptFlags::default()
+            },
             all_prevouts: &[prevout.clone()],
         };
         assert!(verify_input(&ctx).is_ok());
@@ -812,7 +899,10 @@ mod tests {
         let tx = Transaction {
             version: 2,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: Hash256::ZERO, vout: 0 },
+                previous_output: OutPoint {
+                    txid: Hash256::ZERO,
+                    vout: 0,
+                },
                 script_sig: Script::new(),
                 sequence: 0xffff_ffff,
                 witness: vec![witness_script.clone()],
@@ -824,7 +914,10 @@ mod tests {
             tx: &tx,
             input_index: 0,
             prevout: &prevout,
-            flags: ScriptFlags { verify_witness: true, ..ScriptFlags::default() },
+            flags: ScriptFlags {
+                verify_witness: true,
+                ..ScriptFlags::default()
+            },
             all_prevouts: &[prevout.clone()],
         };
         assert!(matches!(verify_input(&ctx), Err(ScriptError::CleanStack)));
@@ -842,7 +935,10 @@ mod tests {
         let tx = Transaction {
             version: 2,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: Hash256::ZERO, vout: 0 },
+                previous_output: OutPoint {
+                    txid: Hash256::ZERO,
+                    vout: 0,
+                },
                 script_sig: Script::new(),
                 sequence: 0xffff_ffff,
                 witness: vec![],
@@ -854,10 +950,16 @@ mod tests {
             tx: &tx,
             input_index: 0,
             prevout: &prevout,
-            flags: ScriptFlags { verify_witness: true, ..ScriptFlags::default() },
+            flags: ScriptFlags {
+                verify_witness: true,
+                ..ScriptFlags::default()
+            },
             all_prevouts: &[prevout.clone()],
         };
-        assert!(matches!(verify_input(&ctx), Err(ScriptError::WitnessProgramWitnessEmpty)));
+        assert!(matches!(
+            verify_input(&ctx),
+            Err(ScriptError::WitnessProgramWitnessEmpty)
+        ));
     }
 
     #[test]
@@ -872,10 +974,16 @@ mod tests {
         let tx = Transaction {
             version: 2,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: Hash256::ZERO, vout: 0 },
+                previous_output: OutPoint {
+                    txid: Hash256::ZERO,
+                    vout: 0,
+                },
                 script_sig: Script::new(),
                 sequence: 0xffff_ffff,
-                witness: vec![vec![0u8; MAX_SCRIPT_ELEMENT_SIZE + 1], witness_script.clone()],
+                witness: vec![
+                    vec![0u8; MAX_SCRIPT_ELEMENT_SIZE + 1],
+                    witness_script.clone(),
+                ],
             }],
             outputs: vec![],
             lock_time: 0,
@@ -884,10 +992,16 @@ mod tests {
             tx: &tx,
             input_index: 0,
             prevout: &prevout,
-            flags: ScriptFlags { verify_witness: true, ..ScriptFlags::default() },
+            flags: ScriptFlags {
+                verify_witness: true,
+                ..ScriptFlags::default()
+            },
             all_prevouts: &[prevout.clone()],
         };
-        assert!(matches!(verify_input(&ctx), Err(ScriptError::PushSizeExceeded)));
+        assert!(matches!(
+            verify_input(&ctx),
+            Err(ScriptError::PushSizeExceeded)
+        ));
     }
 
     #[test]
@@ -906,7 +1020,10 @@ mod tests {
             Transaction {
                 version: 2,
                 inputs: vec![TxIn {
-                    previous_output: OutPoint { txid: Hash256::ZERO, vout: 0 },
+                    previous_output: OutPoint {
+                        txid: Hash256::ZERO,
+                        vout: 0,
+                    },
                     script_sig,
                     sequence: 0xffff_ffff,
                     witness,
@@ -930,8 +1047,13 @@ mod tests {
         }
 
         let fixture_text = include_str!("../tests/fixtures/segwit_vectors.json");
-        let cases: Vec<FixtureCase> = serde_json::from_str(fixture_text).expect("parse segwit fixture");
-        let flags = ScriptFlags { verify_p2sh: true, verify_witness: true, ..ScriptFlags::default() };
+        let cases: Vec<FixtureCase> =
+            serde_json::from_str(fixture_text).expect("parse segwit fixture");
+        let flags = ScriptFlags {
+            verify_p2sh: true,
+            verify_witness: true,
+            ..ScriptFlags::default()
+        };
 
         for case in cases {
             let prevout = TxOut {
@@ -991,7 +1113,8 @@ mod tests {
             tamper_control_block: bool,
         ) -> (TxOut, Vec<Vec<u8>>) {
             let internal_key_bytes = decode_hex(internal_key_hex);
-            let internal_arr: [u8; 32] = internal_key_bytes.try_into().expect("internal key length");
+            let internal_arr: [u8; 32] =
+                internal_key_bytes.try_into().expect("internal key length");
             let tapscript = decode_hex(tapscript_hex);
             let leaf_version = 0xc0u8;
             let leaf = tapleaf_hash(&tapscript, leaf_version);
@@ -1020,7 +1143,8 @@ mod tests {
                 script_pubkey: Script::from_bytes(spk),
             };
 
-            let mut witness: Vec<Vec<u8>> = witness_stack_hex.iter().map(|h| decode_hex(h)).collect();
+            let mut witness: Vec<Vec<u8>> =
+                witness_stack_hex.iter().map(|h| decode_hex(h)).collect();
             witness.push(tapscript);
             witness.push(control_block);
             if let Some(a) = annex_hex {
@@ -1030,7 +1154,8 @@ mod tests {
         }
 
         let fixture_text = include_str!("../tests/fixtures/taproot_vectors.json");
-        let cases: Vec<FixtureCase> = serde_json::from_str(fixture_text).expect("parse taproot fixture");
+        let cases: Vec<FixtureCase> =
+            serde_json::from_str(fixture_text).expect("parse taproot fixture");
         let flags = ScriptFlags {
             verify_p2sh: true,
             verify_dersig: true,
@@ -1045,7 +1170,8 @@ mod tests {
         for case in cases {
             let (prevout, witness) = match case.mode.as_str() {
                 "key_path" => {
-                    let output_key = decode_hex(case.output_key_hex.as_deref().expect("output key"));
+                    let output_key =
+                        decode_hex(case.output_key_hex.as_deref().expect("output key"));
                     let mut spk = vec![0x51, 0x20];
                     spk.extend_from_slice(&output_key);
                     let prevout = TxOut {
@@ -1068,7 +1194,10 @@ mod tests {
             let tx = Transaction {
                 version: 2,
                 inputs: vec![TxIn {
-                    previous_output: OutPoint { txid: Hash256::ZERO, vout: 0 },
+                    previous_output: OutPoint {
+                        txid: Hash256::ZERO,
+                        vout: 0,
+                    },
                     script_sig: Script::new(),
                     sequence: 0xffff_ffff,
                     witness,
@@ -1089,11 +1218,21 @@ mod tests {
                 "ok" => assert!(verify_input(&ctx).is_ok(), "case failed: {}", case.name),
                 "TaprootInvalidSighashType" => {
                     let got = verify_input(&ctx).expect_err(&case.name);
-                    assert_eq!(got, ScriptError::TaprootInvalidSighashType, "case: {}", case.name);
+                    assert_eq!(
+                        got,
+                        ScriptError::TaprootInvalidSighashType,
+                        "case: {}",
+                        case.name
+                    );
                 }
                 "TaprootAny" => {
                     let got = verify_input(&ctx).expect_err(&case.name);
-                    assert!(matches!(got, ScriptError::Taproot(_)), "case {} got {:?}", case.name, got);
+                    assert!(
+                        matches!(got, ScriptError::Taproot(_)),
+                        "case {} got {:?}",
+                        case.name,
+                        got
+                    );
                 }
                 other => panic!("unknown expected value in taproot fixture: {other}"),
             }
@@ -1104,10 +1243,13 @@ mod tests {
     fn verify_input_p2sh_p2wsh_multisig_mainnet_481831() {
         // Real mainnet case from block 481831 that must pass under SegWit v0 rules.
         let spend_hex = "020000000001019bbf31fbb9a42002e74df46681d3640d38a226e6e6fbd952c52b39536b37b796000000002322002072ea6fe4c9b3300191453285354759756372db15b2810502adfda44dba6712ebffffffff01f07e0e00000000001976a9148387657820562980220f07eab2f69ba2a5fb9f0788ac040047304402204ca5c77afba63786071312608ba751ffa56dfdc9e0abdcdbfe3cddacddae9baf0220225ec69ce8e65e95a052a7a48d17a89085b095a601e29dd3a2ce960f40a222d1014830450221008d94de6d3477cbbb7086e566aae224287dd4c7d773f9c0f24f63eed257041837022011df8307187f70ff74a1650fe9057ca06d6ab2928dc4d1c66643c5890fa88f1101475221027d37fabfdae7f06bd97cc0c635b1f24d7607c98bf9baf8d09dcfa5722e81772821039edd051cf2d2a1e06efb7ada59f447f3ab04825eed43b9f248fc569681fc25ec52ae00000000";
-        let spend = Transaction::decode(&mut Cursor::new(decode_hex(spend_hex))).expect("decode spend");
+        let spend =
+            Transaction::decode(&mut Cursor::new(decode_hex(spend_hex))).expect("decode spend");
         let prevout = TxOut {
             value: 1_000_000,
-            script_pubkey: Script::from_bytes(decode_hex("a9144775f70c3d367dd339b920da8ad41b6cef7bf59487")),
+            script_pubkey: Script::from_bytes(decode_hex(
+                "a9144775f70c3d367dd339b920da8ad41b6cef7bf59487",
+            )),
         };
         let ctx = ScriptContext {
             tx: &spend,
@@ -1132,10 +1274,13 @@ mod tests {
         // Real mainnet case from block 508011:
         // witness signature uses sighash byte 0x65 (non-standard but consensus-valid).
         let spend_hex = "01000000000101447e208868dbc8e930fc6eba4fe0d0abfe0d9dc2db4ba70542e02467f00205c90100000017160014e20c60563894174c253ae937ba59ace46ab9ffb1ffffffff010845f305000000001976a91414ac7fc2a782bde1555b753d75ff4ed146683cae88ac024730440220120003c32cca7eabf07bad5c31125accc09d13c39546fa93833b8b69a2c72ed7022057083dc2ed348156874b8af859ac7a9c16e5ce39353f3f1ac2226b49c2b319af652103f73386ac6e567581f8d0611ad7a8536c3cd0253e535f6fc4707514b2ab54198700000000";
-        let spend = Transaction::decode(&mut Cursor::new(decode_hex(spend_hex))).expect("decode spend");
+        let spend =
+            Transaction::decode(&mut Cursor::new(decode_hex(spend_hex))).expect("decode spend");
         let prevout = TxOut {
             value: 99_830_000,
-            script_pubkey: Script::from_bytes(decode_hex("a914e93f9e95f6d5cb1736a94de992d0d18819072fa587")),
+            script_pubkey: Script::from_bytes(decode_hex(
+                "a914e93f9e95f6d5cb1736a94de992d0d18819072fa587",
+            )),
         };
         let ctx = ScriptContext {
             tx: &spend,
@@ -1162,8 +1307,10 @@ mod tests {
         let spend_hex = "0100000002f9cbafc519425637ba4227f8d0a0b7160b4e65168193d5af39747891de98b5b5000000006b4830450221008dd619c563e527c47d9bd53534a770b102e40faa87f61433580e04e271ef2f960220029886434e18122b53d5decd25f1f4acb2480659fea20aabd856987ba3c3907e0121022b78b756e2258af13779c1a1f37ea6800259716ca4b7f0b87610e0bf3ab52a01ffffffff42e7988254800876b69f24676b3e0205b77be476512ca4d970707dd5c60598ab00000000fd260100483045022015bd0139bcccf990a6af6ec5c1c52ed8222e03a0d51c334df139968525d2fcd20221009f9efe325476eb64c3958e4713e9eefe49bf1d820ed58d2112721b134e2a1a53034930460221008431bdfa72bc67f9d41fe72e94c88fb8f359ffa30b33c72c121c5a877d922e1002210089ef5fc22dd8bfc6bf9ffdb01a9862d27687d424d1fefbab9e9c7176844a187a014c9052483045022015bd0139bcccf990a6af6ec5c1c52ed8222e03a0d51c334df139968525d2fcd20221009f9efe325476eb64c3958e4713e9eefe49bf1d820ed58d2112721b134e2a1a5303210378d430274f8c5ec1321338151e9f27f4c676a008bdf8638d07c0b6be9ab35c71210378d430274f8c5ec1321338151e9f27f4c676a008bdf8638d07c0b6be9ab35c7153aeffffffff01a08601000000000017a914d8dacdadb7462ae15cd906f1878706d0da8660e68700000000";
         let prev_hex = "01000000016caf76a1d325b9645d8e52f1ef2d33af3d8787531268cfb6b8f43cef0aae05200f0000006b483045022100d67682b1279ac29ce8d60ef3e672f6b6d097df6307398745891a068814e9b48302203c41a2ea49541b8be3baa8d9ae1c74f3afe57c51c964a0f541f731c9b1763f71012103fee179251dff4b8dda512c0b0a515be9d79657328d34009a63f6dc320945c4a4ffffffff02a08601000000000017a914d8dacdadb7462ae15cd906f1878706d0da8660e687e0fd1c00000000001976a914a61f26bca505466527129f75909c06c6d778887088ac00000000";
 
-        let spend = Transaction::decode(&mut Cursor::new(decode_hex(spend_hex))).expect("decode spend");
-        let prev = Transaction::decode(&mut Cursor::new(decode_hex(prev_hex))).expect("decode prev");
+        let spend =
+            Transaction::decode(&mut Cursor::new(decode_hex(spend_hex))).expect("decode spend");
+        let prev =
+            Transaction::decode(&mut Cursor::new(decode_hex(prev_hex))).expect("decode prev");
         let prevout = prev.outputs[0].clone();
         let all_prevouts = vec![prevout.clone(), prev.outputs[1].clone()];
         let ctx = ScriptContext {
@@ -1187,8 +1334,10 @@ mod tests {
         let spend_hex = "01000000019cc2a6fbf645a81cc42317673ca33d500059f34080d64f333bf72379420687b70000000008000051005102ae91ffffffff0150c300000000000002ae9100000000";
         let prev_hex = "01000000023904cd3644c6d440a6d752c95f07737c46f5e70fb6fbb28f00aa17e281868b7b010000006b483045022100ac455750dc430957942e9766f88aecfe6eb17d4244eb2cb50ca4a25336fd4dd702202640cc943f4fe8f2166b03005bed3bd024f4762767322b60bf471ecf8e3f3ede012102348d4cad0084f88c4c02bdc1bf90cc6c0893a0b97af76ef644daf72e6786b4afffffffffb84057ae61ad22ac17c02635ee1b37d170ef785847ec28efe848a5607331568e020000006b483045022100d7fee595d7a1f9969767098f8582e7a563f08437f461f0a25395f35c1833839302205f565ab12d343478471a78669c4c3476714032f7758a781d7deab19f160784e0012102ea69c47753d8e0228c0c426294a6b4dc926aebbeb8561248d40be37d257d94e0ffffffff01a08601000000000017a91438430c4d1c214bf11d2c0c3dea8e5e9a5d11aab08700000000";
 
-        let spend = Transaction::decode(&mut Cursor::new(decode_hex(spend_hex))).expect("decode spend");
-        let prev = Transaction::decode(&mut Cursor::new(decode_hex(prev_hex))).expect("decode prev");
+        let spend =
+            Transaction::decode(&mut Cursor::new(decode_hex(spend_hex))).expect("decode spend");
+        let prev =
+            Transaction::decode(&mut Cursor::new(decode_hex(prev_hex))).expect("decode prev");
         let prevout = prev.outputs[0].clone();
         let all_prevouts = vec![prevout.clone()];
         let ctx = ScriptContext {
@@ -1230,37 +1379,55 @@ pub fn check_push_only(script: &Script) -> Result<(), ScriptError> {
         let op = bytes[pc];
         pc += 1;
         match op {
-            0x00 => {}         // OP_0 – OK
-            0x01..=0x4b => {   // direct push
+            0x00 => {} // OP_0 – OK
+            0x01..=0x4b => {
+                // direct push
                 let len = op as usize;
                 if pc + len > bytes.len() {
                     return Err(ScriptError::PushOnly);
                 }
                 pc += len;
             }
-            0x4c => {          // OP_PUSHDATA1
-                if pc >= bytes.len() { return Err(ScriptError::PushOnly); }
+            0x4c => {
+                // OP_PUSHDATA1
+                if pc >= bytes.len() {
+                    return Err(ScriptError::PushOnly);
+                }
                 let len = bytes[pc] as usize;
                 pc += 1;
-                if pc + len > bytes.len() { return Err(ScriptError::PushOnly); }
+                if pc + len > bytes.len() {
+                    return Err(ScriptError::PushOnly);
+                }
                 pc += len;
             }
-            0x4d => {          // OP_PUSHDATA2
-                if pc + 1 >= bytes.len() { return Err(ScriptError::PushOnly); }
-                let len = u16::from_le_bytes([bytes[pc], bytes[pc+1]]) as usize;
+            0x4d => {
+                // OP_PUSHDATA2
+                if pc + 1 >= bytes.len() {
+                    return Err(ScriptError::PushOnly);
+                }
+                let len = u16::from_le_bytes([bytes[pc], bytes[pc + 1]]) as usize;
                 pc += 2;
-                if pc + len > bytes.len() { return Err(ScriptError::PushOnly); }
+                if pc + len > bytes.len() {
+                    return Err(ScriptError::PushOnly);
+                }
                 pc += len;
             }
-            0x4e => {          // OP_PUSHDATA4
-                if pc + 3 >= bytes.len() { return Err(ScriptError::PushOnly); }
-                let len = u32::from_le_bytes([bytes[pc], bytes[pc+1], bytes[pc+2], bytes[pc+3]]) as usize;
+            0x4e => {
+                // OP_PUSHDATA4
+                if pc + 3 >= bytes.len() {
+                    return Err(ScriptError::PushOnly);
+                }
+                let len =
+                    u32::from_le_bytes([bytes[pc], bytes[pc + 1], bytes[pc + 2], bytes[pc + 3]])
+                        as usize;
                 pc += 4;
-                if pc + len > bytes.len() { return Err(ScriptError::PushOnly); }
+                if pc + len > bytes.len() {
+                    return Err(ScriptError::PushOnly);
+                }
                 pc += len;
             }
-            0x4f => {}         // OP_1NEGATE – OK
-            0x51..=0x60 => {}  // OP_1–OP_16 – OK
+            0x4f => {}        // OP_1NEGATE – OK
+            0x51..=0x60 => {} // OP_1–OP_16 – OK
             _ => return Err(ScriptError::PushOnly),
         }
     }

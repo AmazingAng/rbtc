@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Write-back UTXO cache with configurable hot-cache size and RocksDB fallback.
 //!
 //! # Architecture
@@ -102,7 +103,10 @@ impl CachedUtxoSet {
                 }
             }
             for (vout, txout) in tx.outputs.iter().enumerate() {
-                let outpoint = OutPoint { txid: *txid, vout: vout as u32 };
+                let outpoint = OutPoint {
+                    txid: *txid,
+                    vout: vout as u32,
+                };
                 self.dirty.insert(
                     outpoint,
                     Some(Utxo {
@@ -170,10 +174,18 @@ impl CachedUtxoSet {
         txs: &[Transaction],
         undo: Vec<Vec<(OutPoint, Utxo)>>,
     ) {
-        for ((txid, tx), spent) in txids.iter().zip(txs.iter()).rev().zip(undo.into_iter().rev()) {
+        for ((txid, tx), spent) in txids
+            .iter()
+            .zip(txs.iter())
+            .rev()
+            .zip(undo.into_iter().rev())
+        {
             // Remove outputs created by this transaction.
             for vout in 0..tx.outputs.len() {
-                let outpoint = OutPoint { txid: *txid, vout: vout as u32 };
+                let outpoint = OutPoint {
+                    txid: *txid,
+                    vout: vout as u32,
+                };
                 self.dirty.insert(outpoint.clone(), None);
                 if self.hot.remove(&outpoint).is_some() {
                     self.hot_bytes = self.hot_bytes.saturating_sub(BYTES_PER_UTXO);
@@ -347,7 +359,11 @@ impl UtxoLookup for CachedUtxoSet {
         let rows = match self.db.iter_cf_prefix(rbtc_storage::db::CF_UTXO, &txid.0) {
             Ok(rows) => rows,
             Err(e) => {
-                panic!("fatal UTXO DB prefix-iterate error for txid {}: {}", txid.to_hex(), e);
+                panic!(
+                    "fatal UTXO DB prefix-iterate error for txid {}: {}",
+                    txid.to_hex(),
+                    e
+                );
             }
         };
         for (k, _) in rows {
@@ -401,18 +417,28 @@ fn utxo_to_stored(u: &Utxo) -> StoredUtxo {
 mod tests {
     use super::*;
     use rbtc_consensus::UtxoLookup;
-    use rbtc_primitives::{hash::Hash256, script::Script, transaction::{OutPoint, TxOut}};
+    use rbtc_primitives::{
+        hash::Hash256,
+        script::Script,
+        transaction::{OutPoint, TxOut},
+    };
 
     fn make_utxo(value: u64) -> Utxo {
         Utxo {
-            txout: TxOut { value, script_pubkey: Script::new() },
+            txout: TxOut {
+                value,
+                script_pubkey: Script::new(),
+            },
             is_coinbase: false,
             height: 1,
         }
     }
 
     fn dummy_outpoint(n: u8) -> OutPoint {
-        OutPoint { txid: Hash256([n; 32]), vout: 0 }
+        OutPoint {
+            txid: Hash256([n; 32]),
+            vout: 0,
+        }
     }
 
     #[test]
@@ -517,7 +543,10 @@ mod tests {
                 sequence: 0xffff_ffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 1, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: 1,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         };
 
@@ -527,5 +556,4 @@ mod tests {
             .expect_err("missing prevout must fail");
         assert!(err.contains("invariant violation"));
     }
-
 }

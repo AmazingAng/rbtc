@@ -17,7 +17,7 @@ use tokio::{
 };
 
 use rbtc_net::message::{
-    GetBlocksMessage, Inventory, InvType, Message, NetworkMessage, VersionMessage,
+    GetBlocksMessage, InvType, Inventory, Message, NetworkMessage, VersionMessage,
 };
 use rbtc_primitives::{hash::Hash256, network::Network};
 
@@ -61,9 +61,7 @@ async fn connect_and_handshake(
                     got_version = true;
                     // Reply with verack
                     write_half
-                        .write_all(
-                            &Message::new(magic, NetworkMessage::Verack).encode_to_bytes(),
-                        )
+                        .write_all(&Message::new(magic, NetworkMessage::Verack).encode_to_bytes())
                         .await?;
                 }
                 NetworkMessage::Verack => {
@@ -76,9 +74,7 @@ async fn connect_and_handshake(
     })
     .await??;
 
-    println!(
-        "[handshake] peer height={peer_height} ua={peer_ua}"
-    );
+    println!("[handshake] peer height={peer_height} ua={peer_ua}");
     Ok((reader, write_half, peer_height))
 }
 
@@ -122,9 +118,7 @@ async fn test_handshake_with_bitcoin_core() {
                     peer_ua = v.user_agent.clone();
                     got_version = true;
                     write_half
-                        .write_all(
-                            &Message::new(magic, NetworkMessage::Verack).encode_to_bytes(),
-                        )
+                        .write_all(&Message::new(magic, NetworkMessage::Verack).encode_to_bytes())
                         .await
                         .unwrap();
                 }
@@ -200,9 +194,7 @@ async fn test_wtxidrelay_and_sendaddrv2_handshake() {
                         .unwrap();
                     // Send verack
                     write_half
-                        .write_all(
-                            &Message::new(magic, NetworkMessage::Verack).encode_to_bytes(),
-                        )
+                        .write_all(&Message::new(magic, NetworkMessage::Verack).encode_to_bytes())
                         .await
                         .unwrap();
                 }
@@ -222,9 +214,7 @@ async fn test_wtxidrelay_and_sendaddrv2_handshake() {
     .await
     .expect("handshake timed out");
 
-    println!(
-        "[bip339/bip155] peer wtxidrelay={peer_wtxidrelay} sendaddrv2={peer_sendaddrv2}"
-    );
+    println!("[bip339/bip155] peer wtxidrelay={peer_wtxidrelay} sendaddrv2={peer_sendaddrv2}");
 
     // Modern Bitcoin Core (v22+) sends both signals
     assert!(peer_wtxidrelay, "peer did not send wtxidrelay");
@@ -276,14 +266,14 @@ async fn test_ping_pong() {
 /// `BlockHeader` (80 bytes, correct version field, etc.).
 #[tokio::test]
 async fn test_getheaders_from_genesis() {
-    let (mut reader, mut writer, peer_height) =
-        match connect_and_handshake(Network::Regtest).await {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("skipping: {e}");
-                return;
-            }
-        };
+    let (mut reader, mut writer, peer_height) = match connect_and_handshake(Network::Regtest).await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("skipping: {e}");
+            return;
+        }
+    };
 
     let magic = Network::Regtest.magic();
 
@@ -294,9 +284,7 @@ async fn test_getheaders_from_genesis() {
     let get_headers = GetBlocksMessage::new(vec![genesis]);
 
     writer
-        .write_all(
-            &Message::new(magic, NetworkMessage::GetHeaders(get_headers)).encode_to_bytes(),
-        )
+        .write_all(&Message::new(magic, NetworkMessage::GetHeaders(get_headers)).encode_to_bytes())
         .await
         .unwrap();
 
@@ -354,7 +342,10 @@ async fn test_getdata_genesis_block() {
         Hash256::from_hex("0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206")
             .unwrap();
 
-    let inv = vec![Inventory { inv_type: InvType::WitnessBlock, hash: genesis }];
+    let inv = vec![Inventory {
+        inv_type: InvType::WitnessBlock,
+        hash: genesis,
+    }];
 
     writer
         .write_all(&Message::new(magic, NetworkMessage::GetData(inv)).encode_to_bytes())
@@ -385,7 +376,10 @@ async fn test_getdata_genesis_block() {
         block.transactions[0].is_coinbase(),
         "genesis tx[0] should be coinbase"
     );
-    assert_eq!(block.header.version, 1, "genesis header version should be 1");
+    assert_eq!(
+        block.header.version, 1,
+        "genesis header version should be 1"
+    );
 }
 
 // ── Test 5: headers-first sync of first N blocks ─────────────────────────────
@@ -394,14 +388,14 @@ async fn test_getdata_genesis_block() {
 /// verify basic properties (version, tx count ≥ 1, coinbase present).
 #[tokio::test]
 async fn test_sync_first_10_blocks() {
-    let (mut reader, mut writer, peer_height) =
-        match connect_and_handshake(Network::Regtest).await {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("skipping: {e}");
-                return;
-            }
-        };
+    let (mut reader, mut writer, peer_height) = match connect_and_handshake(Network::Regtest).await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("skipping: {e}");
+            return;
+        }
+    };
 
     if peer_height < 10 {
         eprintln!("peer only has {peer_height} blocks; need ≥10 -- skipping");
@@ -459,7 +453,10 @@ async fn test_sync_first_10_blocks() {
 
     let inv: Vec<Inventory> = wanted
         .iter()
-        .map(|h| Inventory { inv_type: InvType::WitnessBlock, hash: *h })
+        .map(|h| Inventory {
+            inv_type: InvType::WitnessBlock,
+            hash: *h,
+        })
         .collect();
 
     writer
@@ -482,7 +479,11 @@ async fn test_sync_first_10_blocks() {
                 println!(
                     "  block #{received}: txns={}  coinbase_value={}",
                     block.transactions.len(),
-                    block.transactions[0].outputs.iter().map(|o| o.value).sum::<u64>()
+                    block.transactions[0]
+                        .outputs
+                        .iter()
+                        .map(|o| o.value)
+                        .sum::<u64>()
                 );
             }
         }
@@ -502,14 +503,14 @@ async fn test_sync_first_10_blocks() {
 /// implementation matches Core's.
 #[tokio::test]
 async fn test_merkle_root_matches_header() {
-    let (mut reader, mut writer, peer_height) =
-        match connect_and_handshake(Network::Regtest).await {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("skipping: {e}");
-                return;
-            }
-        };
+    let (mut reader, mut writer, peer_height) = match connect_and_handshake(Network::Regtest).await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("skipping: {e}");
+            return;
+        }
+    };
 
     if peer_height < 5 {
         eprintln!("peer only has {peer_height} blocks; need ≥5 -- skipping");
@@ -565,7 +566,10 @@ async fn test_merkle_root_matches_header() {
 
     let inv: Vec<Inventory> = wanted
         .iter()
-        .map(|h| Inventory { inv_type: InvType::WitnessBlock, hash: *h })
+        .map(|h| Inventory {
+            inv_type: InvType::WitnessBlock,
+            hash: *h,
+        })
         .collect();
 
     writer
@@ -579,11 +583,15 @@ async fn test_merkle_root_matches_header() {
             let msg = Message::read_from(&mut reader, &magic).await.unwrap();
             if let NetworkMessage::Block(block) = msg.payload {
                 // Compute merkle root from transactions
-                let txids: Vec<Hash256> = block.transactions.iter().map(|tx| {
-                    let mut buf = Vec::new();
-                    tx.encode_legacy(&mut buf).ok();
-                    rbtc_crypto::sha256d(&buf)
-                }).collect();
+                let txids: Vec<Hash256> = block
+                    .transactions
+                    .iter()
+                    .map(|tx| {
+                        let mut buf = Vec::new();
+                        tx.encode_legacy(&mut buf).ok();
+                        rbtc_crypto::sha256d(&buf)
+                    })
+                    .collect();
 
                 let computed_root = rbtc_crypto::merkle_root(&txids).unwrap_or(Hash256::ZERO);
                 assert_eq!(
@@ -594,7 +602,8 @@ async fn test_merkle_root_matches_header() {
                 // Also verify no duplicate txids (CVE-2012-2459)
                 let unique: std::collections::HashSet<Hash256> = txids.iter().copied().collect();
                 assert_eq!(
-                    unique.len(), txids.len(),
+                    unique.len(),
+                    txids.len(),
                     "duplicate txid found in block #{verified}"
                 );
 
@@ -619,14 +628,14 @@ async fn test_merkle_root_matches_header() {
 /// pattern (bit 29 set for version-bits signaling blocks on regtest).
 #[tokio::test]
 async fn test_block_version_bits() {
-    let (mut reader, mut writer, peer_height) =
-        match connect_and_handshake(Network::Regtest).await {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("skipping: {e}");
-                return;
-            }
-        };
+    let (mut reader, mut writer, peer_height) = match connect_and_handshake(Network::Regtest).await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("skipping: {e}");
+            return;
+        }
+    };
 
     if peer_height < 1 {
         eprintln!("peer has no blocks -- skipping");
@@ -665,7 +674,11 @@ async fn test_block_version_bits() {
 
     for (i, hdr) in headers.headers.iter().enumerate() {
         // Block version should be > 0 (typical regtest uses version 0x20000000)
-        assert!(hdr.version > 0, "header[{i}] has non-positive version: {}", hdr.version);
+        assert!(
+            hdr.version > 0,
+            "header[{i}] has non-positive version: {}",
+            hdr.version
+        );
 
         // Modern Bitcoin Core regtest uses BIP9 version bits (bit 29 set)
         // The top bits pattern is 0x20xxxxxx
@@ -678,10 +691,7 @@ async fn test_block_version_bits() {
                 hdr.version, signal_bits
             );
         } else {
-            println!(
-                "  header[{i}]: version=0x{:08x} (legacy)",
-                hdr.version
-            );
+            println!("  header[{i}]: version=0x{:08x} (legacy)", hdr.version);
         }
     }
     println!("[version-bits] all headers parsed ✓");
@@ -724,7 +734,10 @@ async fn test_rpc_getblockchaininfo() {
     assert_eq!(val["chain"], "regtest");
     assert!(val["blocks"].as_u64().is_some());
     assert!(val["bestblockhash"].as_str().unwrap().len() == 64);
-    println!("[rpc] getblockchaininfo: chain={} blocks={}", val["chain"], val["blocks"]);
+    println!(
+        "[rpc] getblockchaininfo: chain={} blocks={}",
+        val["chain"], val["blocks"]
+    );
 }
 
 // ── Test 9: RPC decoderawtransaction comparison ──────────────────────────────
@@ -750,18 +763,27 @@ async fn test_rpc_decoderawtransaction() {
     // Fetch the coinbase txid from the verbose block
     let block_json = match bitcoin_cli(&["getblock", &hash, "2"]) {
         Some(s) => s,
-        None => { eprintln!("getblock failed -- skipping"); return; }
+        None => {
+            eprintln!("getblock failed -- skipping");
+            return;
+        }
     };
     let block: serde_json::Value = serde_json::from_str(&block_json).unwrap();
     let coinbase_txid = match block["tx"][0]["txid"].as_str() {
         Some(t) => t.to_string(),
-        None => { eprintln!("no txid in block -- skipping"); return; }
+        None => {
+            eprintln!("no txid in block -- skipping");
+            return;
+        }
     };
 
     // getrawtransaction needs block hash since -txindex may not be enabled
     let raw_hex = match bitcoin_cli(&["getrawtransaction", &coinbase_txid, "false", &hash]) {
         Some(h) => h,
-        None => { eprintln!("getrawtransaction failed -- skipping"); return; }
+        None => {
+            eprintln!("getrawtransaction failed -- skipping");
+            return;
+        }
     };
 
     // Decode with Bitcoin Core
@@ -800,7 +822,10 @@ async fn test_rpc_decoderawtransaction() {
 
     println!(
         "[rpc] decoderawtransaction: txid={} version={} vin={} vout={} ✓",
-        our_txid.to_hex(), tx.version, tx.inputs.len(), tx.outputs.len()
+        our_txid.to_hex(),
+        tx.version,
+        tx.inputs.len(),
+        tx.outputs.len()
     );
 }
 
@@ -829,7 +854,10 @@ async fn test_rpc_validateaddress() {
 
     // Our implementation should also validate this address
     let our_script = rbtc_wallet::address::address_to_script(&addr);
-    assert!(our_script.is_ok(), "rbtc should parse Bitcoin Core bech32 address: {addr}");
+    assert!(
+        our_script.is_ok(),
+        "rbtc should parse Bitcoin Core bech32 address: {addr}"
+    );
     let script = our_script.unwrap();
     assert!(
         script.is_p2wpkh() || script.is_p2wsh() || script.is_p2tr(),
@@ -866,8 +894,13 @@ async fn test_rpc_getblockstats() {
     assert_eq!(core_stats["subsidy"], 5_000_000_000u64);
     // Note: Bitcoin Core excludes coinbase from total_size/total_weight,
     // so block 1 (coinbase only) may report 0 for these fields.
-    assert!(core_stats["total_weight"].as_u64().is_some() || core_stats["total_weight"].as_i64().is_some());
-    assert!(core_stats["total_size"].as_u64().is_some() || core_stats["total_size"].as_i64().is_some());
+    assert!(
+        core_stats["total_weight"].as_u64().is_some()
+            || core_stats["total_weight"].as_i64().is_some()
+    );
+    assert!(
+        core_stats["total_size"].as_u64().is_some() || core_stats["total_size"].as_i64().is_some()
+    );
 
     println!(
         "[rpc] getblockstats: height={} txs={} subsidy={} ✓",
@@ -890,7 +923,10 @@ async fn test_bip68_sequence_lock_enforcement() {
     // Generate blocks to ensure we have mature coins
     let addr = match bitcoin_cli(&["getnewaddress"]) {
         Some(a) => a,
-        None => { eprintln!("getnewaddress failed -- skipping"); return; }
+        None => {
+            eprintln!("getnewaddress failed -- skipping");
+            return;
+        }
     };
     // Make sure we have at least 110 blocks for mature coinbases
     let current_height: u64 = bitcoin_cli(&["getblockcount"])
@@ -904,7 +940,10 @@ async fn test_bip68_sequence_lock_enforcement() {
     // Get a UTXO to spend
     let utxos_str = match bitcoin_cli(&["listunspent"]) {
         Some(s) => s,
-        None => { eprintln!("listunspent failed -- skipping"); return; }
+        None => {
+            eprintln!("listunspent failed -- skipping");
+            return;
+        }
     };
     let utxos: serde_json::Value = serde_json::from_str(&utxos_str).unwrap();
     let utxo_arr = utxos.as_array().unwrap();
@@ -926,13 +965,19 @@ async fn test_bip68_sequence_lock_enforcement() {
 
     let raw = match bitcoin_cli(&["createrawtransaction", &inputs, &outputs]) {
         Some(r) => r,
-        None => { eprintln!("createrawtransaction failed -- skipping"); return; }
+        None => {
+            eprintln!("createrawtransaction failed -- skipping");
+            return;
+        }
     };
 
     // Sign it
     let signed_str = match bitcoin_cli(&["signrawtransactionwithwallet", &raw]) {
         Some(s) => s,
-        None => { eprintln!("signrawtransaction failed -- skipping"); return; }
+        None => {
+            eprintln!("signrawtransaction failed -- skipping");
+            return;
+        }
     };
     let signed: serde_json::Value = serde_json::from_str(&signed_str).unwrap();
     assert_eq!(signed["complete"], true, "signing should complete");
@@ -947,16 +992,24 @@ async fn test_bip68_sequence_lock_enforcement() {
     let accepted = accept[0]["allowed"].as_bool().unwrap_or(false);
 
     if confs >= 10 {
-        assert!(accepted, "BIP68: tx with sequence=10 should be accepted when UTXO has {confs} confs >= 10");
+        assert!(
+            accepted,
+            "BIP68: tx with sequence=10 should be accepted when UTXO has {confs} confs >= 10"
+        );
         println!("[bip68] tx with sequence=10, utxo confs={confs} → accepted ✓");
     } else {
-        assert!(!accepted, "BIP68: tx with sequence=10 should be rejected when UTXO has {confs} confs < 10");
+        assert!(
+            !accepted,
+            "BIP68: tx with sequence=10 should be rejected when UTXO has {confs} confs < 10"
+        );
         let reason = accept[0]["reject-reason"].as_str().unwrap_or("");
         assert!(
             reason.contains("non-BIP68-final") || reason.contains("sequence"),
             "reject reason should mention BIP68: {reason}"
         );
-        println!("[bip68] tx with sequence=10, utxo confs={confs} → correctly rejected: {reason} ✓");
+        println!(
+            "[bip68] tx with sequence=10, utxo confs={confs} → correctly rejected: {reason} ✓"
+        );
     }
 }
 
@@ -1039,16 +1092,25 @@ async fn test_dust_limit_enforcement() {
 
     let dust_addr = match bitcoin_cli(&["getnewaddress", "", "bech32"]) {
         Some(a) => a,
-        None => { eprintln!("getnewaddress failed -- skipping"); return; }
+        None => {
+            eprintln!("getnewaddress failed -- skipping");
+            return;
+        }
     };
     let change_addr = match bitcoin_cli(&["getnewaddress", "", "bech32"]) {
         Some(a) => a,
-        None => { eprintln!("getnewaddress failed -- skipping"); return; }
+        None => {
+            eprintln!("getnewaddress failed -- skipping");
+            return;
+        }
     };
 
     let utxos_str = match bitcoin_cli(&["listunspent"]) {
         Some(s) => s,
-        None => { eprintln!("listunspent failed -- skipping"); return; }
+        None => {
+            eprintln!("listunspent failed -- skipping");
+            return;
+        }
     };
     let utxos: serde_json::Value = serde_json::from_str(&utxos_str).unwrap();
     let utxo_arr = utxos.as_array().unwrap();
@@ -1071,16 +1133,25 @@ async fn test_dust_limit_enforcement() {
     }
 
     let inputs = format!("[{{\"txid\":\"{txid}\",\"vout\":{vout}}}]");
-    let outputs = format!("{{\"{}\":{:.8},\"{}\":{:.8}}}", dust_addr, dust_amount, change_addr, change);
+    let outputs = format!(
+        "{{\"{}\":{:.8},\"{}\":{:.8}}}",
+        dust_addr, dust_amount, change_addr, change
+    );
 
     let raw = match bitcoin_cli(&["createrawtransaction", &inputs, &outputs]) {
         Some(r) => r,
-        None => { eprintln!("createrawtransaction failed -- skipping"); return; }
+        None => {
+            eprintln!("createrawtransaction failed -- skipping");
+            return;
+        }
     };
 
     let signed_str = match bitcoin_cli(&["signrawtransactionwithwallet", &raw]) {
         Some(s) => s,
-        None => { eprintln!("signrawtransactionwithwallet failed -- skipping"); return; }
+        None => {
+            eprintln!("signrawtransactionwithwallet failed -- skipping");
+            return;
+        }
     };
     let signed: serde_json::Value = serde_json::from_str(&signed_str).unwrap();
     let signed_hex = signed["hex"].as_str().unwrap();
@@ -1175,11 +1246,15 @@ async fn test_mempool_standardness() {
             },
             rbtc_primitives::transaction::TxOut {
                 value: 0,
-                script_pubkey: rbtc_primitives::script::Script::from_bytes(vec![0x6a, 0x02, 0xaa, 0xbb]),
+                script_pubkey: rbtc_primitives::script::Script::from_bytes(vec![
+                    0x6a, 0x02, 0xaa, 0xbb,
+                ]),
             },
             rbtc_primitives::transaction::TxOut {
                 value: 0,
-                script_pubkey: rbtc_primitives::script::Script::from_bytes(vec![0x6a, 0x02, 0xcc, 0xdd]),
+                script_pubkey: rbtc_primitives::script::Script::from_bytes(vec![
+                    0x6a, 0x02, 0xcc, 0xdd,
+                ]),
             },
         ],
         lock_time: 0,

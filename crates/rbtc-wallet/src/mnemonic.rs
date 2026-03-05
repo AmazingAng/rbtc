@@ -18,9 +18,11 @@ impl Mnemonic {
             18 => 24,
             21 => 28,
             24 => 32,
-            _ => return Err(WalletError::InvalidMnemonic(
-                "word_count must be 12, 15, 18, 21, or 24".into(),
-            )),
+            _ => {
+                return Err(WalletError::InvalidMnemonic(
+                    "word_count must be 12, 15, 18, 21, or 24".into(),
+                ))
+            }
         };
         let mut entropy = vec![0u8; entropy_bytes];
         rand::rngs::OsRng.fill_bytes(&mut entropy);

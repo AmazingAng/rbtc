@@ -10,7 +10,7 @@ use rbtc_primitives::{
     script::Script,
     transaction::{OutPoint, Transaction, TxIn, TxOut},
 };
-use rbtc_script::{ScriptContext, ScriptFlags, verify_input};
+use rbtc_script::{verify_input, ScriptContext, ScriptFlags};
 
 use serde_json::Value;
 
@@ -50,7 +50,9 @@ fn parse_script_asm(s: &str) -> Result<Vec<u8>, String> {
                 lit.push(chars[i] as u8);
                 i += 1;
             }
-            if i < chars.len() { i += 1; } // consume closing '
+            if i < chars.len() {
+                i += 1;
+            } // consume closing '
             push_bytes(&mut out, &lit);
             continue;
         }
@@ -69,8 +71,7 @@ fn parse_script_asm(s: &str) -> Result<Vec<u8>, String> {
                 // 0x with nothing — skip
                 continue;
             }
-            let bytes = decode_hex(hex)
-                .map_err(|e| format!("bad hex token '{}': {}", token, e))?;
+            let bytes = decode_hex(hex).map_err(|e| format!("bad hex token '{}': {}", token, e))?;
             out.extend_from_slice(&bytes);
             continue;
         }
@@ -166,7 +167,11 @@ fn encode_script_int(n: i64) -> Vec<u8> {
 /// Return the opcode byte for a name token, or None.
 fn opcode_byte(token: &str) -> Option<u8> {
     // strip optional OP_ prefix
-    let t = if token.starts_with("OP_") { &token[3..] } else { token };
+    let t = if token.starts_with("OP_") {
+        &token[3..]
+    } else {
+        token
+    };
     Some(match t {
         "0" | "FALSE" => 0x00,
         "PUSHDATA1" => 0x4c,
@@ -292,7 +297,7 @@ fn decode_hex(s: &str) -> Result<Vec<u8>, String> {
     (0..s.len() / 2)
         .map(|i| {
             u8::from_str_radix(&s[2 * i..2 * i + 2], 16)
-                .map_err(|e| format!("bad hex '{}': {}", &s[2*i..2*i+2], e))
+                .map_err(|e| format!("bad hex '{}': {}", &s[2 * i..2 * i + 2], e))
         })
         .collect()
 }
@@ -304,7 +309,10 @@ fn make_crediting_tx(script_pubkey: &[u8], amount: u64) -> Transaction {
     Transaction {
         version: 1,
         inputs: vec![TxIn {
-            previous_output: OutPoint { txid: Hash256::ZERO, vout: 0xffffffff },
+            previous_output: OutPoint {
+                txid: Hash256::ZERO,
+                vout: 0xffffffff,
+            },
             script_sig: Script::from_bytes(vec![0x00, 0x00]), // OP_0 OP_0
             sequence: 0xffffffff,
             witness: vec![],
@@ -334,7 +342,10 @@ fn make_spending_tx(
     Transaction {
         version: 1,
         inputs: vec![TxIn {
-            previous_output: OutPoint { txid: txid(cred), vout: 0 },
+            previous_output: OutPoint {
+                txid: txid(cred),
+                vout: 0,
+            },
             script_sig: Script::from_bytes(script_sig.to_vec()),
             sequence: 0xffffffff,
             witness,
@@ -374,11 +385,12 @@ fn parse_entry(entry: &Value) -> Option<ScriptTestCase> {
         if wit_arr.len() < 1 {
             return None;
         }
-        let amount = wit_arr.last()
+        let amount = wit_arr
+            .last()
             .and_then(|v| v.as_f64())
             .map(|btc| (btc * 100_000_000.0).round() as u64)
             .unwrap_or(0);
-        let items: Vec<Vec<u8>> = wit_arr[..wit_arr.len()-1]
+        let items: Vec<Vec<u8>> = wit_arr[..wit_arr.len() - 1]
             .iter()
             .filter_map(|v| v.as_str().and_then(|s| decode_hex(s).ok()))
             .collect();
@@ -396,20 +408,40 @@ fn parse_entry(entry: &Value) -> Option<ScriptTestCase> {
     let flags_str = arr[rest_start + 2].as_str()?.to_string();
     let expected_str = arr[rest_start + 3].as_str()?;
     let expected_ok = expected_str == "OK";
-    let comment = arr.get(rest_start + 4)
+    let comment = arr
+        .get(rest_start + 4)
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
 
     // Skip entries that look like pure comments (no proper flags field).
-    let known_flags = ["NONE","P2SH","STRICTENC","DERSIG","LOW_S","SIGPUSHONLY",
-                       "MINIMALDATA","DISCOURAGE_UPGRADABLE_NOPS","CLEANSTACK",
-                       "CHECKLOCKTIMEVERIFY","CHECKSEQUENCEVERIFY","WITNESS",
-                       "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM","MINIMALIF",
-                       "NULLDUMMY","NULLFAIL","WITNESS_PUBKEYTYPE","CONST_SCRIPTCODE",
-                       "TAPROOT","DISCOURAGE_UPGRADABLE_TAPROOT_VERSION",
-                       "DISCOURAGE_OP_SUCCESS","DISCOURAGE_UPGRADABLE_PUBKEYTYPE"];
-    let is_valid_flags = flags_str.split(',').all(|f| known_flags.contains(&f.trim()));
+    let known_flags = [
+        "NONE",
+        "P2SH",
+        "STRICTENC",
+        "DERSIG",
+        "LOW_S",
+        "SIGPUSHONLY",
+        "MINIMALDATA",
+        "DISCOURAGE_UPGRADABLE_NOPS",
+        "CLEANSTACK",
+        "CHECKLOCKTIMEVERIFY",
+        "CHECKSEQUENCEVERIFY",
+        "WITNESS",
+        "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM",
+        "MINIMALIF",
+        "NULLDUMMY",
+        "NULLFAIL",
+        "WITNESS_PUBKEYTYPE",
+        "CONST_SCRIPTCODE",
+        "TAPROOT",
+        "DISCOURAGE_UPGRADABLE_TAPROOT_VERSION",
+        "DISCOURAGE_OP_SUCCESS",
+        "DISCOURAGE_UPGRADABLE_PUBKEYTYPE",
+    ];
+    let is_valid_flags = flags_str
+        .split(',')
+        .all(|f| known_flags.contains(&f.trim()));
     if !is_valid_flags {
         return None;
     }
@@ -443,14 +475,20 @@ fn script_tests_json() {
             Ok(b) => b,
             Err(e) => {
                 // Skip entries we can't parse (should be rare).
-                eprintln!("SKIP (parse error in scriptSig '{}': {})", tc.script_sig_asm, e);
+                eprintln!(
+                    "SKIP (parse error in scriptSig '{}': {})",
+                    tc.script_sig_asm, e
+                );
                 continue;
             }
         };
         let script_pubkey_bytes = match parse_script_asm(&tc.script_pubkey_asm) {
             Ok(b) => b,
             Err(e) => {
-                eprintln!("SKIP (parse error in scriptPubKey '{}': {})", tc.script_pubkey_asm, e);
+                eprintln!(
+                    "SKIP (parse error in scriptPubKey '{}': {})",
+                    tc.script_pubkey_asm, e
+                );
                 continue;
             }
         };
@@ -476,8 +514,10 @@ fn script_tests_json() {
         total += 1;
         if got_ok != tc.expected_ok {
             let label = if tc.comment.is_empty() {
-                format!("sig='{}' spk='{}' flags='{}'",
-                    tc.script_sig_asm, tc.script_pubkey_asm, tc.flags_str)
+                format!(
+                    "sig='{}' spk='{}' flags='{}'",
+                    tc.script_sig_asm, tc.script_pubkey_asm, tc.flags_str
+                )
             } else {
                 tc.comment.clone()
             };
@@ -485,17 +525,27 @@ fn script_tests_json() {
                 Ok(_) => "Ok (expected Err)".to_string(),
                 Err(e) => format!("Err({}) (expected Ok)", e),
             };
-            failures.push(format!("[{}] expected={} got={} — {}",
-                label, tc.expected_ok, got_ok, err_str));
+            failures.push(format!(
+                "[{}] expected={} got={} — {}",
+                label, tc.expected_ok, got_ok, err_str
+            ));
         }
     }
 
     if !failures.is_empty() {
-        eprintln!("\n=== SCRIPT TEST FAILURES ({}/{}) ===", failures.len(), total);
+        eprintln!(
+            "\n=== SCRIPT TEST FAILURES ({}/{}) ===",
+            failures.len(),
+            total
+        );
         for f in &failures {
             eprintln!("  FAIL: {}", f);
         }
-        panic!("{} / {} script_tests.json cases failed", failures.len(), total);
+        panic!(
+            "{} / {} script_tests.json cases failed",
+            failures.len(),
+            total
+        );
     }
 
     println!("script_tests.json: {total} cases all passed");

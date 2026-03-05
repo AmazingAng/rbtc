@@ -14,7 +14,10 @@ pub struct OutPoint {
 
 impl OutPoint {
     pub fn null() -> Self {
-        Self { txid: Hash256::ZERO, vout: 0xffffffff }
+        Self {
+            txid: Hash256::ZERO,
+            vout: 0xffffffff,
+        }
     }
 
     pub fn is_null(&self) -> bool {
@@ -68,7 +71,12 @@ impl Decodable for TxIn {
         let previous_output = OutPoint::decode(r)?;
         let script_sig = Script::decode(r)?;
         let sequence = u32::decode(r)?;
-        Ok(Self { previous_output, script_sig, sequence, witness: Vec::new() })
+        Ok(Self {
+            previous_output,
+            script_sig,
+            sequence,
+            witness: Vec::new(),
+        })
     }
 }
 
@@ -92,7 +100,10 @@ impl Decodable for TxOut {
     fn decode<R: Read>(r: &mut R) -> Result<Self> {
         let value = u64::decode(r)?;
         let script_pubkey = Script::decode(r)?;
-        Ok(Self { value, script_pubkey })
+        Ok(Self {
+            value,
+            script_pubkey,
+        })
     }
 }
 
@@ -192,7 +203,7 @@ impl Transaction {
     }
 
     pub fn vsize(&self) -> u64 {
-        (self.weight() + 3) / 4
+        self.weight().div_ceil(4)
     }
 }
 
@@ -212,9 +223,9 @@ impl Decodable for Transaction {
             // SegWit: marker=0x00, flag must be 0x01
             let flag = u8::decode(r)?;
             if flag != 0x01 {
-                return Err(CodecError::InvalidData(
-                    format!("invalid segwit flag: {flag}"),
-                ));
+                return Err(CodecError::InvalidData(format!(
+                    "invalid segwit flag: {flag}"
+                )));
             }
             let inputs = decode_list::<TxIn, _>(r)?;
             let outputs = decode_list::<TxOut, _>(r)?;
@@ -230,7 +241,12 @@ impl Decodable for Transaction {
             (inputs, outputs, false)
         };
 
-        let mut tx = Transaction { version, inputs, outputs, lock_time: 0 };
+        let mut tx = Transaction {
+            version,
+            inputs,
+            outputs,
+            lock_time: 0,
+        };
 
         if has_witness {
             for input in &mut tx.inputs {
@@ -289,7 +305,10 @@ mod tests {
 
     #[test]
     fn outpoint_encode_decode() {
-        let o = OutPoint { txid: Hash256([1; 32]), vout: 5 };
+        let o = OutPoint {
+            txid: Hash256([1; 32]),
+            vout: 5,
+        };
         let buf = o.encode_to_vec();
         let d = OutPoint::decode_from_slice(&buf).unwrap();
         assert_eq!(d.txid.0, o.txid.0);
@@ -306,7 +325,10 @@ mod tests {
         };
         assert!(i.is_coinbase());
         let i2 = TxIn {
-            previous_output: OutPoint { txid: Hash256([1; 32]), vout: 0 },
+            previous_output: OutPoint {
+                txid: Hash256([1; 32]),
+                vout: 0,
+            },
             script_sig: Script::new(),
             sequence: 0,
             witness: vec![],
@@ -327,7 +349,10 @@ mod tests {
         assert_eq!(d.sequence, txin.sequence);
         assert!(d.witness.is_empty());
 
-        let txout = TxOut { value: 1000, script_pubkey: Script::new() };
+        let txout = TxOut {
+            value: 1000,
+            script_pubkey: Script::new(),
+        };
         let buf = txout.encode_to_vec();
         let d = TxOut::decode_from_slice(&buf).unwrap();
         assert_eq!(d.value, 1000);

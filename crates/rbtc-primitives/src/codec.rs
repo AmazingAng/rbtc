@@ -30,6 +30,10 @@ impl VarInt {
             _ => 9,
         }
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.0 == 0
+    }
 }
 
 pub trait Encodable {
@@ -296,7 +300,17 @@ mod tests {
 
     #[test]
     fn varint_encode_decode_roundtrip() {
-        for &n in &[0u64, 1, 0xfc, 0xfd, 0xffff, 0x10000, 0xffffffff, 0x100000000, u64::MAX] {
+        for &n in &[
+            0u64,
+            1,
+            0xfc,
+            0xfd,
+            0xffff,
+            0x10000,
+            0xffffffff,
+            0x100000000,
+            u64::MAX,
+        ] {
             let v = VarInt(n);
             let buf = v.encode_to_vec();
             let decoded = VarInt::decode_from_slice(&buf).unwrap();

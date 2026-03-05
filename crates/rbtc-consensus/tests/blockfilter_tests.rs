@@ -1,3 +1,4 @@
+use rbtc_crypto::sha256d;
 /// BIP158 compact block filter test vectors from Bitcoin Core.
 ///
 /// Format: [height, block_hash, raw_block_hex, [prev_output_scripts], prev_basic_header,
@@ -7,12 +8,10 @@
 /// 1. Construct basic filter from block data + prev output scripts
 /// 2. Verify filter matches expected hex
 /// 3. Verify filter header chain
-
 use rbtc_primitives::{
     codec::{Decodable, VarInt},
     transaction::Transaction,
 };
-use rbtc_crypto::sha256d;
 use serde_json::Value;
 use siphasher::sip::SipHasher24;
 use std::collections::HashSet;
@@ -58,7 +57,11 @@ struct BitWriter {
 
 impl BitWriter {
     fn new() -> Self {
-        Self { data: Vec::new(), current: 0, bits_used: 0 }
+        Self {
+            data: Vec::new(),
+            current: 0,
+            bits_used: 0,
+        }
     }
 
     fn write_bit(&mut self, bit: u8) {
@@ -202,7 +205,11 @@ fn bip158_blockfilter_vectors() {
         // Collect all output scriptPubKeys
         let output_scripts: Vec<Vec<u8>> = txs
             .iter()
-            .flat_map(|tx| tx.outputs.iter().map(|o| o.script_pubkey.as_bytes().to_vec()))
+            .flat_map(|tx| {
+                tx.outputs
+                    .iter()
+                    .map(|o| o.script_pubkey.as_bytes().to_vec())
+            })
             .collect();
 
         // Parse previous output scripts from test vector
@@ -249,10 +256,7 @@ fn bip158_blockfilter_vectors() {
         for f in &failures {
             eprintln!("  FAIL: {f}");
         }
-        panic!(
-            "{} / {total} blockfilter cases failed",
-            failures.len()
-        );
+        panic!("{} / {total} blockfilter cases failed", failures.len());
     }
 
     println!("blockfilters.json: {total} cases all passed");

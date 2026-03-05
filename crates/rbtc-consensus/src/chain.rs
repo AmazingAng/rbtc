@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 
+use rbtc_crypto::sha256d;
+use rbtc_primitives::codec::Encodable;
 use rbtc_primitives::{
     block::{Block, BlockHeader},
-    constants::{MEDIAN_TIME_SPAN, DIFFICULTY_ADJUSTMENT_INTERVAL},
+    constants::{DIFFICULTY_ADJUSTMENT_INTERVAL, MEDIAN_TIME_SPAN},
     hash::{BlockHash, Hash256},
     network::Network,
 };
-use rbtc_crypto::sha256d;
-use rbtc_primitives::codec::Encodable;
 
 use crate::{
     difficulty::{bits_to_work, is_adjustment_height, next_bits},
@@ -71,9 +71,7 @@ impl BlockIndex {
         F: Fn(u32) -> Option<u32>, // height -> timestamp
     {
         let start = self.height.saturating_sub(MEDIAN_TIME_SPAN as u32 - 1);
-        let mut times: Vec<u32> = (start..=self.height)
-            .filter_map(|h| get_ancestor(h))
-            .collect();
+        let mut times: Vec<u32> = (start..=self.height).filter_map(get_ancestor).collect();
         times.sort_unstable();
         times.get(times.len() / 2).copied().unwrap_or(0)
     }
@@ -213,14 +211,19 @@ impl ChainState {
         let height = index.height;
 
         // Compute txids
-        let txids: Vec<_> = block.transactions.iter().map(|tx| {
-            let mut buf = Vec::new();
-            tx.encode_legacy(&mut buf).ok();
-            sha256d(&buf)
-        }).collect();
+        let txids: Vec<_> = block
+            .transactions
+            .iter()
+            .map(|tx| {
+                let mut buf = Vec::new();
+                tx.encode_legacy(&mut buf).ok();
+                sha256d(&buf)
+            })
+            .collect();
 
         // Update UTXO set
-        self.utxos.connect_block(&txids, &block.transactions, height);
+        self.utxos
+            .connect_block(&txids, &block.transactions, height);
 
         // Mark block as in-chain
         if let Some(bi) = self.block_index.get_mut(&block_hash) {
@@ -272,7 +275,10 @@ impl ChainState {
     /// Disconnect the tip block (for reorg)
     pub fn disconnect_tip(&mut self) -> Result<(), ConsensusError> {
         let tip_hash = self.best_tip.ok_or(ConsensusError::GenesisMismatch)?;
-        let tip = self.block_index.get(&tip_hash).ok_or(ConsensusError::GenesisMismatch)?;
+        let tip = self
+            .block_index
+            .get(&tip_hash)
+            .ok_or(ConsensusError::GenesisMismatch)?;
 
         if tip.height == 0 {
             return Err(ConsensusError::GenesisMismatch);
@@ -497,14 +503,21 @@ mod tests {
 
     #[test]
     fn genesis_header_hash_matches_all_networks() {
-        for net in [Network::Mainnet, Network::Testnet4, Network::Regtest, Network::Signet] {
+        for net in [
+            Network::Mainnet,
+            Network::Testnet4,
+            Network::Regtest,
+            Network::Signet,
+        ] {
             let header = net.genesis_header();
             let computed = header_hash(&header);
             let expected = genesis_hash(net);
             assert_eq!(
-                computed, expected,
+                computed,
+                expected,
                 "{net}: computed={} expected={}",
-                computed.to_hex(), expected.to_hex()
+                computed.to_hex(),
+                expected.to_hex()
             );
         }
     }
@@ -514,34 +527,40 @@ mod tests {
         let mut chain = ChainState::new(Network::Regtest);
         let h0 = Hash256([10; 32]);
         let h1 = Hash256([11; 32]);
-        chain.insert_block_index(h0, BlockIndex {
-            hash: h0,
-            header: BlockHeader {
-                version: 1,
-                prev_block: BlockHash::ZERO,
-                merkle_root: Hash256::ZERO,
-                time: 100,
-                bits: 0x1d00ffff,
-                nonce: 0,
+        chain.insert_block_index(
+            h0,
+            BlockIndex {
+                hash: h0,
+                header: BlockHeader {
+                    version: 1,
+                    prev_block: BlockHash::ZERO,
+                    merkle_root: Hash256::ZERO,
+                    time: 100,
+                    bits: 0x1d00ffff,
+                    nonce: 0,
+                },
+                height: 0,
+                chainwork: 1,
+                status: BlockStatus::InChain,
             },
-            height: 0,
-            chainwork: 1,
-            status: BlockStatus::InChain,
-        });
-        chain.insert_block_index(h1, BlockIndex {
-            hash: h1,
-            header: BlockHeader {
-                version: 1,
-                prev_block: h0,
-                merkle_root: Hash256::ZERO,
-                time: 200,
-                bits: 0x1d00ffff,
-                nonce: 0,
+        );
+        chain.insert_block_index(
+            h1,
+            BlockIndex {
+                hash: h1,
+                header: BlockHeader {
+                    version: 1,
+                    prev_block: h0,
+                    merkle_root: Hash256::ZERO,
+                    time: 200,
+                    bits: 0x1d00ffff,
+                    nonce: 0,
+                },
+                height: 1,
+                chainwork: 2,
+                status: BlockStatus::InChain,
             },
-            height: 1,
-            chainwork: 2,
-            status: BlockStatus::InChain,
-        });
+        );
         assert_eq!(chain.get_ancestor_time(0), Some(100));
         assert_eq!(chain.get_ancestor_time(1), Some(200));
         assert_eq!(chain.median_time_past(1), 200);
@@ -551,20 +570,23 @@ mod tests {
     fn next_required_bits_with_tip() {
         let mut chain = ChainState::new(Network::Regtest);
         let h0 = Hash256([20; 32]);
-        chain.insert_block_index(h0, BlockIndex {
-            hash: h0,
-            header: BlockHeader {
-                version: 1,
-                prev_block: BlockHash::ZERO,
-                merkle_root: Hash256::ZERO,
-                time: 0,
-                bits: 0x1d00ffff,
-                nonce: 0,
+        chain.insert_block_index(
+            h0,
+            BlockIndex {
+                hash: h0,
+                header: BlockHeader {
+                    version: 1,
+                    prev_block: BlockHash::ZERO,
+                    merkle_root: Hash256::ZERO,
+                    time: 0,
+                    bits: 0x1d00ffff,
+                    nonce: 0,
+                },
+                height: 0,
+                chainwork: 1,
+                status: BlockStatus::InChain,
             },
-            height: 0,
-            chainwork: 1,
-            status: BlockStatus::InChain,
-        });
+        );
         assert_eq!(chain.next_required_bits(), 0x1d00ffff);
     }
 

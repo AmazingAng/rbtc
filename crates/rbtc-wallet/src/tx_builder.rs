@@ -136,8 +136,10 @@ impl CoinSelector {
                                 let vbytes = 10 + indices.len() as u64 * 68 + 31;
                                 (vbytes as f64 * fee_rate).ceil() as u64
                             };
-                            let selected: Vec<WalletUtxo> =
-                                indices.iter().map(|&i| utxos[sorted[i].0].clone()).collect();
+                            let selected: Vec<WalletUtxo> = indices
+                                .iter()
+                                .map(|&i| utxos[sorted[i].0].clone())
+                                .collect();
                             (selected, fee)
                         });
                     }
@@ -212,8 +214,10 @@ impl CoinSelector {
                 let vbytes = 10 + indices.len() as u64 * 68 + 31;
                 (vbytes as f64 * fee_rate).ceil() as u64
             };
-            let selected: Vec<WalletUtxo> =
-                indices.iter().map(|&i| utxos[sorted[i].0].clone()).collect();
+            let selected: Vec<WalletUtxo> = indices
+                .iter()
+                .map(|&i| utxos[sorted[i].0].clone())
+                .collect();
             (selected, fee)
         })
     }
@@ -272,7 +276,10 @@ impl TxBuilder {
     }
 
     pub fn add_output(mut self, value: u64, script_pubkey: Script) -> Self {
-        self.outputs.push(TxOut { value, script_pubkey });
+        self.outputs.push(TxOut {
+            value,
+            script_pubkey,
+        });
         self
     }
 
@@ -398,23 +405,18 @@ pub fn sign_transaction(
                 if ws_bytes.last() == Some(&0xae) {
                     // Multisig witness: OP_0 <sig> <witness_script>
                     signed.inputs[i].witness = vec![
-                        vec![],   // OP_0 dummy (CHECKMULTISIG bug)
+                        vec![], // OP_0 dummy (CHECKMULTISIG bug)
                         sig_bytes,
                         ws_bytes.to_vec(),
                     ];
                 } else {
                     // Generic P2WSH: <sig> <pubkey> <witness_script>
                     let pubkey = secp256k1::PublicKey::from_secret_key(&secp, &si.secret_key);
-                    signed.inputs[i].witness = vec![
-                        sig_bytes,
-                        pubkey.serialize().to_vec(),
-                        ws_bytes.to_vec(),
-                    ];
+                    signed.inputs[i].witness =
+                        vec![sig_bytes, pubkey.serialize().to_vec(), ws_bytes.to_vec()];
                 }
             } else {
-                tracing::warn!(
-                    "sign_transaction: P2WSH input {i} missing witness_script"
-                );
+                tracing::warn!("sign_transaction: P2WSH input {i} missing witness_script");
             }
         } else if spk.is_p2tr() {
             // Taproot key-path spend (P2TR)
@@ -441,9 +443,7 @@ pub fn sign_transaction(
             signed.inputs[i].witness = vec![sig.as_ref().to_vec()];
         } else {
             // Unsupported script type — leave unsigned, caller can handle
-            tracing::warn!(
-                "sign_transaction: unsupported input script type for input {i}"
-            );
+            tracing::warn!("sign_transaction: unsupported input script type for input {i}");
         }
     }
 
@@ -457,15 +457,15 @@ pub fn sign_transaction(
 pub fn estimate_vsize(n_inputs: usize, n_outputs: usize) -> u64 {
     // Overhead: version(4) + marker+flag(2) + locktime(4) + varint counts(2)
     let base = 4 + 4 + 1 + 1; // version, locktime, input count varint, output count varint
-    // Per-input (P2WPKH): outpoint(36) + script_sig_len(1) + sequence(4) = 41 non-witness
-    //                      witness: varint(1) + sig_len(1) + sig(72) + pub_len(1) + pub(33) = 108
+                              // Per-input (P2WPKH): outpoint(36) + script_sig_len(1) + sequence(4) = 41 non-witness
+                              //                      witness: varint(1) + sig_len(1) + sig(72) + pub_len(1) + pub(33) = 108
     let input_base = n_inputs * 41;
     let input_witness = n_inputs * 108; // charged at 1/4 weight
-    // Per-output (P2WPKH 31 bytes): value(8) + script_len(1) + script(22)
+                                        // Per-output (P2WPKH 31 bytes): value(8) + script_len(1) + script(22)
     let output_base = n_outputs * 31;
 
     let weight = (base + input_base + output_base) * 4 + input_witness + 2; // +2 for segwit overhead
-    ((weight as u64) + 3) / 4
+    (weight as u64).div_ceil(4)
 }
 
 #[cfg(test)]
@@ -479,12 +479,13 @@ mod tests {
     use rbtc_primitives::hash::Hash256;
 
     fn sample_utxos() -> Vec<WalletUtxo> {
-        let spk = p2wpkh_script(
-            &ExtendedPrivKey::from_seed(&[2u8; 64]).unwrap().public_key(),
-        );
+        let spk = p2wpkh_script(&ExtendedPrivKey::from_seed(&[2u8; 64]).unwrap().public_key());
         vec![
             WalletUtxo {
-                outpoint: OutPoint { txid: Hash256([1u8; 32]), vout: 0 },
+                outpoint: OutPoint {
+                    txid: Hash256([1u8; 32]),
+                    vout: 0,
+                },
                 value: 100_000,
                 script_pubkey: spk.clone(),
                 height: 100,
@@ -493,7 +494,10 @@ mod tests {
                 addr_type: AddressType::SegWit,
             },
             WalletUtxo {
-                outpoint: OutPoint { txid: Hash256([2u8; 32]), vout: 0 },
+                outpoint: OutPoint {
+                    txid: Hash256([2u8; 32]),
+                    vout: 0,
+                },
                 value: 200_000,
                 script_pubkey: spk,
                 height: 101,
@@ -520,7 +524,10 @@ mod tests {
 
     #[test]
     fn tx_builder_builds_correct_structure() {
-        let op = OutPoint { txid: Hash256([0u8; 32]), vout: 0 };
+        let op = OutPoint {
+            txid: Hash256([0u8; 32]),
+            vout: 0,
+        };
         let spk = Script::from_bytes(vec![0x51]); // OP_1
         let tx = TxBuilder::new()
             .add_input(op.clone())
@@ -541,11 +548,12 @@ mod tests {
     #[test]
     fn bnb_finds_exact_match() {
         // Create UTXOs that can exactly cover 150_000 + fees
-        let spk = p2wpkh_script(
-            &ExtendedPrivKey::from_seed(&[2u8; 64]).unwrap().public_key(),
-        );
+        let spk = p2wpkh_script(&ExtendedPrivKey::from_seed(&[2u8; 64]).unwrap().public_key());
         let make = |val: u64, id: u8| WalletUtxo {
-            outpoint: OutPoint { txid: Hash256([id; 32]), vout: 0 },
+            outpoint: OutPoint {
+                txid: Hash256([id; 32]),
+                vout: 0,
+            },
             value: val,
             script_pubkey: spk.clone(),
             height: 100,
@@ -553,7 +561,12 @@ mod tests {
             confirmed: true,
             addr_type: AddressType::SegWit,
         };
-        let utxos = vec![make(50_000, 1), make(60_000, 2), make(90_000, 3), make(100_000, 4)];
+        let utxos = vec![
+            make(50_000, 1),
+            make(60_000, 2),
+            make(90_000, 3),
+            make(100_000, 4),
+        ];
         // BnB should find a subset; either way total >= target + fee
         let (selected, fee) = CoinSelector::select(&utxos, 50_000, 1.0).unwrap();
         let total: u64 = selected.iter().map(|u| u.value).sum();
@@ -577,11 +590,12 @@ mod tests {
 
     #[test]
     fn largest_first_selects_fewest_utxos() {
-        let spk = p2wpkh_script(
-            &ExtendedPrivKey::from_seed(&[2u8; 64]).unwrap().public_key(),
-        );
+        let spk = p2wpkh_script(&ExtendedPrivKey::from_seed(&[2u8; 64]).unwrap().public_key());
         let make = |val: u64, id: u8| WalletUtxo {
-            outpoint: OutPoint { txid: Hash256([id; 32]), vout: 0 },
+            outpoint: OutPoint {
+                txid: Hash256([id; 32]),
+                vout: 0,
+            },
             value: val,
             script_pubkey: spk.clone(),
             height: 100,
@@ -590,7 +604,7 @@ mod tests {
             addr_type: AddressType::SegWit,
         };
         let utxos = vec![make(10_000, 1), make(20_000, 2), make(500_000, 3)];
-        let estimate_fee = |n: usize| -> u64 { (10 + n as u64 * 68 + 2 * 31) };
+        let estimate_fee = |n: usize| -> u64 { 10 + n as u64 * 68 + 2 * 31 };
         let (selected, _fee) = CoinSelector::largest_first(&utxos, 100_000, &estimate_fee).unwrap();
         // Should pick the 500k UTXO first (largest), which alone covers 100k
         assert_eq!(selected.len(), 1);

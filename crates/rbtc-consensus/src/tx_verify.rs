@@ -1,13 +1,13 @@
+#[cfg(feature = "experimental-input-parallel")]
+use rayon::prelude::*;
+use rbtc_crypto::sha256d;
 use rbtc_primitives::{
     constants::{COIN, COINBASE_MATURITY, INITIAL_SUBSIDY, SUBSIDY_HALVING_INTERVAL},
     hash::Hash256,
     transaction::{Transaction, TxOut},
     Network,
 };
-use rbtc_crypto::sha256d;
-use rbtc_script::{ScriptContext, ScriptFlags, verify_input};
-#[cfg(feature = "experimental-input-parallel")]
-use rayon::prelude::*;
+use rbtc_script::{verify_input, ScriptContext, ScriptFlags};
 
 use crate::{
     error::ConsensusError,
@@ -42,17 +42,11 @@ pub fn verify_transaction(
 ) -> Result<u64, ConsensusError> {
     struct NoopMtp;
     impl MedianTimeProvider for NoopMtp {
-        fn median_time_past_at_height(&self, _height: u32) -> u32 { 0 }
+        fn median_time_past_at_height(&self, _height: u32) -> u32 {
+            0
+        }
     }
-    verify_transaction_with_lock_rules(
-        tx,
-        utxos,
-        current_height,
-        flags,
-        u32::MAX,
-        &NoopMtp,
-        false,
-    )
+    verify_transaction_with_lock_rules(tx, utxos, current_height, flags, u32::MAX, &NoopMtp, false)
 }
 
 pub fn verify_transaction_with_lock_rules(
@@ -77,6 +71,7 @@ pub fn verify_transaction_with_lock_rules(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn verify_transaction_with_lock_rules_preloaded(
     tx: &Transaction,
     utxos: &impl UtxoLookup,
@@ -131,12 +126,14 @@ pub fn verify_transaction_with_lock_rules_preloaded(
     };
 
     for utxo in &loaded {
-
         // Coinbase maturity check
         if utxo.is_coinbase {
             let depth = current_height.saturating_sub(utxo.height);
             if depth < COINBASE_MATURITY {
-                return Err(ConsensusError::CoinbaseNotMature(utxo.height, current_height));
+                return Err(ConsensusError::CoinbaseNotMature(
+                    utxo.height,
+                    current_height,
+                ));
             }
         }
 
@@ -154,7 +151,13 @@ pub fn verify_transaction_with_lock_rules_preloaded(
     // BIP68 relative lock-times (enabled with CSV deployment).
     if enforce_lock_rules
         && flags.verify_checksequenceverify
-        && !sequence_locks_satisfied(tx, &input_heights, current_height, lock_time_cutoff, mtp_provider)
+        && !sequence_locks_satisfied(
+            tx,
+            &input_heights,
+            current_height,
+            lock_time_cutoff,
+            mtp_provider,
+        )
     {
         return Err(ConsensusError::SequenceLockNotSatisfied);
     }
@@ -215,7 +218,8 @@ pub fn verify_transaction_scripts_with_prevouts(
             flags,
             all_prevouts: prevouts,
         };
-        verify_input(&ctx).map_err(|e| script_error_for_input(tx, &txid, i, prevout, flags, &e.to_string()))?;
+        verify_input(&ctx)
+            .map_err(|e| script_error_for_input(tx, &txid, i, prevout, flags, &e.to_string()))?;
         cache_insert(key);
     }
     Ok(())
@@ -223,14 +227,30 @@ pub fn verify_transaction_scripts_with_prevouts(
 
 fn script_flags_mask(flags: ScriptFlags) -> u16 {
     let mut m = 0u16;
-    if flags.verify_p2sh { m |= 1 << 0; }
-    if flags.verify_dersig { m |= 1 << 1; }
-    if flags.verify_witness { m |= 1 << 2; }
-    if flags.verify_nulldummy { m |= 1 << 3; }
-    if flags.verify_cleanstack { m |= 1 << 4; }
-    if flags.verify_checklocktimeverify { m |= 1 << 5; }
-    if flags.verify_checksequenceverify { m |= 1 << 6; }
-    if flags.verify_taproot { m |= 1 << 7; }
+    if flags.verify_p2sh {
+        m |= 1 << 0;
+    }
+    if flags.verify_dersig {
+        m |= 1 << 1;
+    }
+    if flags.verify_witness {
+        m |= 1 << 2;
+    }
+    if flags.verify_nulldummy {
+        m |= 1 << 3;
+    }
+    if flags.verify_cleanstack {
+        m |= 1 << 4;
+    }
+    if flags.verify_checklocktimeverify {
+        m |= 1 << 5;
+    }
+    if flags.verify_checksequenceverify {
+        m |= 1 << 6;
+    }
+    if flags.verify_taproot {
+        m |= 1 << 7;
+    }
     m
 }
 
@@ -429,7 +449,7 @@ pub fn verify_coinbase(
 
     // Coinbase scriptSig length: 2–100 bytes
     let sig_len = tx.inputs[0].script_sig.len();
-    if sig_len < 2 || sig_len > 100 {
+    if !(2..=100).contains(&sig_len) {
         return Err(ConsensusError::InvalidTx(format!(
             "coinbase scriptSig length {sig_len} out of range [2, 100]"
         )));
@@ -444,7 +464,10 @@ pub fn verify_coinbase(
     // Total output value ≤ subsidy + fees (checked at block level)
     let total_out: u64 = tx.outputs.iter().map(|o| o.value).sum();
     if total_out > expected_subsidy {
-        return Err(ConsensusError::BadCoinbaseAmount(total_out, expected_subsidy));
+        return Err(ConsensusError::BadCoinbaseAmount(
+            total_out,
+            expected_subsidy,
+        ));
     }
 
     Ok(())
@@ -453,11 +476,15 @@ pub fn verify_coinbase(
 fn check_coinbase_height(tx: &Transaction, height: u32) -> Result<(), ConsensusError> {
     let script = tx.inputs[0].script_sig.as_bytes();
     if script.is_empty() {
-        return Err(ConsensusError::InvalidTx("coinbase missing height push".into()));
+        return Err(ConsensusError::InvalidTx(
+            "coinbase missing height push".into(),
+        ));
     }
     let push_len = script[0] as usize;
     if push_len == 0 || push_len > 4 || 1 + push_len > script.len() {
-        return Err(ConsensusError::InvalidTx("invalid coinbase height push".into()));
+        return Err(ConsensusError::InvalidTx(
+            "invalid coinbase height push".into(),
+        ));
     }
     let mut h = 0u32;
     for i in 0..push_len {
@@ -474,12 +501,12 @@ fn check_coinbase_height(tx: &Transaction, height: u32) -> Result<(), ConsensusE
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utxo::UtxoSet;
     use rbtc_primitives::hash::Hash256;
-    use rbtc_primitives::Network;
     use rbtc_primitives::script::Script;
     use rbtc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
+    use rbtc_primitives::Network;
     use rbtc_script::ScriptFlags;
-    use crate::utxo::UtxoSet;
 
     struct TestMtpProvider;
     impl MedianTimeProvider for TestMtpProvider {
@@ -509,7 +536,10 @@ mod tests {
         let tx = Transaction {
             version: 1,
             inputs: vec![],
-            outputs: vec![TxOut { value: 1000, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: 1000,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         };
         let utxos = UtxoSet::new();
@@ -523,7 +553,10 @@ mod tests {
         let tx = Transaction {
             version: 1,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: Hash256::ZERO, vout: 0 },
+                previous_output: OutPoint {
+                    txid: Hash256::ZERO,
+                    vout: 0,
+                },
                 script_sig: Script::new(),
                 sequence: 0,
                 witness: vec![],
@@ -532,12 +565,19 @@ mod tests {
             lock_time: 0,
         };
         let mut utxos = UtxoSet::new();
-        utxos.add_tx(Hash256::ZERO, &Transaction {
-            version: 1,
-            inputs: vec![],
-            outputs: vec![TxOut { value: 1000, script_pubkey: Script::new() }],
-            lock_time: 0,
-        }, 0);
+        utxos.add_tx(
+            Hash256::ZERO,
+            &Transaction {
+                version: 1,
+                inputs: vec![],
+                outputs: vec![TxOut {
+                    value: 1000,
+                    script_pubkey: Script::new(),
+                }],
+                lock_time: 0,
+            },
+            0,
+        );
         let r = verify_transaction(&tx, &utxos, 0, ScriptFlags::default());
         assert!(r.is_err());
         assert!(matches!(r.unwrap_err(), ConsensusError::NoOutputs));
@@ -548,12 +588,18 @@ mod tests {
         let tx = Transaction {
             version: 1,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: Hash256([1; 32]), vout: 0 },
+                previous_output: OutPoint {
+                    txid: Hash256([1; 32]),
+                    vout: 0,
+                },
                 script_sig: Script::new(),
                 sequence: 0,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: 50_0000_0000,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         };
         let r = verify_coinbase(&tx, 0, 50_0000_0000, Network::Regtest);
@@ -571,7 +617,10 @@ mod tests {
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: 50_0000_0000,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         };
         let r = verify_coinbase(&tx, 0, 50_0000_0000, Network::Regtest);
@@ -588,7 +637,10 @@ mod tests {
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 25_0000_0000, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: 25_0000_0000,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         };
         assert!(verify_coinbase(&tx, 0, 50_0000_0000, Network::Regtest).is_ok());
@@ -599,12 +651,18 @@ mod tests {
         let tx = Transaction {
             version: 1,
             inputs: vec![TxIn {
-                previous_output: OutPoint { txid: Hash256([9; 32]), vout: 0 },
+                previous_output: OutPoint {
+                    txid: Hash256([9; 32]),
+                    vout: 0,
+                },
                 script_sig: Script::new(),
                 sequence: 0,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 1000, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: 1000,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 100,
         };
         let utxos = UtxoSet::new();
@@ -627,7 +685,10 @@ mod tests {
         utxos.insert(
             OutPoint { txid, vout: 0 },
             Utxo {
-                txout: TxOut { value: 2_000, script_pubkey: Script::new() },
+                txout: TxOut {
+                    value: 2_000,
+                    script_pubkey: Script::new(),
+                },
                 is_coinbase: false,
                 height: 100,
             },
@@ -640,7 +701,10 @@ mod tests {
                 sequence: 1,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 1_000, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: 1_000,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         };
         let mut flags = ScriptFlags::default();
@@ -664,7 +728,10 @@ mod tests {
         utxos.insert(
             OutPoint { txid, vout: 0 },
             Utxo {
-                txout: TxOut { value: 2_000, script_pubkey: Script::new() },
+                txout: TxOut {
+                    value: 2_000,
+                    script_pubkey: Script::new(),
+                },
                 is_coinbase: false,
                 height: 100,
             },
@@ -677,7 +744,10 @@ mod tests {
                 sequence: (1 << 22) | 1,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value: 1_000, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value: 1_000,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         };
         let mut flags = ScriptFlags::default();

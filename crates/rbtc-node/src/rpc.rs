@@ -13,13 +13,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
-    routing::post,
-    Json, Router,
-};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::post, Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, RwLock};
@@ -28,16 +22,16 @@ use tracing::{debug, info, warn};
 use rbtc_consensus::chain::ChainState;
 use rbtc_crypto::sha256d;
 use rbtc_mempool::Mempool;
-use rbtc_miner::{BlockTemplate, TxSelector, mine_block};
+use rbtc_miner::{mine_block, BlockTemplate, TxSelector};
 use rbtc_primitives::{
-    block::{Block, nbits_to_target},
+    block::{nbits_to_target, Block},
     codec::{Decodable, Encodable},
     hash::Hash256,
     transaction::{OutPoint, Transaction},
 };
 use rbtc_psbt::Psbt;
 use rbtc_storage::{AddrIndexStore, BlockStore, Database, TxIndexStore};
-use rbtc_wallet::{AddressType, Wallet, address::address_to_script};
+use rbtc_wallet::{address::address_to_script, AddressType, Wallet};
 
 // ── Shared state ─────────────────────────────────────────────────────────────
 
@@ -92,14 +86,21 @@ struct RpcError {
 
 impl RpcResponse {
     fn ok(id: Option<Value>, result: Value) -> Self {
-        Self { id, result: Some(result), error: None }
+        Self {
+            id,
+            result: Some(result),
+            error: None,
+        }
     }
 
     fn err(id: Option<Value>, code: i32, message: impl Into<String>) -> Self {
         Self {
             id,
             result: None,
-            error: Some(RpcError { code, message: message.into() }),
+            error: Some(RpcError {
+                code,
+                message: message.into(),
+            }),
         }
     }
 }
@@ -123,68 +124,68 @@ async fn handle_rpc(
 
     let result = match req.method.as_str() {
         // Chain
-        "getblockchaininfo"          => rpc_getblockchaininfo(&state).await,
-        "getblockcount"              => rpc_getblockcount(&state).await,
-        "getblockhash"               => rpc_getblockhash(&state, &params).await,
-        "getblock"                   => rpc_getblock(&state, &params).await,
-        "invalidateblock"            => rpc_invalidateblock(&state, &params).await,
-        "reconsiderblock"            => rpc_reconsiderblock(&state, &params).await,
+        "getblockchaininfo" => rpc_getblockchaininfo(&state).await,
+        "getblockcount" => rpc_getblockcount(&state).await,
+        "getblockhash" => rpc_getblockhash(&state, &params).await,
+        "getblock" => rpc_getblock(&state, &params).await,
+        "invalidateblock" => rpc_invalidateblock(&state, &params).await,
+        "reconsiderblock" => rpc_reconsiderblock(&state, &params).await,
         // Transactions
-        "getrawtransaction"          => rpc_getrawtransaction(&state, &params).await,
-        "getrawmempool"              => rpc_getrawmempool(&state).await,
-        "sendrawtransaction"         => rpc_sendrawtransaction(&state, &params).await,
+        "getrawtransaction" => rpc_getrawtransaction(&state, &params).await,
+        "getrawmempool" => rpc_getrawmempool(&state).await,
+        "sendrawtransaction" => rpc_sendrawtransaction(&state, &params).await,
         // Wallet
-        "getnewaddress"              => rpc_getnewaddress(&state, &params).await,
-        "getbalance"                 => rpc_getbalance(&state).await,
-        "listunspent"                => rpc_listunspent(&state, &params).await,
-        "sendtoaddress"              => rpc_sendtoaddress(&state, &params).await,
-        "fundrawtransaction"         => rpc_fundrawtransaction(&state, &params).await,
+        "getnewaddress" => rpc_getnewaddress(&state, &params).await,
+        "getbalance" => rpc_getbalance(&state).await,
+        "listunspent" => rpc_listunspent(&state, &params).await,
+        "sendtoaddress" => rpc_sendtoaddress(&state, &params).await,
+        "fundrawtransaction" => rpc_fundrawtransaction(&state, &params).await,
         "signrawtransactionwithwallet" => rpc_signrawtransactionwithwallet(&state, &params).await,
-        "dumpprivkey"                => rpc_dumpprivkey(&state, &params).await,
-        "importprivkey"              => rpc_importprivkey(&state, &params).await,
-        "getwalletinfo"              => rpc_getwalletinfo(&state).await,
+        "dumpprivkey" => rpc_dumpprivkey(&state, &params).await,
+        "importprivkey" => rpc_importprivkey(&state, &params).await,
+        "getwalletinfo" => rpc_getwalletinfo(&state).await,
         // Address index
-        "getaddresstxids"            => rpc_getaddresstxids(&state, &params).await,
-        "getaddressutxos"            => rpc_getaddressutxos(&state, &params).await,
-        "getaddressbalance"          => rpc_getaddressbalance(&state, &params).await,
+        "getaddresstxids" => rpc_getaddresstxids(&state, &params).await,
+        "getaddressutxos" => rpc_getaddressutxos(&state, &params).await,
+        "getaddressbalance" => rpc_getaddressbalance(&state, &params).await,
         // Mining
-        "getblocktemplate"           => rpc_getblocktemplate(&state, &params).await,
-        "submitblock"                => rpc_submitblock(&state, &params).await,
-        "generatetoaddress"          => rpc_generatetoaddress(&state, &params).await,
-        "generate"                   => rpc_generate(&state, &params).await,
-        "getmininginfo"              => rpc_getmininginfo(&state).await,
-        "getnetworkhashps"           => rpc_getnetworkhashps(&state, &params).await,
-        "estimatesmartfee"           => rpc_estimatesmartfee(&state, &params).await,
+        "getblocktemplate" => rpc_getblocktemplate(&state, &params).await,
+        "submitblock" => rpc_submitblock(&state, &params).await,
+        "generatetoaddress" => rpc_generatetoaddress(&state, &params).await,
+        "generate" => rpc_generate(&state, &params).await,
+        "getmininginfo" => rpc_getmininginfo(&state).await,
+        "getnetworkhashps" => rpc_getnetworkhashps(&state, &params).await,
+        "estimatesmartfee" => rpc_estimatesmartfee(&state, &params).await,
         // PSBT (BIP174)
-        "createpsbt"                 => rpc_createpsbt(&state, &params).await,
-        "walletprocesspsbt"          => rpc_walletprocesspsbt(&state, &params).await,
-        "finalizepsbt"               => rpc_finalizepsbt(&state, &params).await,
-        "combinepsbt"                => rpc_combinepsbt(&state, &params).await,
-        "decodepsbt"                 => rpc_decodepsbt(&state, &params).await,
-        "analyzepsbt"                => rpc_analyzepsbt(&state, &params).await,
+        "createpsbt" => rpc_createpsbt(&state, &params).await,
+        "walletprocesspsbt" => rpc_walletprocesspsbt(&state, &params).await,
+        "finalizepsbt" => rpc_finalizepsbt(&state, &params).await,
+        "combinepsbt" => rpc_combinepsbt(&state, &params).await,
+        "decodepsbt" => rpc_decodepsbt(&state, &params).await,
+        "analyzepsbt" => rpc_analyzepsbt(&state, &params).await,
         // Chain (Phase D)
-        "getchaintips"               => rpc_getchaintips(&state).await,
-        "getblockstats"              => rpc_getblockstats(&state, &params).await,
+        "getchaintips" => rpc_getchaintips(&state).await,
+        "getblockstats" => rpc_getblockstats(&state, &params).await,
         // Mempool (Phase D)
-        "getmempoolentry"            => rpc_getmempoolentry(&state, &params).await,
-        "getmempoolancestors"        => rpc_getmempoolancestors(&state, &params).await,
-        "getmempooldescendants"      => rpc_getmempooldescendants(&state, &params).await,
-        "testmempoolaccept"          => rpc_testmempoolaccept(&state, &params).await,
+        "getmempoolentry" => rpc_getmempoolentry(&state, &params).await,
+        "getmempoolancestors" => rpc_getmempoolancestors(&state, &params).await,
+        "getmempooldescendants" => rpc_getmempooldescendants(&state, &params).await,
+        "testmempoolaccept" => rpc_testmempoolaccept(&state, &params).await,
         // Utility (Phase D)
-        "validateaddress"            => rpc_validateaddress(&state, &params).await,
-        "decoderawtransaction"       => rpc_decoderawtransaction(&state, &params).await,
-        "decodescript"               => rpc_decodescript(&state, &params).await,
-        "createmultisig"             => rpc_createmultisig(&state, &params).await,
-        "verifymessage"              => rpc_verifymessage(&state, &params).await,
-        "signmessagewithprivkey"     => rpc_signmessagewithprivkey(&state, &params).await,
+        "validateaddress" => rpc_validateaddress(&state, &params).await,
+        "decoderawtransaction" => rpc_decoderawtransaction(&state, &params).await,
+        "decodescript" => rpc_decodescript(&state, &params).await,
+        "createmultisig" => rpc_createmultisig(&state, &params).await,
+        "verifymessage" => rpc_verifymessage(&state, &params).await,
+        "signmessagewithprivkey" => rpc_signmessagewithprivkey(&state, &params).await,
         // Wallet (Phase F)
-        "dumpwallet"                 => rpc_dumpwallet(&state, &params).await,
-        "importwallet"               => rpc_importwallet(&state, &params).await,
-        "getdescriptorinfo"          => rpc_getdescriptorinfo(&state, &params).await,
-        "deriveaddresses"            => rpc_deriveaddresses(&state, &params).await,
+        "dumpwallet" => rpc_dumpwallet(&state, &params).await,
+        "importwallet" => rpc_importwallet(&state, &params).await,
+        "getdescriptorinfo" => rpc_getdescriptorinfo(&state, &params).await,
+        "deriveaddresses" => rpc_deriveaddresses(&state, &params).await,
         // Network (Phase D)
-        "getnetworkinfo"             => rpc_getnetworkinfo(&state).await,
-        "getpeerinfo"                => rpc_getpeerinfo(&state).await,
+        "getnetworkinfo" => rpc_getnetworkinfo(&state).await,
+        "getpeerinfo" => rpc_getpeerinfo(&state).await,
         method => {
             warn!("rpc: unknown method {method}");
             Err((-32601, format!("Method not found: {method}")))
@@ -241,8 +242,7 @@ async fn rpc_getblock(state: &RpcState, params: &Value) -> RpcResult {
         .get(0)
         .and_then(Value::as_str)
         .ok_or((-32602, "Invalid params: expected block hash".to_string()))?;
-    let hash = Hash256::from_hex(hash_hex)
-        .map_err(|_| (-8, "Invalid block hash".to_string()))?;
+    let hash = Hash256::from_hex(hash_hex).map_err(|_| (-8, "Invalid block hash".to_string()))?;
 
     let verbosity = params.get(1).and_then(Value::as_u64).unwrap_or(1);
 
@@ -285,13 +285,15 @@ async fn rpc_invalidateblock(state: &RpcState, params: &Value) -> RpcResult {
         .get(0)
         .and_then(Value::as_str)
         .ok_or((-32602, "Invalid params: expected block hash".to_string()))?;
-    let hash = Hash256::from_hex(hash_hex)
-        .map_err(|_| (-8, "Invalid block hash".to_string()))?;
+    let hash = Hash256::from_hex(hash_hex).map_err(|_| (-8, "Invalid block hash".to_string()))?;
 
     let (reply_tx, reply_rx) = oneshot::channel();
     state
         .control_tx
-        .send(RpcNodeCommand::InvalidateBlock { hash, reply: reply_tx })
+        .send(RpcNodeCommand::InvalidateBlock {
+            hash,
+            reply: reply_tx,
+        })
         .map_err(|_| (-1, "node channel closed".to_string()))?;
 
     match reply_rx.await {
@@ -306,13 +308,15 @@ async fn rpc_reconsiderblock(state: &RpcState, params: &Value) -> RpcResult {
         .get(0)
         .and_then(Value::as_str)
         .ok_or((-32602, "Invalid params: expected block hash".to_string()))?;
-    let hash = Hash256::from_hex(hash_hex)
-        .map_err(|_| (-8, "Invalid block hash".to_string()))?;
+    let hash = Hash256::from_hex(hash_hex).map_err(|_| (-8, "Invalid block hash".to_string()))?;
 
     let (reply_tx, reply_rx) = oneshot::channel();
     state
         .control_tx
-        .send(RpcNodeCommand::ReconsiderBlock { hash, reply: reply_tx })
+        .send(RpcNodeCommand::ReconsiderBlock {
+            hash,
+            reply: reply_tx,
+        })
         .map_err(|_| (-1, "node channel closed".to_string()))?;
 
     match reply_rx.await {
@@ -327,8 +331,7 @@ async fn rpc_getrawtransaction(state: &RpcState, params: &Value) -> RpcResult {
         .get(0)
         .and_then(Value::as_str)
         .ok_or((-32602, "Invalid params: expected txid".to_string()))?;
-    let txid = Hash256::from_hex(txid_hex)
-        .map_err(|_| (-8, "Invalid txid".to_string()))?;
+    let txid = Hash256::from_hex(txid_hex).map_err(|_| (-8, "Invalid txid".to_string()))?;
 
     let verbose = params.get(1).and_then(Value::as_bool).unwrap_or(false);
 
@@ -388,21 +391,30 @@ async fn rpc_getrawtransaction(state: &RpcState, params: &Value) -> RpcResult {
         let computed_txid = rbtc_crypto::sha256d(&buf);
         txid_bytes.copy_from_slice(&computed_txid.0);
 
-        let vin: Vec<Value> = tx.inputs.iter().map(|inp| {
-            json!({
-                "txid": inp.previous_output.txid.to_hex(),
-                "vout": inp.previous_output.vout,
-                "sequence": inp.sequence,
+        let vin: Vec<Value> = tx
+            .inputs
+            .iter()
+            .map(|inp| {
+                json!({
+                    "txid": inp.previous_output.txid.to_hex(),
+                    "vout": inp.previous_output.vout,
+                    "sequence": inp.sequence,
+                })
             })
-        }).collect();
+            .collect();
 
-        let vout: Vec<Value> = tx.outputs.iter().enumerate().map(|(n, out)| {
-            json!({
-                "n": n,
-                "value": out.value,
-                "scriptPubKey": { "hex": hex::encode(&out.script_pubkey.0) },
+        let vout: Vec<Value> = tx
+            .outputs
+            .iter()
+            .enumerate()
+            .map(|(n, out)| {
+                json!({
+                    "n": n,
+                    "value": out.value,
+                    "scriptPubKey": { "hex": hex::encode(&out.script_pubkey.0) },
+                })
             })
-        }).collect();
+            .collect();
 
         Ok(json!({
             "txid": txid.to_hex(),
@@ -425,10 +437,10 @@ async fn rpc_getrawmempool(state: &RpcState) -> RpcResult {
 }
 
 async fn rpc_sendrawtransaction(state: &RpcState, params: &Value) -> RpcResult {
-    let hex_str = params
-        .get(0)
-        .and_then(Value::as_str)
-        .ok_or((-32602, "Invalid params: expected raw transaction hex".to_string()))?;
+    let hex_str = params.get(0).and_then(Value::as_str).ok_or((
+        -32602,
+        "Invalid params: expected raw transaction hex".to_string(),
+    ))?;
 
     let raw = hex::decode(hex_str).map_err(|_| (-22, "TX decode failed".to_string()))?;
     let tx = Transaction::decode_from_slice(&raw)
@@ -452,7 +464,12 @@ macro_rules! require_wallet {
     ($state:expr) => {
         match $state.wallet.as_ref() {
             Some(w) => w,
-            None => return Err((-18, "No wallet loaded. Start with --wallet or --create-wallet.".into())),
+            None => {
+                return Err((
+                    -18,
+                    "No wallet loaded. Start with --wallet or --create-wallet.".into(),
+                ))
+            }
         }
     };
 }
@@ -461,12 +478,10 @@ async fn rpc_getnewaddress(state: &RpcState, params: &Value) -> RpcResult {
     let wallet_arc = require_wallet!(state);
 
     let addr_type_str = params.get(1).and_then(Value::as_str).unwrap_or("bech32");
-    let addr_type = AddressType::from_str(addr_type_str)
-        .unwrap_or(AddressType::SegWit);
+    let addr_type = AddressType::parse(addr_type_str).unwrap_or(AddressType::SegWit);
 
     let mut w = wallet_arc.write().await;
-    let address = w.new_address(addr_type)
-        .map_err(|e| (-1, e.to_string()))?;
+    let address = w.new_address(addr_type).map_err(|e| (-1, e.to_string()))?;
     Ok(json!(address))
 }
 
@@ -488,14 +503,16 @@ async fn rpc_listunspent(state: &RpcState, params: &Value) -> RpcResult {
     let utxos: Vec<Value> = w
         .list_unspent(min_conf)
         .iter()
-        .map(|u| json!({
-            "txid":          u.outpoint.txid.to_hex(),
-            "vout":          u.outpoint.vout,
-            "address":       u.address,
-            "amount":        u.value as f64 / 1e8,
-            "confirmations": u.height,
-            "spendable":     true,
-        }))
+        .map(|u| {
+            json!({
+                "txid":          u.outpoint.txid.to_hex(),
+                "vout":          u.outpoint.vout,
+                "address":       u.address,
+                "amount":        u.value as f64 / 1e8,
+                "confirmations": u.height,
+                "spendable":     true,
+            })
+        })
         .collect();
     Ok(json!(utxos))
 }
@@ -503,9 +520,13 @@ async fn rpc_listunspent(state: &RpcState, params: &Value) -> RpcResult {
 async fn rpc_sendtoaddress(state: &RpcState, params: &Value) -> RpcResult {
     let wallet_arc = require_wallet!(state);
 
-    let address = params.get(0).and_then(Value::as_str)
+    let address = params
+        .get(0)
+        .and_then(Value::as_str)
         .ok_or((-32602, "missing address".to_string()))?;
-    let amount_btc = params.get(1).and_then(Value::as_f64)
+    let amount_btc = params
+        .get(1)
+        .and_then(Value::as_f64)
         .ok_or((-32602, "missing amount".to_string()))?;
     let fee_rate = params.get(2).and_then(Value::as_f64).unwrap_or(1.0);
 
@@ -520,7 +541,9 @@ async fn rpc_sendtoaddress(state: &RpcState, params: &Value) -> RpcResult {
 
     // Encode and submit to mempool
     let mut raw = Vec::new();
-    signed_tx.encode(&mut raw).map_err(|e| (-22, e.to_string()))?;
+    signed_tx
+        .encode(&mut raw)
+        .map_err(|e| (-22, e.to_string()))?;
     let hex_tx = hex::encode(&raw);
 
     // Reuse sendrawtransaction logic
@@ -531,9 +554,12 @@ async fn rpc_sendtoaddress(state: &RpcState, params: &Value) -> RpcResult {
 async fn rpc_fundrawtransaction(state: &RpcState, params: &Value) -> RpcResult {
     let wallet_arc = require_wallet!(state);
 
-    let hex_str = params.get(0).and_then(Value::as_str)
+    let hex_str = params
+        .get(0)
+        .and_then(Value::as_str)
         .ok_or((-32602, "missing raw transaction hex".to_string()))?;
-    let fee_rate = params.get(1)
+    let fee_rate = params
+        .get(1)
         .and_then(|p| p.get("feeRate"))
         .and_then(Value::as_f64)
         .unwrap_or(1.0);
@@ -549,8 +575,9 @@ async fn rpc_fundrawtransaction(state: &RpcState, params: &Value) -> RpcResult {
     let available: Vec<_> = w.list_unspent(1).into_iter().cloned().collect();
     drop(w);
 
-    let (selected, actual_fee) = rbtc_wallet::CoinSelector::select(&available, output_total, fee_rate)
-        .map_err(|e| (-6, e.to_string()))?;
+    let (selected, actual_fee) =
+        rbtc_wallet::CoinSelector::select(&available, output_total, fee_rate)
+            .map_err(|e| (-6, e.to_string()))?;
 
     let total_in: u64 = selected.iter().map(|u| u.value).sum();
     let change = total_in.saturating_sub(output_total + actual_fee);
@@ -566,7 +593,8 @@ async fn rpc_fundrawtransaction(state: &RpcState, params: &Value) -> RpcResult {
     }
     if change > 546 {
         let mut w = wallet_arc.write().await;
-        let change_addr = w.new_address(AddressType::SegWit)
+        let change_addr = w
+            .new_address(AddressType::SegWit)
             .map_err(|e| (-1, e.to_string()))?;
         drop(w);
         let change_spk = rbtc_wallet::address::address_to_script(&change_addr)
@@ -589,7 +617,9 @@ async fn rpc_fundrawtransaction(state: &RpcState, params: &Value) -> RpcResult {
 async fn rpc_signrawtransactionwithwallet(state: &RpcState, params: &Value) -> RpcResult {
     let wallet_arc = require_wallet!(state);
 
-    let hex_str = params.get(0).and_then(Value::as_str)
+    let hex_str = params
+        .get(0)
+        .and_then(Value::as_str)
         .ok_or((-32602, "missing raw transaction hex".to_string()))?;
     let raw = hex::decode(hex_str).map_err(|_| (-22, "TX decode failed".to_string()))?;
     let tx = Transaction::decode_from_slice(&raw)
@@ -610,7 +640,9 @@ async fn rpc_signrawtransactionwithwallet(state: &RpcState, params: &Value) -> R
 async fn rpc_dumpprivkey(state: &RpcState, params: &Value) -> RpcResult {
     let wallet_arc = require_wallet!(state);
 
-    let address = params.get(0).and_then(Value::as_str)
+    let address = params
+        .get(0)
+        .and_then(Value::as_str)
         .ok_or((-32602, "missing address".to_string()))?;
 
     let w = wallet_arc.read().await;
@@ -621,7 +653,9 @@ async fn rpc_dumpprivkey(state: &RpcState, params: &Value) -> RpcResult {
 async fn rpc_importprivkey(state: &RpcState, params: &Value) -> RpcResult {
     let wallet_arc = require_wallet!(state);
 
-    let wif = params.get(0).and_then(Value::as_str)
+    let wif = params
+        .get(0)
+        .and_then(Value::as_str)
         .ok_or((-32602, "missing WIF private key".to_string()))?;
     let label = params.get(1).and_then(Value::as_str).unwrap_or("");
 
@@ -647,7 +681,10 @@ async fn rpc_getwalletinfo(state: &RpcState) -> RpcResult {
 // ── Mining RPC implementations ────────────────────────────────────────────────
 
 /// Build a `BlockTemplate` from the current chain/mempool state.
-async fn build_template(state: &RpcState, output_script: rbtc_primitives::script::Script) -> BlockTemplate {
+async fn build_template(
+    state: &RpcState,
+    output_script: rbtc_primitives::script::Script,
+) -> BlockTemplate {
     let chain = state.chain.read().await;
     let mempool = state.mempool.read().await;
 
@@ -688,24 +725,27 @@ async fn rpc_getblocktemplate(state: &RpcState, _params: &Value) -> RpcResult {
     let target_hex = hex::encode(target_bytes);
 
     // Encode each selected transaction
-    let tx_entries: Vec<Value> = transactions.iter().map(|tx| {
-        let mut buf = Vec::new();
-        tx.encode(&mut buf).unwrap_or_default();
-        let mut legacy_buf = Vec::new();
-        tx.encode_legacy(&mut legacy_buf).unwrap_or_default();
-        let txid = rbtc_crypto::sha256d(&legacy_buf).to_hex();
-        json!({
-            "data":   hex::encode(&buf),
-            "txid":   txid,
-            "fee":    0u64,   // fees per-tx not tracked in mempool entry here
-            "weight": tx.weight(),
+    let tx_entries: Vec<Value> = transactions
+        .iter()
+        .map(|tx| {
+            let mut buf = Vec::new();
+            tx.encode(&mut buf).unwrap_or_default();
+            let mut legacy_buf = Vec::new();
+            tx.encode_legacy(&mut legacy_buf).unwrap_or_default();
+            let txid = rbtc_crypto::sha256d(&legacy_buf).to_hex();
+            json!({
+                "data":   hex::encode(&buf),
+                "txid":   txid,
+                "fee":    0u64,   // fees per-tx not tracked in mempool entry here
+                "weight": tx.weight(),
+            })
         })
-    }).collect();
+        .collect();
 
     let curtime = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs() as u64;
+        .as_secs();
 
     Ok(json!({
         "version":           0x2000_0000i64,
@@ -735,8 +775,8 @@ async fn rpc_submitblock(state: &RpcState, params: &Value) -> RpcResult {
         .ok_or((-32602, "expected hex-encoded block".to_string()))?;
 
     let raw = hex::decode(hex_str).map_err(|_| (-22, "block decode failed".to_string()))?;
-    let block = Block::decode_from_slice(&raw)
-        .map_err(|e| (-22, format!("block decode failed: {e}")))?;
+    let block =
+        Block::decode_from_slice(&raw).map_err(|e| (-22, format!("block decode failed: {e}")))?;
 
     state
         .submit_block_tx
@@ -756,8 +796,8 @@ async fn rpc_generatetoaddress(state: &RpcState, params: &Value) -> RpcResult {
         .and_then(Value::as_str)
         .ok_or((-32602, "expected address".to_string()))?;
 
-    let output_script = address_to_script(address)
-        .map_err(|e| (-5, format!("invalid address: {e}")))?;
+    let output_script =
+        address_to_script(address).map_err(|e| (-5, format!("invalid address: {e}")))?;
 
     let mut block_hashes: Vec<String> = Vec::with_capacity(nblocks);
 
@@ -782,7 +822,10 @@ async fn rpc_generatetoaddress(state: &RpcState, params: &Value) -> RpcResult {
             .map_err(|_| (-1, "node channel closed".to_string()))?;
 
         block_hashes.push(hash);
-        info!("generatetoaddress: mined block {}", block_hashes.last().unwrap());
+        info!(
+            "generatetoaddress: mined block {}",
+            block_hashes.last().unwrap()
+        );
 
         // Brief yield so the node event loop can process the submitted block
         // and update its chain state before we build the next template.
@@ -866,7 +909,7 @@ async fn rpc_estimatesmartfee(state: &RpcState, params: &Value) -> RpcResult {
         //   4-6      → 50th percentile (median)
         //   7+       → 25th percentile
         let percentile = match conf_target {
-            0..=1 => 0.10,  // top 10% → index = len * 0.10
+            0..=1 => 0.10, // top 10% → index = len * 0.10
             2..=3 => 0.25,
             4..=6 => 0.50,
             _ => 0.75,
@@ -953,8 +996,14 @@ async fn rpc_getaddresstxids(state: &RpcState, params: &Value) -> RpcResult {
 
     let script = resolve_script(address)?;
 
-    let filter_start = params.get(1).and_then(|v| v.get("start")).and_then(Value::as_u64);
-    let filter_end   = params.get(1).and_then(|v| v.get("end")).and_then(Value::as_u64);
+    let filter_start = params
+        .get(1)
+        .and_then(|v| v.get("start"))
+        .and_then(Value::as_u64);
+    let filter_end = params
+        .get(1)
+        .and_then(|v| v.get("end"))
+        .and_then(Value::as_u64);
 
     let addr_idx = AddrIndexStore::new(&state.db);
     let entries = addr_idx
@@ -965,7 +1014,7 @@ async fn rpc_getaddresstxids(state: &RpcState, params: &Value) -> RpcResult {
         .into_iter()
         .filter(|e| {
             let h = e.height as u64;
-            filter_start.map_or(true, |s| h >= s) && filter_end.map_or(true, |en| h <= en)
+            filter_start.is_none_or(|s| h >= s) && filter_end.is_none_or(|en| h <= en)
         })
         .map(|e| json!(e.txid.to_hex()))
         .collect();
@@ -1019,7 +1068,10 @@ async fn rpc_getaddressutxos(state: &RpcState, params: &Value) -> RpcResult {
             let mut txid_buf = Vec::new();
             tx.encode_legacy(&mut txid_buf).ok();
             let txid = sha256d(&txid_buf);
-            let outpoint = OutPoint { txid, vout: vout as u32 };
+            let outpoint = OutPoint {
+                txid,
+                vout: vout as u32,
+            };
             if chain.utxos.get(&outpoint).is_some() {
                 let confirmations = best_height.saturating_sub(entry.height) + 1;
                 utxos.push(json!({
@@ -1082,7 +1134,10 @@ async fn rpc_getaddressbalance(state: &RpcState, params: &Value) -> RpcResult {
                 continue;
             }
             received += output.value;
-            let outpoint = OutPoint { txid, vout: vout as u32 };
+            let outpoint = OutPoint {
+                txid,
+                vout: vout as u32,
+            };
             if chain.utxos.get(&outpoint).is_some() {
                 balance += output.value;
             }
@@ -1098,32 +1153,45 @@ async fn rpc_getaddressbalance(state: &RpcState, params: &Value) -> RpcResult {
 ///
 /// Params: [ [{txid, vout, sequence?}, ...], [{address: amount_sats}, ...], locktime? ]
 async fn rpc_createpsbt(_state: &RpcState, params: &Value) -> RpcResult {
-    let inputs_raw = params.get(0)
+    let inputs_raw = params
+        .get(0)
         .and_then(|v| v.as_array())
         .ok_or((-8, "params[0] must be array of inputs".to_string()))?;
-    let outputs_raw = params.get(1)
-        .and_then(|v| v.as_object())
-        .ok_or((-8, "params[1] must be object of {address: sats}".to_string()))?;
+    let outputs_raw = params.get(1).and_then(|v| v.as_object()).ok_or((
+        -8,
+        "params[1] must be object of {address: sats}".to_string(),
+    ))?;
     let locktime = params.get(2).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
 
-    use rbtc_primitives::{hash::Hash256, transaction::{TxIn, TxOut}};
+    use rbtc_primitives::{
+        hash::Hash256,
+        transaction::{TxIn, TxOut},
+    };
     let mut inputs = Vec::new();
     for inp in inputs_raw {
-        let txid_hex = inp.get("txid").and_then(|v| v.as_str())
+        let txid_hex = inp
+            .get("txid")
+            .and_then(|v| v.as_str())
             .ok_or((-8, "input missing txid".to_string()))?;
-        let vout = inp.get("vout").and_then(|v| v.as_u64())
+        let vout = inp
+            .get("vout")
+            .and_then(|v| v.as_u64())
             .ok_or((-8, "input missing vout".to_string()))? as u32;
-        let sequence = inp.get("sequence").and_then(|v| v.as_u64())
+        let sequence = inp
+            .get("sequence")
+            .and_then(|v| v.as_u64())
             .unwrap_or(0xffffffff) as u32;
-        let txid_bytes = hex::decode(txid_hex)
-            .map_err(|_| (-8, "invalid txid hex".to_string()))?;
+        let txid_bytes = hex::decode(txid_hex).map_err(|_| (-8, "invalid txid hex".to_string()))?;
         if txid_bytes.len() != 32 {
             return Err((-8, "txid must be 32 bytes".to_string()));
         }
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&txid_bytes);
         inputs.push(TxIn {
-            previous_output: rbtc_primitives::transaction::OutPoint { txid: Hash256(arr), vout },
+            previous_output: rbtc_primitives::transaction::OutPoint {
+                txid: Hash256(arr),
+                vout,
+            },
             script_sig: rbtc_primitives::script::Script::new(),
             sequence,
             witness: vec![],
@@ -1132,15 +1200,22 @@ async fn rpc_createpsbt(_state: &RpcState, params: &Value) -> RpcResult {
 
     let mut txouts = Vec::new();
     for (addr, amount_val) in outputs_raw {
-        let amount = amount_val.as_u64()
+        let amount = amount_val
+            .as_u64()
             .ok_or((-8, format!("amount for {addr} must be integer sats")))?;
-        let script = address_to_script(addr)
-            .map_err(|e| (-8, format!("invalid address {addr}: {e}")))?;
-        txouts.push(TxOut { value: amount, script_pubkey: script });
+        let script =
+            address_to_script(addr).map_err(|e| (-8, format!("invalid address {addr}: {e}")))?;
+        txouts.push(TxOut {
+            value: amount,
+            script_pubkey: script,
+        });
     }
 
     let tx = rbtc_primitives::transaction::Transaction {
-        version: 2, inputs, outputs: txouts, lock_time: locktime,
+        version: 2,
+        inputs,
+        outputs: txouts,
+        lock_time: locktime,
     };
     let psbt = Psbt::create(tx);
     Ok(json!(psbt.to_base64()))
@@ -1148,12 +1223,15 @@ async fn rpc_createpsbt(_state: &RpcState, params: &Value) -> RpcResult {
 
 /// `walletprocesspsbt` — Updater + Signer using the node's built-in wallet.
 async fn rpc_walletprocesspsbt(state: &RpcState, params: &Value) -> RpcResult {
-    let b64 = params.get(0).and_then(|v| v.as_str())
+    let b64 = params
+        .get(0)
+        .and_then(|v| v.as_str())
         .ok_or((-8, "params[0] must be PSBT base64 string".to_string()))?;
-    let mut psbt = Psbt::from_base64(b64)
-        .map_err(|e| (-8, format!("PSBT decode: {e}")))?;
+    let mut psbt = Psbt::from_base64(b64).map_err(|e| (-8, format!("PSBT decode: {e}")))?;
 
-    let wallet_arc = state.wallet.as_ref()
+    let wallet_arc = state
+        .wallet
+        .as_ref()
         .ok_or((-18, "Wallet not loaded".to_string()))?;
     let wallet = wallet_arc.read().await;
 
@@ -1164,7 +1242,9 @@ async fn rpc_walletprocesspsbt(state: &RpcState, params: &Value) -> RpcResult {
             txout.script_pubkey.as_bytes().to_vec()
         } else if let Some(tx) = psbt.inputs[i].non_witness_utxo.as_ref() {
             let vout = psbt.global.unsigned_tx.inputs[i].previous_output.vout as usize;
-            tx.outputs.get(vout).map(|o| o.script_pubkey.as_bytes().to_vec())
+            tx.outputs
+                .get(vout)
+                .map(|o| o.script_pubkey.as_bytes().to_vec())
                 .unwrap_or_default()
         } else {
             continue;
@@ -1185,16 +1265,20 @@ async fn rpc_walletprocesspsbt(state: &RpcState, params: &Value) -> RpcResult {
 
 /// `finalizepsbt` — Finalizer + Extractor.
 async fn rpc_finalizepsbt(_state: &RpcState, params: &Value) -> RpcResult {
-    let b64 = params.get(0).and_then(|v| v.as_str())
+    let b64 = params
+        .get(0)
+        .and_then(|v| v.as_str())
         .ok_or((-8, "params[0] must be PSBT base64 string".to_string()))?;
-    let mut psbt = Psbt::from_base64(b64)
-        .map_err(|e| (-8, format!("PSBT decode: {e}")))?;
+    let mut psbt = Psbt::from_base64(b64).map_err(|e| (-8, format!("PSBT decode: {e}")))?;
 
-    psbt.finalize().map_err(|e| (-8, format!("finalize error: {e}")))?;
+    psbt.finalize()
+        .map_err(|e| (-8, format!("finalize error: {e}")))?;
 
     let complete = psbt.inputs.iter().all(|i| i.is_finalized());
     if complete {
-        let tx = psbt.clone().extract_tx()
+        let tx = psbt
+            .clone()
+            .extract_tx()
             .map_err(|e| (-8, format!("extract error: {e}")))?;
         let mut buf = Vec::new();
         tx.encode(&mut buf).ok();
@@ -1206,9 +1290,10 @@ async fn rpc_finalizepsbt(_state: &RpcState, params: &Value) -> RpcResult {
 
 /// `combinepsbt` — Combiner.
 async fn rpc_combinepsbt(_state: &RpcState, params: &Value) -> RpcResult {
-    let psbts_raw = params.get(0)
-        .and_then(|v| v.as_array())
-        .ok_or((-8, "params[0] must be array of PSBT base64 strings".to_string()))?;
+    let psbts_raw = params.get(0).and_then(|v| v.as_array()).ok_or((
+        -8,
+        "params[0] must be array of PSBT base64 strings".to_string(),
+    ))?;
 
     if psbts_raw.is_empty() {
         return Err((-8, "at least one PSBT required".to_string()));
@@ -1220,7 +1305,8 @@ async fn rpc_combinepsbt(_state: &RpcState, params: &Value) -> RpcResult {
     for (idx, val) in psbts_raw.iter().enumerate().skip(1) {
         let other = Psbt::from_base64(val.as_str().unwrap_or(""))
             .map_err(|e| (-8, format!("PSBT[{idx}] decode: {e}")))?;
-        combined.combine(other)
+        combined
+            .combine(other)
             .map_err(|e| (-8, format!("combine error at [{idx}]: {e}")))?;
     }
 
@@ -1229,24 +1315,30 @@ async fn rpc_combinepsbt(_state: &RpcState, params: &Value) -> RpcResult {
 
 /// `decodepsbt` — human-readable PSBT inspection.
 async fn rpc_decodepsbt(_state: &RpcState, params: &Value) -> RpcResult {
-    let b64 = params.get(0).and_then(|v| v.as_str())
+    let b64 = params
+        .get(0)
+        .and_then(|v| v.as_str())
         .ok_or((-8, "params[0] must be PSBT base64 string".to_string()))?;
-    let psbt = Psbt::from_base64(b64)
-        .map_err(|e| (-8, format!("PSBT decode: {e}")))?;
+    let psbt = Psbt::from_base64(b64).map_err(|e| (-8, format!("PSBT decode: {e}")))?;
 
-    let inputs: Vec<Value> = psbt.inputs.iter().enumerate().map(|(i, inp)| {
-        let mut obj = json!({
-            "has_non_witness_utxo": inp.non_witness_utxo.is_some(),
-            "has_witness_utxo": inp.witness_utxo.is_some(),
-            "partial_sigs": inp.partial_sigs.len(),
-            "finalized": inp.is_finalized(),
-        });
-        if let Some(sh) = inp.sighash_type {
-            obj["sighash_type"] = json!(sh);
-        }
-        let _ = i;
-        obj
-    }).collect();
+    let inputs: Vec<Value> = psbt
+        .inputs
+        .iter()
+        .enumerate()
+        .map(|(i, inp)| {
+            let mut obj = json!({
+                "has_non_witness_utxo": inp.non_witness_utxo.is_some(),
+                "has_witness_utxo": inp.witness_utxo.is_some(),
+                "partial_sigs": inp.partial_sigs.len(),
+                "finalized": inp.is_finalized(),
+            });
+            if let Some(sh) = inp.sighash_type {
+                obj["sighash_type"] = json!(sh);
+            }
+            let _ = i;
+            obj
+        })
+        .collect();
 
     let unsigned_txid = {
         let mut buf = Vec::new();
@@ -1264,23 +1356,28 @@ async fn rpc_decodepsbt(_state: &RpcState, params: &Value) -> RpcResult {
 
 /// `analyzepsbt` — per-input signing status report.
 async fn rpc_analyzepsbt(_state: &RpcState, params: &Value) -> RpcResult {
-    let b64 = params.get(0).and_then(|v| v.as_str())
+    let b64 = params
+        .get(0)
+        .and_then(|v| v.as_str())
         .ok_or((-8, "params[0] must be PSBT base64 string".to_string()))?;
-    let psbt = Psbt::from_base64(b64)
-        .map_err(|e| (-8, format!("PSBT decode: {e}")))?;
+    let psbt = Psbt::from_base64(b64).map_err(|e| (-8, format!("PSBT decode: {e}")))?;
 
-    let inputs: Vec<Value> = psbt.inputs.iter().map(|inp| {
-        let status = if inp.is_finalized() {
-            "finalized"
-        } else if !inp.partial_sigs.is_empty() {
-            "partially_signed"
-        } else if inp.witness_utxo.is_some() || inp.non_witness_utxo.is_some() {
-            "ready_to_sign"
-        } else {
-            "missing_utxo"
-        };
-        json!({ "status": status, "partial_sigs": inp.partial_sigs.len() })
-    }).collect();
+    let inputs: Vec<Value> = psbt
+        .inputs
+        .iter()
+        .map(|inp| {
+            let status = if inp.is_finalized() {
+                "finalized"
+            } else if !inp.partial_sigs.is_empty() {
+                "partially_signed"
+            } else if inp.witness_utxo.is_some() || inp.non_witness_utxo.is_some() {
+                "ready_to_sign"
+            } else {
+                "missing_utxo"
+            };
+            json!({ "status": status, "partial_sigs": inp.partial_sigs.len() })
+        })
+        .collect();
 
     let all_finalized = psbt.inputs.iter().all(|i| i.is_finalized());
     Ok(json!({ "inputs": inputs, "estimated_complete": all_finalized }))
@@ -1298,10 +1395,7 @@ async fn rpc_getchaintips(state: &RpcState) -> RpcResult {
         .values()
         .map(|bi| bi.header.prev_block)
         .collect();
-    let tips: Vec<Hash256> = all_hashes
-        .difference(&parent_hashes)
-        .copied()
-        .collect();
+    let tips: Vec<Hash256> = all_hashes.difference(&parent_hashes).copied().collect();
     let best = chain.best_tip;
     let best_height = chain.height();
 
@@ -1420,12 +1514,11 @@ async fn rpc_getmempoolentry(state: &RpcState, params: &Value) -> RpcResult {
         .get(0)
         .and_then(Value::as_str)
         .ok_or((-32602, "Expected txid".to_string()))?;
-    let txid =
-        Hash256::from_hex(txid_hex).map_err(|_| (-8, "Invalid txid".to_string()))?;
+    let txid = Hash256::from_hex(txid_hex).map_err(|_| (-8, "Invalid txid".to_string()))?;
     let mp = state.mempool.read().await;
     let entry = mp
         .get(&txid)
-        .ok_or((-5, format!("Transaction not in mempool")))?;
+        .ok_or((-5, "Transaction not in mempool".to_string()))?;
     let (anc_fee, anc_vsize) = mp.ancestor_package(&txid);
     let anc_count = {
         // count ancestors by walking parents
@@ -1465,8 +1558,7 @@ async fn rpc_getmempoolancestors(state: &RpcState, params: &Value) -> RpcResult 
         .get(0)
         .and_then(Value::as_str)
         .ok_or((-32602, "Expected txid".to_string()))?;
-    let txid =
-        Hash256::from_hex(txid_hex).map_err(|_| (-8, "Invalid txid".to_string()))?;
+    let txid = Hash256::from_hex(txid_hex).map_err(|_| (-8, "Invalid txid".to_string()))?;
     let mp = state.mempool.read().await;
     if !mp.contains(&txid) {
         return Err((-5, "Transaction not in mempool".to_string()));
@@ -1498,8 +1590,7 @@ async fn rpc_getmempooldescendants(state: &RpcState, params: &Value) -> RpcResul
         .get(0)
         .and_then(Value::as_str)
         .ok_or((-32602, "Expected txid".to_string()))?;
-    let txid =
-        Hash256::from_hex(txid_hex).map_err(|_| (-8, "Invalid txid".to_string()))?;
+    let txid = Hash256::from_hex(txid_hex).map_err(|_| (-8, "Invalid txid".to_string()))?;
     let mp = state.mempool.read().await;
     if !mp.contains(&txid) {
         return Err((-5, "Transaction not in mempool".to_string()));
@@ -1542,8 +1633,7 @@ async fn rpc_testmempoolaccept(state: &RpcState, params: &Value) -> RpcResult {
         let hex_str = raw
             .as_str()
             .ok_or((-32602, "Expected hex string".to_string()))?;
-        let bytes =
-            hex::decode(hex_str).map_err(|_| (-22, "Invalid hex".to_string()))?;
+        let bytes = hex::decode(hex_str).map_err(|_| (-22, "Invalid hex".to_string()))?;
         let tx = Transaction::decode(&mut &bytes[..])
             .map_err(|e| (-22, format!("TX decode failed: {e}")))?;
 
@@ -1601,8 +1691,7 @@ async fn rpc_testmempoolaccept(state: &RpcState, params: &Value) -> RpcResult {
                     if let Some(utxo) = chain.utxos.get(&inp.previous_output) {
                         total_in += utxo.txout.value;
                     } else if let Some(parent) = mp.get(&inp.previous_output.txid) {
-                        if let Some(out) =
-                            parent.tx.outputs.get(inp.previous_output.vout as usize)
+                        if let Some(out) = parent.tx.outputs.get(inp.previous_output.vout as usize)
                         {
                             total_in += out.value;
                         }
@@ -1638,8 +1727,6 @@ fn classify_script(script: &rbtc_primitives::script::Script) -> &'static str {
         "witness_v1_taproot"
     } else if script.is_op_return() {
         "nulldata"
-    } else if script.0.is_empty() {
-        "nonstandard"
     } else {
         "nonstandard"
     }
@@ -1685,8 +1772,7 @@ async fn rpc_decoderawtransaction(_state: &RpcState, params: &Value) -> RpcResul
         .get(0)
         .and_then(Value::as_str)
         .ok_or((-32602, "Expected hex string".to_string()))?;
-    let bytes =
-        hex::decode(hex_str).map_err(|_| (-22, "Invalid hex".to_string()))?;
+    let bytes = hex::decode(hex_str).map_err(|_| (-22, "Invalid hex".to_string()))?;
     let tx = Transaction::decode(&mut &bytes[..])
         .map_err(|e| (-22, format!("TX decode failed: {e}")))?;
 
@@ -1708,9 +1794,7 @@ async fn rpc_decoderawtransaction(_state: &RpcState, params: &Value) -> RpcResul
                 "sequence": inp.sequence,
             });
             if !inp.witness.is_empty() {
-                v["txinwitness"] = json!(
-                    inp.witness.iter().map(hex::encode).collect::<Vec<_>>()
-                );
+                v["txinwitness"] = json!(inp.witness.iter().map(hex::encode).collect::<Vec<_>>());
             }
             v
         })
@@ -1749,14 +1833,13 @@ async fn rpc_decodescript(_state: &RpcState, params: &Value) -> RpcResult {
         .get(0)
         .and_then(Value::as_str)
         .ok_or((-32602, "Expected hex string".to_string()))?;
-    let bytes =
-        hex::decode(hex_str).map_err(|_| (-22, "Invalid hex".to_string()))?;
+    let bytes = hex::decode(hex_str).map_err(|_| (-22, "Invalid hex".to_string()))?;
     let script = rbtc_primitives::script::Script::from_bytes(bytes.clone());
     let script_type = classify_script(&script);
 
     // Compute P2SH address: hash160 of the script, then base58check
     let script_hash = rbtc_crypto::hash160(&bytes);
-    let p2sh_hex = hex::encode(&script_hash.0);
+    let p2sh_hex = hex::encode(script_hash.0);
 
     Ok(json!({
         "type": script_type,
@@ -1789,8 +1872,7 @@ async fn rpc_createmultisig(_state: &RpcState, params: &Value) -> RpcResult {
         let key_hex = key_val
             .as_str()
             .ok_or((-8, "Expected hex pubkey".to_string()))?;
-        let key_bytes =
-            hex::decode(key_hex).map_err(|_| (-8, "Invalid hex pubkey".to_string()))?;
+        let key_bytes = hex::decode(key_hex).map_err(|_| (-8, "Invalid hex pubkey".to_string()))?;
         if key_bytes.len() != 33 && key_bytes.len() != 65 {
             return Err((-8, "Invalid pubkey length".to_string()));
         }
@@ -1804,7 +1886,7 @@ async fn rpc_createmultisig(_state: &RpcState, params: &Value) -> RpcResult {
     let redeem_script_hex = hex::encode(&script_bytes);
 
     Ok(json!({
-        "address": hex::encode(&script_hash.0),
+        "address": hex::encode(script_hash.0),
         "redeemScript": redeem_script_hex,
     }))
 }
@@ -1874,7 +1956,11 @@ async fn rpc_verifymessage(_state: &RpcState, params: &Value) -> RpcResult {
         // For uncompressed keys, serialize uncompressed and hash
         let uncompressed = recovered_pk.serialize_uncompressed();
         let h160 = rbtc_crypto::hash160(&uncompressed);
-        let version = if network == Network::Mainnet { 0x00u8 } else { 0x6fu8 };
+        let version = if network == Network::Mainnet {
+            0x00u8
+        } else {
+            0x6fu8
+        };
         let mut payload = vec![version];
         payload.extend_from_slice(&h160.0);
         use sha2::{Digest, Sha256};
@@ -1964,7 +2050,10 @@ async fn rpc_getpeerinfo(_state: &RpcState) -> RpcResult {
 
 /// `dumpwallet "filename"` — Dumps all wallet keys and addresses to a file.
 async fn rpc_dumpwallet(state: &RpcState, params: &Value) -> RpcResult {
-    let wallet = state.wallet.as_ref().ok_or((-18, "No wallet loaded".into()))?;
+    let wallet = state
+        .wallet
+        .as_ref()
+        .ok_or((-18, "No wallet loaded".into()))?;
     let filename = params
         .get(0)
         .and_then(Value::as_str)
@@ -1992,14 +2081,17 @@ async fn rpc_dumpwallet(state: &RpcState, params: &Value) -> RpcResult {
 
 /// `importwallet "filename"` — Imports keys from a wallet dump file.
 async fn rpc_importwallet(state: &RpcState, params: &Value) -> RpcResult {
-    let wallet = state.wallet.as_ref().ok_or((-18, "No wallet loaded".into()))?;
+    let wallet = state
+        .wallet
+        .as_ref()
+        .ok_or((-18, "No wallet loaded".into()))?;
     let filename = params
         .get(0)
         .and_then(Value::as_str)
         .ok_or((-1, "Missing filename parameter".into()))?;
 
-    let content = std::fs::read_to_string(filename)
-        .map_err(|e| (-1, format!("Failed to read file: {e}")))?;
+    let content =
+        std::fs::read_to_string(filename).map_err(|e| (-1, format!("Failed to read file: {e}")))?;
 
     let mut imported = 0usize;
     let mut w = wallet.write().await;
@@ -2175,7 +2267,8 @@ mod tests {
 
     #[test]
     fn classify_op_return() {
-        let script = rbtc_primitives::script::Script::from_bytes(vec![0x6a, 0x04, 0xde, 0xad, 0xbe, 0xef]);
+        let script =
+            rbtc_primitives::script::Script::from_bytes(vec![0x6a, 0x04, 0xde, 0xad, 0xbe, 0xef]);
         assert_eq!(classify_script(&script), "nulldata");
     }
 
@@ -2238,7 +2331,9 @@ mod tests {
     #[tokio::test]
     async fn validate_address_invalid() {
         let (state, _tmpdir) = test_state();
-        let result = rpc_validateaddress(&state, &json!(["not_an_address"])).await.unwrap();
+        let result = rpc_validateaddress(&state, &json!(["not_an_address"]))
+            .await
+            .unwrap();
         assert_eq!(result["isvalid"], false);
     }
 
@@ -2250,7 +2345,9 @@ mod tests {
         // Two dummy compressed pubkeys
         let pk1 = "02".to_string() + &"ab".repeat(32);
         let pk2 = "03".to_string() + &"cd".repeat(32);
-        let result = rpc_createmultisig(&state, &json!([1, [pk1, pk2]])).await.unwrap();
+        let result = rpc_createmultisig(&state, &json!([1, [pk1, pk2]]))
+            .await
+            .unwrap();
         assert!(!result["redeemScript"].as_str().unwrap().is_empty());
         assert!(!result["address"].as_str().unwrap().is_empty());
     }
@@ -2281,7 +2378,9 @@ mod tests {
         let (state, _tmpdir) = test_state();
         // Coinbase transaction hex
         let hex = "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff03020000ffffffff0100f2052a010000000000000000";
-        let result = rpc_testmempoolaccept(&state, &json!([[hex]])).await.unwrap();
+        let result = rpc_testmempoolaccept(&state, &json!([[hex]]))
+            .await
+            .unwrap();
         let arr = result.as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["allowed"], false);
@@ -2340,7 +2439,8 @@ mod tests {
         let result = rpc_getmempoolentry(
             &state,
             &json!(["0000000000000000000000000000000000000000000000000000000000000000"]),
-        ).await;
+        )
+        .await;
         assert!(result.is_err());
     }
 
@@ -2352,7 +2452,8 @@ mod tests {
         let result = rpc_getmempoolancestors(
             &state,
             &json!(["0000000000000000000000000000000000000000000000000000000000000000"]),
-        ).await;
+        )
+        .await;
         assert!(result.is_err());
     }
 
@@ -2362,7 +2463,8 @@ mod tests {
         let result = rpc_getmempooldescendants(
             &state,
             &json!(["0000000000000000000000000000000000000000000000000000000000000000"]),
-        ).await;
+        )
+        .await;
         assert!(result.is_err());
     }
 
@@ -2374,7 +2476,8 @@ mod tests {
         let result = rpc_verifymessage(
             &state,
             &json!(["1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", "sig", "msg"]),
-        ).await;
+        )
+        .await;
         assert!(result.is_err());
     }
 
@@ -2383,8 +2486,12 @@ mod tests {
         let (state, _tmpdir) = test_state();
         let result = rpc_signmessagewithprivkey(
             &state,
-            &json!(["KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU73sVHnoWn", "hello"]),
-        ).await;
+            &json!([
+                "KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU73sVHnoWn",
+                "hello"
+            ]),
+        )
+        .await;
         let sig = result.unwrap();
         // Should be a base64 string
         assert!(sig.as_str().unwrap().len() > 0);

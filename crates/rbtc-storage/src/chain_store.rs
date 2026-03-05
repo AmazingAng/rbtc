@@ -1,5 +1,8 @@
+use rbtc_primitives::{
+    codec::{Decodable, Encodable},
+    hash::BlockHash,
+};
 use rocksdb::WriteBatch;
-use rbtc_primitives::{codec::{Decodable, Encodable}, hash::BlockHash};
 
 use crate::{
     db::{Database, CF_CHAIN_STATE},
@@ -68,7 +71,8 @@ impl<'db> ChainStore<'db> {
     }
 
     pub fn set_chainwork(&self, work: u128) -> Result<()> {
-        self.db.put_cf(CF_CHAIN_STATE, KEY_CHAINWORK, &work.to_le_bytes())
+        self.db
+            .put_cf(CF_CHAIN_STATE, KEY_CHAINWORK, &work.to_le_bytes())
     }
 
     pub fn get_network_magic(&self) -> Result<Option<[u8; 4]>> {
@@ -103,13 +107,13 @@ impl<'db> ChainStore<'db> {
             .put_cf(CF_CHAIN_STATE, KEY_INDEXED_HEIGHT, &height.encode_to_vec())
     }
 
-    pub fn update_indexed_height_batch(
-        &self,
-        batch: &mut WriteBatch,
-        height: u32,
-    ) -> Result<()> {
-        self.db
-            .batch_put_cf(batch, CF_CHAIN_STATE, KEY_INDEXED_HEIGHT, &height.encode_to_vec())
+    pub fn update_indexed_height_batch(&self, batch: &mut WriteBatch, height: u32) -> Result<()> {
+        self.db.batch_put_cf(
+            batch,
+            CF_CHAIN_STATE,
+            KEY_INDEXED_HEIGHT,
+            &height.encode_to_vec(),
+        )
     }
 
     /// Atomically update tip + height + chainwork (self-contained batch).
@@ -127,9 +131,20 @@ impl<'db> ChainStore<'db> {
         height: u32,
         chainwork: u128,
     ) -> Result<()> {
-        self.db.batch_put_cf(batch, CF_CHAIN_STATE, KEY_BEST_BLOCK, &hash.0)?;
-        self.db.batch_put_cf(batch, CF_CHAIN_STATE, KEY_BEST_HEIGHT, &height.encode_to_vec())?;
-        self.db.batch_put_cf(batch, CF_CHAIN_STATE, KEY_CHAINWORK, &chainwork.to_le_bytes())?;
+        self.db
+            .batch_put_cf(batch, CF_CHAIN_STATE, KEY_BEST_BLOCK, &hash.0)?;
+        self.db.batch_put_cf(
+            batch,
+            CF_CHAIN_STATE,
+            KEY_BEST_HEIGHT,
+            &height.encode_to_vec(),
+        )?;
+        self.db.batch_put_cf(
+            batch,
+            CF_CHAIN_STATE,
+            KEY_CHAINWORK,
+            &chainwork.to_le_bytes(),
+        )?;
         Ok(())
     }
 }
@@ -137,9 +152,9 @@ impl<'db> ChainStore<'db> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::Database;
     use rbtc_primitives::hash::Hash256;
     use tempfile::TempDir;
-    use crate::db::Database;
 
     #[test]
     fn chain_store_best_block_height_chainwork() {
@@ -178,7 +193,9 @@ mod tests {
         let store = ChainStore::new(&db);
         let hash: BlockHash = Hash256([3; 32]);
         let mut batch = db.new_batch();
-        store.update_tip_batch(&mut batch, &hash, 300, 3000).unwrap();
+        store
+            .update_tip_batch(&mut batch, &hash, 300, 3000)
+            .unwrap();
         db.write_batch(batch).unwrap();
         assert_eq!(store.get_best_block().unwrap(), Some(hash));
         assert_eq!(store.get_best_height().unwrap(), Some(300));
@@ -189,18 +206,23 @@ mod tests {
     fn chain_store_invalid_best_block_hash_length() {
         let dir = TempDir::new().unwrap();
         let db = Database::open(dir.path()).unwrap();
-        db.put_cf(crate::db::CF_CHAIN_STATE, b"best_block", b"short").unwrap();
+        db.put_cf(crate::db::CF_CHAIN_STATE, b"best_block", b"short")
+            .unwrap();
         let store = ChainStore::new(&db);
         let r = store.get_best_block();
         assert!(r.is_err());
-        assert!(r.unwrap_err().to_string().contains("invalid best block hash"));
+        assert!(r
+            .unwrap_err()
+            .to_string()
+            .contains("invalid best block hash"));
     }
 
     #[test]
     fn chain_store_invalid_chainwork_length() {
         let dir = TempDir::new().unwrap();
         let db = Database::open(dir.path()).unwrap();
-        db.put_cf(crate::db::CF_CHAIN_STATE, b"chainwork", b"x").unwrap();
+        db.put_cf(crate::db::CF_CHAIN_STATE, b"chainwork", b"x")
+            .unwrap();
         let store = ChainStore::new(&db);
         let r = store.get_chainwork();
         assert!(r.is_err());
@@ -211,7 +233,8 @@ mod tests {
     fn chain_store_invalid_network_magic_length() {
         let dir = TempDir::new().unwrap();
         let db = Database::open(dir.path()).unwrap();
-        db.put_cf(crate::db::CF_CHAIN_STATE, b"network", b"xy").unwrap();
+        db.put_cf(crate::db::CF_CHAIN_STATE, b"network", b"xy")
+            .unwrap();
         let store = ChainStore::new(&db);
         let r = store.get_network_magic();
         assert!(r.is_err());

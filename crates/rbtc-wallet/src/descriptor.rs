@@ -23,9 +23,7 @@ use rbtc_primitives::script::Script;
 use secp256k1::PublicKey;
 
 use crate::{
-    address::{
-        address_to_script, p2pkh_script, p2tr_script, p2wpkh_script, taproot_output_key,
-    },
+    address::{address_to_script, p2pkh_script, p2tr_script, p2wpkh_script},
     error::WalletError,
 };
 
@@ -62,7 +60,10 @@ pub enum DescriptorKey {
     /// Hex-encoded compressed public key (33 bytes).
     Fixed(Vec<u8>),
     /// Extended public key with optional derivation path suffix (e.g., `xpub.../0/*`).
-    Xpub { key: String, path_suffix: Option<String> },
+    Xpub {
+        key: String,
+        path_suffix: Option<String>,
+    },
 }
 
 // ── Parsing ──────────────────────────────────────────────────────────────────
@@ -116,7 +117,9 @@ impl Descriptor {
             let (k, keys) = parse_multi_args(inner)?;
             return Ok(Descriptor::Multi(k, keys));
         }
-        Err(WalletError::InvalidAddress(format!("unrecognized descriptor: {s}")))
+        Err(WalletError::InvalidAddress(format!(
+            "unrecognized descriptor: {s}"
+        )))
     }
 
     /// Derive the scriptPubKey for this descriptor at the given index
@@ -150,7 +153,6 @@ impl Descriptor {
             Descriptor::Tr(key) => {
                 let pk = key.to_pubkey_at(index)?;
                 let secp = secp256k1::Secp256k1::new();
-                let sk_bytes = [1u8; 32]; // dummy — we only need the xonly from pubkey
                 // For tr() with just a pubkey, we treat it as the internal key and tweak
                 let (xonly, _) = pk.x_only_public_key();
                 // Apply taptweak: Q = P + H_TapTweak(P)*G
@@ -168,9 +170,11 @@ impl Descriptor {
                 Ok(build_multisig_script(*k, &pubkeys?))
             }
             Descriptor::SortedMulti(k, keys) => {
-                let mut pubkeys: Vec<PublicKey> =
-                    keys.iter().map(|k| k.to_pubkey_at(index)).collect::<Result<_, _>>()?;
-                pubkeys.sort_by(|a, b| a.serialize().cmp(&b.serialize()));
+                let mut pubkeys: Vec<PublicKey> = keys
+                    .iter()
+                    .map(|k| k.to_pubkey_at(index))
+                    .collect::<Result<_, _>>()?;
+                pubkeys.sort_by_key(|k| k.serialize());
                 Ok(build_multisig_script(*k, &pubkeys))
             }
             Descriptor::Wsh(inner) => {
@@ -218,8 +222,8 @@ impl DescriptorKey {
         let s = s.trim();
         // If it looks like hex (66 chars = 33 bytes compressed pubkey)
         if s.len() == 66 && s.chars().all(|c| c.is_ascii_hexdigit()) {
-            let bytes = hex::decode(s)
-                .map_err(|_| WalletError::InvalidAddress("bad hex key".into()))?;
+            let bytes =
+                hex::decode(s).map_err(|_| WalletError::InvalidAddress("bad hex key".into()))?;
             return Ok(DescriptorKey::Fixed(bytes));
         }
         // xpub/tpub with optional path
@@ -235,13 +239,21 @@ impl DescriptorKey {
             });
         }
         // Try as WIF
-        if s.len() >= 51 && s.len() <= 52 && (s.starts_with('K') || s.starts_with('L') || s.starts_with('5') || s.starts_with('c')) {
+        if s.len() >= 51
+            && s.len() <= 52
+            && (s.starts_with('K')
+                || s.starts_with('L')
+                || s.starts_with('5')
+                || s.starts_with('c'))
+        {
             let (sk, _) = crate::wif::from_wif(s)?;
             let secp = secp256k1::Secp256k1::signing_only();
             let pk = secp256k1::PublicKey::from_secret_key(&secp, &sk);
             return Ok(DescriptorKey::Fixed(pk.serialize().to_vec()));
         }
-        Err(WalletError::InvalidAddress(format!("unrecognized key: {s}")))
+        Err(WalletError::InvalidAddress(format!(
+            "unrecognized key: {s}"
+        )))
     }
 
     /// Resolve to a concrete `PublicKey` at the given derivation index.
@@ -249,8 +261,9 @@ impl DescriptorKey {
     /// For xpub keys, the path suffix is applied (replacing `*` with `index`).
     fn to_pubkey_at(&self, index: u32) -> Result<PublicKey, WalletError> {
         match self {
-            DescriptorKey::Fixed(bytes) => PublicKey::from_slice(bytes)
-                .map_err(|_| WalletError::InvalidKey),
+            DescriptorKey::Fixed(bytes) => {
+                PublicKey::from_slice(bytes).map_err(|_| WalletError::InvalidKey)
+            }
             DescriptorKey::Xpub { key, path_suffix } => {
                 let xpub = crate::hd::ExtendedPubKey::from_base58(key)?;
                 // Apply path suffix if present, e.g., "/0/*" → derive child 0, then child `index`
@@ -270,11 +283,6 @@ impl DescriptorKey {
                 Ok(current.public_key)
             }
         }
-    }
-
-    /// Convenience: resolve at index 0 (for non-ranged descriptors).
-    fn to_pubkey(&self) -> Result<PublicKey, WalletError> {
-        self.to_pubkey_at(0)
     }
 }
 
@@ -299,7 +307,9 @@ fn strip_func<'a>(s: &'a str, func: &str) -> Option<&'a str> {
 fn parse_multi_args(s: &str) -> Result<(u32, Vec<DescriptorKey>), WalletError> {
     let parts: Vec<&str> = s.split(',').map(|p| p.trim()).collect();
     if parts.len() < 2 {
-        return Err(WalletError::InvalidAddress("multi requires k and at least one key".into()));
+        return Err(WalletError::InvalidAddress(
+            "multi requires k and at least one key".into(),
+        ));
     }
     let k: u32 = parts[0]
         .parse()

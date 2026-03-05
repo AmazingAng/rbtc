@@ -78,7 +78,13 @@ impl Database {
         WriteBatch::default()
     }
 
-    pub fn batch_put_cf(&self, batch: &mut WriteBatch, cf_name: &str, key: &[u8], value: &[u8]) -> Result<()> {
+    pub fn batch_put_cf(
+        &self,
+        batch: &mut WriteBatch,
+        cf_name: &str,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<()> {
         let cf = self.cf(cf_name)?;
         batch.put_cf(cf, key, value);
         Ok(())
@@ -90,9 +96,14 @@ impl Database {
         Ok(())
     }
 
-    pub fn iter_cf(&self, cf_name: &str) -> Result<impl Iterator<Item = (Box<[u8]>, Box<[u8]>)> + '_> {
+    #[allow(clippy::type_complexity)]
+    pub fn iter_cf(
+        &self,
+        cf_name: &str,
+    ) -> Result<impl Iterator<Item = (Box<[u8]>, Box<[u8]>)> + '_> {
         let cf = self.cf(cf_name)?;
-        let iter = self.db
+        let iter = self
+            .db
             .iterator_cf(cf, IteratorMode::Start)
             .filter_map(|item| item.ok());
         Ok(iter)
@@ -102,7 +113,9 @@ impl Database {
     /// Returns a collected `Vec` so the borrow on `self` is not held across await points.
     pub fn iter_cf_prefix(&self, cf_name: &str, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let cf = self.cf(cf_name)?;
-        let iter = self.db.iterator_cf(cf, IteratorMode::From(prefix, rocksdb::Direction::Forward));
+        let iter = self
+            .db
+            .iterator_cf(cf, IteratorMode::From(prefix, rocksdb::Direction::Forward));
         let mut result = Vec::new();
         for item in iter {
             let (k, v) = item.map_err(StorageError::Rocks)?;
@@ -115,9 +128,9 @@ impl Database {
     }
 
     fn cf(&self, name: &str) -> Result<&ColumnFamily> {
-        self.db.cf_handle(name).ok_or_else(|| {
-            StorageError::Corruption(format!("column family '{name}' not found"))
-        })
+        self.db
+            .cf_handle(name)
+            .ok_or_else(|| StorageError::Corruption(format!("column family '{name}' not found")))
     }
 
     /// Delete all keys in `[from, to)` for the given column family.
@@ -144,7 +157,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Database::open(dir.path()).unwrap();
         db.put_cf(CF_BLOCK_INDEX, b"key1", b"val1").unwrap();
-        assert_eq!(db.get_cf(CF_BLOCK_INDEX, b"key1").unwrap(), Some(b"val1".to_vec()));
+        assert_eq!(
+            db.get_cf(CF_BLOCK_INDEX, b"key1").unwrap(),
+            Some(b"val1".to_vec())
+        );
         db.delete_cf(CF_BLOCK_INDEX, b"key1").unwrap();
         assert_eq!(db.get_cf(CF_BLOCK_INDEX, b"key1").unwrap(), None);
     }

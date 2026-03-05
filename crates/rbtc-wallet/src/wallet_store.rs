@@ -92,8 +92,7 @@ impl<'a> WalletStore<'a> {
 
     pub fn put_address(&self, info: &StoredAddressInfo) -> Result<(), WalletError> {
         let key = format!("addr:{}", info.address);
-        let val = serde_json::to_vec(info)
-            .map_err(|e| WalletError::Storage(e.to_string()))?;
+        let val = serde_json::to_vec(info).map_err(|e| WalletError::Storage(e.to_string()))?;
         self.db
             .put_cf(CF_WALLET, key.as_bytes(), &val)
             .map_err(|e| WalletError::Storage(e.to_string()))
@@ -119,10 +118,13 @@ impl<'a> WalletStore<'a> {
         format!("utxo:{}:{}", outpoint.txid.to_hex(), outpoint.vout)
     }
 
-    pub fn put_utxo(&self, outpoint: &OutPoint, utxo: &StoredWalletUtxo) -> Result<(), WalletError> {
+    pub fn put_utxo(
+        &self,
+        outpoint: &OutPoint,
+        utxo: &StoredWalletUtxo,
+    ) -> Result<(), WalletError> {
         let key = Self::utxo_key(outpoint);
-        let val = serde_json::to_vec(utxo)
-            .map_err(|e| WalletError::Storage(e.to_string()))?;
+        let val = serde_json::to_vec(utxo).map_err(|e| WalletError::Storage(e.to_string()))?;
         self.db
             .put_cf(CF_WALLET, key.as_bytes(), &val)
             .map_err(|e| WalletError::Storage(e.to_string()))
@@ -181,7 +183,10 @@ impl<'a> WalletStore<'a> {
             }
             let utxo: StoredWalletUtxo = serde_json::from_slice(&v).ok()?;
             let txid = rbtc_primitives::hash::Hash256::from_hex(&utxo.txid).ok()?;
-            let outpoint = OutPoint { txid, vout: utxo.vout };
+            let outpoint = OutPoint {
+                txid,
+                vout: utxo.vout,
+            };
             Some((outpoint, utxo))
         })
         .collect()

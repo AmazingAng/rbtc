@@ -1,26 +1,31 @@
-use std::{collections::{HashMap, HashSet, VecDeque}, net::IpAddr, sync::Arc, time::{Duration, Instant}};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    net::IpAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
 use rbtc_consensus::{
     block_verify::{verify_block_with_options, BlockValidationContext},
-    chain::{BlockIndex, BlockStatus, ChainState, header_hash},
-    tx_verify::MedianTimeProvider,
+    chain::{header_hash, BlockIndex, BlockStatus, ChainState},
     script_flags_for_block,
+    tx_verify::MedianTimeProvider,
 };
 use rbtc_crypto::sha256d;
 use rbtc_mempool::Mempool;
 use rbtc_net::{
-    compact::{short_txid, reconstruct_block, CompactBlock, GetBlockTxn},
-    message::{Inventory, InvType, NetworkMessage},
-    peer_manager::{BAN_DURATION, NodeEvent, PeerManager, PeerManagerConfig},
+    compact::{reconstruct_block, short_txid, CompactBlock, GetBlockTxn},
+    message::{InvType, Inventory, NetworkMessage},
+    peer_manager::{NodeEvent, PeerManager, PeerManagerConfig, BAN_DURATION},
 };
-use rbtc_primitives::hash::Hash256;
 use rbtc_primitives::codec::Encodable;
+use rbtc_primitives::hash::Hash256;
 use rbtc_storage::{
-    encode_block_undo, decode_block_undo, AddrIndexStore, BlockStore, ChainStore, Database,
+    decode_block_undo, encode_block_undo, AddrIndexStore, BlockStore, ChainStore, Database,
     PeerStore, StoredBlockIndex, StoredUtxo, TxIndexStore, UtxoStore,
 };
 use rbtc_wallet::Wallet;
@@ -102,7 +107,13 @@ pub struct Node {
     rpc_control_tx: mpsc::UnboundedSender<RpcNodeCommand>,
     /// BIP152: partially-reconstructed compact blocks awaiting `blocktxn` responses.
     /// Key = block_hash, Value = (compact block, list of already-filled tx slots).
-    pending_compact: HashMap<rbtc_primitives::hash::Hash256, (CompactBlock, Vec<Option<rbtc_primitives::transaction::Transaction>>)>,
+    pending_compact: HashMap<
+        rbtc_primitives::hash::Hash256,
+        (
+            CompactBlock,
+            Vec<Option<rbtc_primitives::transaction::Transaction>>,
+        ),
+    >,
     /// Out-of-order blocks received during parallel IBD, waiting for predecessors.
     /// Key = block height, Value = candidate blocks for that height.
     /// We keep multiple candidates to avoid dropping the valid chain block when
@@ -146,11 +157,7 @@ impl Node {
         let Some(bi) = chain.block_index.get(hash) else {
             return false;
         };
-        chain
-            .active_chain
-            .get(bi.height as usize)
-            .copied()
-            == Some(*hash)
+        chain.active_chain.get(bi.height as usize).copied() == Some(*hash)
     }
 
     pub async fn new(args: Args) -> Result<Self> {
@@ -224,15 +231,23 @@ impl Node {
             Some(args.utxo_cache * 1_000_000)
         };
         let utxo_cache = CachedUtxoSet::new(Arc::clone(&db), max_bytes);
-        info!("utxo_cache: lazy mode, limit={} MB (0 = unlimited)", args.utxo_cache);
+        info!(
+            "utxo_cache: lazy mode, limit={} MB (0 = unlimited)",
+            args.utxo_cache
+        );
 
         let assumevalid_hash = match args.assumevalid.as_ref() {
-            Some(h) => Some(Hash256::from_hex(h).map_err(|_| anyhow!("invalid --assumevalid hash"))?),
+            Some(h) => {
+                Some(Hash256::from_hex(h).map_err(|_| anyhow!("invalid --assumevalid hash"))?)
+            }
             None => None,
         };
         let min_chain_work = args.min_chain_work;
         let check_all_scripts = args.check_all_scripts;
-        let signet_challenge = args.signet_challenge.as_ref().and_then(|h| hex::decode(h).ok());
+        let signet_challenge = args
+            .signet_challenge
+            .as_ref()
+            .and_then(|h| hex::decode(h).ok());
 
         Ok(Self {
             args,
@@ -489,7 +504,8 @@ impl Node {
     }
 
     fn spawn_index_worker_if_idle(&mut self) {
-        if self.should_defer_indexes() || self.index_worker.is_some() || self.index_queue.is_empty() {
+        if self.should_defer_indexes() || self.index_worker.is_some() || self.index_queue.is_empty()
+        {
             return;
         }
         let mut tasks = Vec::new();
@@ -503,7 +519,9 @@ impl Node {
             return;
         }
         let db = Arc::clone(&self.db);
-        self.index_worker = Some(tokio::task::spawn_blocking(move || write_index_batch(db, tasks)));
+        self.index_worker = Some(tokio::task::spawn_blocking(move || {
+            write_index_batch(db, tasks)
+        }));
     }
 
     async fn process_pending_events(&mut self) {
@@ -547,7 +565,11 @@ impl Node {
 
     async fn handle_node_event(&mut self, event: NodeEvent) -> Result<()> {
         match event {
-            NodeEvent::PeerConnected { peer_id, addr, best_height } => {
+            NodeEvent::PeerConnected {
+                peer_id,
+                addr,
+                best_height,
+            } => {
                 // If peer IDs are recycled, make sure stale disconnect marks
                 // don't block fresh assignments.
                 self.disconnecting_peers.remove(&peer_id);
@@ -573,14 +595,12 @@ impl Node {
                     self.ibd.release_peer(peer_id);
                     // Try to assign to a remaining connected peer.
                     self.assign_blocks_to_peers().await;
-                } else {
-                    if self.ibd.sync_peer == Some(peer_id) {
-                        self.ibd.sync_peer = None;
-                        if let Some(new_peer) = self.peer_manager.best_peer() {
-                            self.ibd.sync_peer = Some(new_peer);
-                            self.ibd.record_progress();
-                            self.request_headers(new_peer).await;
-                        }
+                } else if self.ibd.sync_peer == Some(peer_id) {
+                    self.ibd.sync_peer = None;
+                    if let Some(new_peer) = self.peer_manager.best_peer() {
+                        self.ibd.sync_peer = Some(new_peer);
+                        self.ibd.record_progress();
+                        self.request_headers(new_peer).await;
                     }
                 }
             }
@@ -649,13 +669,19 @@ impl Node {
                     InvType::Tx
                 };
                 let mp = self.mempool.read().await;
-                let inv_items: Vec<Inventory> = mp.txids().iter().map(|txid| {
-                    Inventory { inv_type, hash: *txid }
-                }).collect();
+                let inv_items: Vec<Inventory> = mp
+                    .txids()
+                    .iter()
+                    .map(|txid| Inventory {
+                        inv_type,
+                        hash: *txid,
+                    })
+                    .collect();
                 drop(mp);
                 // BIP35: batch at most 50000 inv items per message
                 for chunk in inv_items.chunks(50000) {
-                    self.peer_manager.send_to(peer_id, NetworkMessage::Inv(chunk.to_vec()));
+                    self.peer_manager
+                        .send_to(peer_id, NetworkMessage::Inv(chunk.to_vec()));
                 }
             }
 
@@ -770,7 +796,9 @@ impl Node {
         drop(chain);
 
         if headers.len() == 2000 {
-            let last_hash = last_header.map(|h| header_hash(&h)).unwrap_or(Hash256::ZERO);
+            let last_hash = last_header
+                .map(|h| header_hash(&h))
+                .unwrap_or(Hash256::ZERO);
             self.peer_manager.send_to(
                 peer_id,
                 NetworkMessage::GetHeaders(rbtc_net::message::GetBlocksMessage {
@@ -797,20 +825,13 @@ impl Node {
     /// for multi-peer parallel download.
     async fn build_canonical_header_chain(&mut self) {
         let chain = self.chain.read().await;
-        let best = chain
-            .block_index
-            .values()
-            .max_by_key(|bi| bi.chainwork);
+        let best = chain.block_index.values().max_by_key(|bi| bi.chainwork);
         let Some(tip) = best else { return };
         let tip_height = tip.height as usize;
         let active_height = chain.height();
         let mut canonical = vec![Hash256::ZERO; tip_height + 1];
         let mut cur = tip.hash;
-        loop {
-            let bi = match chain.block_index.get(&cur) {
-                Some(b) => b,
-                None => break,
-            };
+        while let Some(bi) = chain.block_index.get(&cur) {
             canonical[bi.height as usize] = cur;
             if bi.height == 0 {
                 break;
@@ -819,10 +840,7 @@ impl Node {
         }
         let tip_u32 = tip.height;
         drop(chain);
-        info!(
-            "canonical header chain built: {} headers",
-            canonical.len()
-        );
+        info!("canonical header chain built: {} headers", canonical.len());
         self.canonical_header_chain = canonical;
 
         // Partition the un-downloaded height range into fixed-size segments.
@@ -834,11 +852,7 @@ impl Node {
 
     // ── BIP152 Compact Block handlers ─────────────────────────────────────────
 
-    async fn handle_cmpct_block(
-        &mut self,
-        peer_id: u64,
-        cmpct: CompactBlock,
-    ) -> Result<()> {
+    async fn handle_cmpct_block(&mut self, peer_id: u64, cmpct: CompactBlock) -> Result<()> {
         let block_hash = {
             let mut buf = Vec::with_capacity(80);
             buf.extend_from_slice(&cmpct.header.version.to_le_bytes());
@@ -876,7 +890,10 @@ impl Node {
             self.pending_compact.insert(block_hash, (cmpct, vec![]));
             self.peer_manager.send_to(
                 peer_id,
-                NetworkMessage::GetBlockTxn(GetBlockTxn { block_hash, indexes: missing }),
+                NetworkMessage::GetBlockTxn(GetBlockTxn {
+                    block_hash,
+                    indexes: missing,
+                }),
             );
         }
 
@@ -924,7 +941,10 @@ impl Node {
         if let Some(block) = maybe_block {
             self.handle_block(peer_id, block).await?;
         } else {
-            warn!("blocktxn: still could not reconstruct block {}", resp.block_hash.to_hex());
+            warn!(
+                "blocktxn: still could not reconstruct block {}",
+                resp.block_hash.to_hex()
+            );
         }
 
         Ok(())
@@ -973,14 +993,12 @@ impl Node {
         let mut hashes = Vec::new();
         for h in start..=end {
             // Prefer active_chain, fall back to canonical_header_chain.
-            let hash = chain
-                .get_ancestor_hash(h)
-                .or_else(|| {
-                    self.canonical_header_chain
-                        .get(h as usize)
-                        .copied()
-                        .filter(|h| *h != Hash256::ZERO)
-                });
+            let hash = chain.get_ancestor_hash(h).or_else(|| {
+                self.canonical_header_chain
+                    .get(h as usize)
+                    .copied()
+                    .filter(|h| *h != Hash256::ZERO)
+            });
             // Stop at the first missing height so we never request disjoint tails
             // without their predecessors (which would stall frontier connection).
             let Some(hash) = hash else { break };
@@ -1081,10 +1099,13 @@ impl Node {
             dynamic = (approx_blocks_per_sec * 25.0) as u32;
         }
         let (min_w, max_w) = self.peer_window_bounds();
-        let peer_floor = (peer_count as u32).saturating_mul(max_w.max(min_w)).saturating_mul(2);
-        dynamic
-            .max(peer_floor)
-            .clamp(MIN_DYNAMIC_GLOBAL_WINDOW_BLOCKS, MAX_DYNAMIC_GLOBAL_WINDOW_BLOCKS)
+        let peer_floor = (peer_count as u32)
+            .saturating_mul(max_w.max(min_w))
+            .saturating_mul(2);
+        dynamic.max(peer_floor).clamp(
+            MIN_DYNAMIC_GLOBAL_WINDOW_BLOCKS,
+            MAX_DYNAMIC_GLOBAL_WINDOW_BLOCKS,
+        )
     }
 
     fn note_peer_timeout(&mut self, peer_id: u64) {
@@ -1136,14 +1157,12 @@ impl Node {
         let frontier = our_height.saturating_add(1);
         let frontier_hash = {
             let chain = self.chain.read().await;
-            chain
-                .get_ancestor_hash(frontier)
-                .or_else(|| {
-                    self.canonical_header_chain
-                        .get(frontier as usize)
-                        .copied()
-                        .filter(|h| *h != Hash256::ZERO)
-                })
+            chain.get_ancestor_hash(frontier).or_else(|| {
+                self.canonical_header_chain
+                    .get(frontier as usize)
+                    .copied()
+                    .filter(|h| *h != Hash256::ZERO)
+            })
         };
         let mut frontier_pending = false;
         let mut frontier_hash_for_preemption: Option<Hash256> = None;
@@ -1200,7 +1219,9 @@ impl Node {
                         "IBD: assigning frontier height {} (1 block) to peer {}",
                         frontier, peer_id
                     );
-                    self.ibd.assigned_ranges.insert(peer_id, (frontier, frontier));
+                    self.ibd
+                        .assigned_ranges
+                        .insert(peer_id, (frontier, frontier));
                     self.ibd.record_peer_request(peer_id, vec![frontier_hash]);
                     self.peer_manager.request_blocks(peer_id, &[frontier_hash]);
                     idle_peers.remove(0);
@@ -1286,13 +1307,14 @@ impl Node {
                 if let Some(fh) = frontier_hash {
                     debug!(
                         "IBD: reassigning peer {} from ahead-work to frontier height {}",
-                        victim_peer,
-                        frontier
+                        victim_peer, frontier
                     );
                     // Release ahead-assignment (re-queues the range for later).
                     self.ibd.release_peer(victim_peer);
                     // Immediately assign frontier to this peer instead of disconnecting.
-                    self.ibd.assigned_ranges.insert(victim_peer, (frontier, frontier));
+                    self.ibd
+                        .assigned_ranges
+                        .insert(victim_peer, (frontier, frontier));
                     self.ibd.record_peer_request(victim_peer, vec![fh]);
                     self.peer_manager.request_blocks(victim_peer, &[fh]);
                 }
@@ -1329,7 +1351,9 @@ impl Node {
                 }
             }
             let Some(best_idx) = best_idx else { break };
-            let Some(range) = self.ibd.pending_ranges.remove(best_idx) else { continue };
+            let Some(range) = self.ibd.pending_ranges.remove(best_idx) else {
+                continue;
+            };
             let (start, end) = range;
 
             // Per-peer inflight cap: split large segments into smaller requests.
@@ -1361,7 +1385,9 @@ impl Node {
                 hashes.len(),
                 peer_id
             );
-            self.ibd.assigned_ranges.insert(peer_id, (start, requested_end));
+            self.ibd
+                .assigned_ranges
+                .insert(peer_id, (start, requested_end));
             self.ibd.record_peer_request(peer_id, hashes.clone());
             self.peer_manager.request_blocks(peer_id, &hashes);
         }
@@ -1371,7 +1397,12 @@ impl Node {
             // Double-check by looking for un-downloaded heights.
             let tip = {
                 let chain = self.chain.read().await;
-                chain.block_index.values().map(|bi| bi.height).max().unwrap_or(0)
+                chain
+                    .block_index
+                    .values()
+                    .map(|bi| bi.height)
+                    .max()
+                    .unwrap_or(0)
             };
             let connected_height = self.chain.read().await.height();
             if connected_height >= tip {
@@ -1466,7 +1497,8 @@ impl Node {
 
         // height == chain_height + 1: validate and connect immediately, then
         // drain any consecutively-pending blocks that are now unblocked.
-        self.do_connect_block(peer_id, block_hash, block, height).await?;
+        self.do_connect_block(peer_id, block_hash, block, height)
+            .await?;
         self.ibd_mark_connected_all(&block_hash).await;
 
         loop {
@@ -1479,8 +1511,9 @@ impl Node {
                 if let Some(tip) = chain.best_hash() {
                     tip
                 } else if next_height == 1 {
-                    Hash256::from_hex(chain.network.genesis_hash())
-                        .map_err(|_| anyhow!("invalid genesis hash encoding for {:?}", chain.network))?
+                    Hash256::from_hex(chain.network.genesis_hash()).map_err(|_| {
+                        anyhow!("invalid genesis hash encoding for {:?}", chain.network)
+                    })?
                 } else {
                     break;
                 }
@@ -1500,7 +1533,8 @@ impl Node {
                 self.pending_blocks.insert(next_height, candidates);
             }
             let p_hash = header_hash(&p_block.header);
-            self.do_connect_block(p_peer, p_hash, p_block, next_height).await?;
+            self.do_connect_block(p_peer, p_hash, p_block, next_height)
+                .await?;
             // Mark connected here — not at cache time — so peer batch tracking
             // reflects actual chain progress, not just block delivery.
             self.ibd_mark_connected_all(&p_hash).await;
@@ -1561,7 +1595,8 @@ impl Node {
             let network = chain.network;
             let flags = script_flags_for_block(network, height, block_hash, block.header.time, mtp);
             let mtp_provider = ChainMtpProvider { chain: &chain };
-            assumevalid_skip_scripts = self.should_skip_scripts_with_assumevalid(&chain, height, block_hash);
+            assumevalid_skip_scripts =
+                self.should_skip_scripts_with_assumevalid(&chain, height, block_hash);
 
             let ctx = BlockValidationContext {
                 block: &block,
@@ -1579,7 +1614,9 @@ impl Node {
         let verify_elapsed = verify_started.elapsed();
         if assumevalid_skip_scripts && !self.assumevalid_announced {
             self.assumevalid_announced = true;
-            info!("assumevalid active: skipping script checks while connecting historical ancestors");
+            info!(
+                "assumevalid active: skipping script checks while connecting historical ancestors"
+            );
         }
         if assumevalid_skip_scripts {
             self.assumevalid_skipped_blocks = self.assumevalid_skipped_blocks.saturating_add(1);
@@ -1693,7 +1730,9 @@ impl Node {
                         bi.status = BlockStatus::InChain;
                     }
                     if height as usize >= chain.active_chain.len() {
-                        chain.active_chain.resize(height as usize + 1, Hash256::ZERO);
+                        chain
+                            .active_chain
+                            .resize(height as usize + 1, Hash256::ZERO);
                     }
                     chain.active_chain[height as usize] = block_hash;
                     let new_work = chain.block_index[&block_hash].chainwork;
@@ -1752,7 +1791,10 @@ impl Node {
                 );
             }
             Err(e) => {
-                warn!("block {} rejected from peer {peer_id}: {e}", block_hash.to_hex());
+                warn!(
+                    "block {} rejected from peer {peer_id}: {e}",
+                    block_hash.to_hex()
+                );
             }
         }
 
@@ -1804,18 +1846,17 @@ impl Node {
         if *canon_hash != block_hash {
             return false;
         }
-        let Some(canon_assumevalid) = self.canonical_header_chain.get(assumevalid_bi.height as usize) else {
+        let Some(canon_assumevalid) = self
+            .canonical_header_chain
+            .get(assumevalid_bi.height as usize)
+        else {
             return false;
         };
         *canon_assumevalid == assumevalid_hash
     }
 
     /// Accept an unconfirmed transaction into the mempool and relay it.
-    async fn handle_tx(
-        &mut self,
-        peer_id: u64,
-        tx: rbtc_primitives::transaction::Transaction,
-    ) {
+    async fn handle_tx(&mut self, peer_id: u64, tx: rbtc_primitives::transaction::Transaction) {
         let txid = {
             let mut buf = Vec::new();
             tx.encode_legacy(&mut buf).ok();
@@ -1832,13 +1873,18 @@ impl Node {
                     accepted_txid.to_hex()
                 );
                 // Compute fee rate in sat/kvB for feefilter comparison
-                let fee_rate_sat_kvb = mp.get(&accepted_txid)
+                let fee_rate_sat_kvb = mp
+                    .get(&accepted_txid)
                     .map(|e| e.fee_rate * 1000)
                     .unwrap_or(0);
                 drop(mp);
                 // Announce to peers whose feefilter allows this tx
-                let inv = vec![Inventory { inv_type: InvType::WitnessTx, hash: txid }];
-                self.peer_manager.broadcast_tx_inv(NetworkMessage::Inv(inv), fee_rate_sat_kvb);
+                let inv = vec![Inventory {
+                    inv_type: InvType::WitnessTx,
+                    hash: txid,
+                }];
+                self.peer_manager
+                    .broadcast_tx_inv(NetworkMessage::Inv(inv), fee_rate_sat_kvb);
             }
             Err(e) => {
                 // AlreadyKnown is not worth logging
@@ -1848,9 +1894,15 @@ impl Node {
                     if self.ibd.phase != IbdPhase::Complete
                         && matches!(e, rbtc_mempool::MempoolError::MissingInput(_, _))
                     {
-                        debug!("mempool: rejected tx {} from peer {peer_id}: {e}", txid.to_hex());
+                        debug!(
+                            "mempool: rejected tx {} from peer {peer_id}: {e}",
+                            txid.to_hex()
+                        );
                     } else {
-                        warn!("mempool: rejected tx {} from peer {peer_id}: {e}", txid.to_hex());
+                        warn!(
+                            "mempool: rejected tx {} from peer {peer_id}: {e}",
+                            txid.to_hex()
+                        );
                     }
                 }
             }
@@ -1863,10 +1915,14 @@ impl Node {
             collect_subtree_hashes(&chain, hash)?
         };
         if descendants.is_empty() {
-            return Err(anyhow!("invalidateblock: block {} not found", hash.to_hex()));
+            return Err(anyhow!(
+                "invalidateblock: block {} not found",
+                hash.to_hex()
+            ));
         }
 
-        self.set_status_for_hashes(&descendants, BlockStatus::Invalid).await?;
+        self.set_status_for_hashes(&descendants, BlockStatus::Invalid)
+            .await?;
         info!(
             "invalidateblock: marked {} block(s) invalid from {}",
             descendants.len(),
@@ -1888,7 +1944,10 @@ impl Node {
             collect_subtree_hashes(&chain, hash)?
         };
         if descendants.is_empty() {
-            return Err(anyhow!("reconsiderblock: block {} not found", hash.to_hex()));
+            return Err(anyhow!(
+                "reconsiderblock: block {} not found",
+                hash.to_hex()
+            ));
         }
 
         let to_restore = {
@@ -1905,7 +1964,8 @@ impl Node {
                 })
                 .collect::<Vec<_>>()
         };
-        self.set_status_for_hashes(&to_restore, BlockStatus::Valid).await?;
+        self.set_status_for_hashes(&to_restore, BlockStatus::Valid)
+            .await?;
         info!(
             "reconsiderblock: restored {} block(s) from {}",
             to_restore.len(),
@@ -1927,13 +1987,20 @@ impl Node {
             .block_index
             .iter()
             .filter(|(_, bi)| {
-                matches!(bi.status, BlockStatus::Valid | BlockStatus::InChain | BlockStatus::Pruned)
+                matches!(
+                    bi.status,
+                    BlockStatus::Valid | BlockStatus::InChain | BlockStatus::Pruned
+                )
             })
             .max_by_key(|(_, bi)| bi.chainwork)
             .map(|(h, _)| *h)
     }
 
-    async fn set_status_for_hashes(&mut self, hashes: &[Hash256], status: BlockStatus) -> Result<()> {
+    async fn set_status_for_hashes(
+        &mut self,
+        hashes: &[Hash256],
+        status: BlockStatus,
+    ) -> Result<()> {
         if hashes.is_empty() {
             return Ok(());
         }
@@ -2007,7 +2074,12 @@ impl Node {
                 .ok_or_else(|| anyhow!("reorg: missing block index {}", hash.to_hex()))?;
 
             // In-memory UTXO undo
-            let mem_undo: Vec<Vec<(rbtc_primitives::transaction::OutPoint, rbtc_consensus::utxo::Utxo)>> = undo
+            let mem_undo: Vec<
+                Vec<(
+                    rbtc_primitives::transaction::OutPoint,
+                    rbtc_consensus::utxo::Utxo,
+                )>,
+            > = undo
                 .iter()
                 .map(|tx_undo| {
                     tx_undo
@@ -2036,7 +2108,9 @@ impl Node {
             let (new_best_tip, new_best_height, new_best_work) = {
                 let mut chain = self.chain.write().await;
                 chain.disconnect_tip()?;
-                let best = chain.best_tip.ok_or_else(|| anyhow!("reorg: missing best tip after disconnect"))?;
+                let best = chain
+                    .best_tip
+                    .ok_or_else(|| anyhow!("reorg: missing best tip after disconnect"))?;
                 let (best_height, best_work) = chain
                     .block_index
                     .get(&best)
@@ -2066,7 +2140,12 @@ impl Node {
                     )?;
                 }
             }
-            chain_store.update_tip_batch(&mut batch, &new_best_tip, new_best_height, new_best_work)?;
+            chain_store.update_tip_batch(
+                &mut batch,
+                &new_best_tip,
+                new_best_height,
+                new_best_work,
+            )?;
             self.db.write_batch(batch)?;
             self.utxo_cache.commit_flush_plan(utxo_flush_plan);
         }
@@ -2084,7 +2163,8 @@ impl Node {
                 .get(hash)
                 .map(|bi| bi.height)
                 .ok_or_else(|| anyhow!("reorg: missing block index {}", hash.to_hex()))?;
-            self.do_connect_block(LOCAL_PEER_ID, *hash, block, height).await?;
+            self.do_connect_block(LOCAL_PEER_ID, *hash, block, height)
+                .await?;
         }
 
         self.peer_manager
@@ -2143,14 +2223,12 @@ impl Node {
             let frontier = self.chain.read().await.height().saturating_add(1);
             let frontier_hash = {
                 let chain = self.chain.read().await;
-                chain
-                    .get_ancestor_hash(frontier)
-                    .or_else(|| {
-                        self.canonical_header_chain
-                            .get(frontier as usize)
-                            .copied()
-                            .filter(|h| *h != Hash256::ZERO)
-                    })
+                chain.get_ancestor_hash(frontier).or_else(|| {
+                    self.canonical_header_chain
+                        .get(frontier as usize)
+                        .copied()
+                        .filter(|h| *h != Hash256::ZERO)
+                })
             };
             if let Some(frontier_hash) = frontier_hash {
                 let frontier_connected = {
@@ -2272,9 +2350,10 @@ impl Node {
     /// Update the candidate address pool from a received `addr` message.
     fn handle_addr_received(&mut self, entries: Vec<(u32, u64, [u8; 16], u16)>) {
         for (_, services, ip_bytes, port) in &entries {
-            use std::net::{Ipv6Addr, IpAddr, SocketAddr};
+            use std::net::{IpAddr, Ipv6Addr, SocketAddr};
             let v6 = Ipv6Addr::from(*ip_bytes);
-            let ip = v6.to_ipv4_mapped()
+            let ip = v6
+                .to_ipv4_mapped()
                 .map(IpAddr::V4)
                 .or_else(|| v6.to_ipv4().map(IpAddr::V4))
                 .unwrap_or(IpAddr::V6(v6));
@@ -2302,7 +2381,8 @@ impl Node {
             .unwrap_or_default()
             .as_secs();
 
-        let entries: Vec<_> = candidates.iter()
+        let entries: Vec<_> = candidates
+            .iter()
             .map(|addr| (*addr, unix_now, 1u64))
             .collect();
 
@@ -2405,16 +2485,19 @@ fn write_index_batch(
             })
             .collect();
         for (offset, (tx, txid)) in block.transactions.iter().zip(txids.iter()).enumerate() {
-            tx_idx.batch_put(&mut batch, txid, &task.block_hash, offset as u32).ok();
-            for output in &tx.outputs {
-                addr_idx.batch_put(
-                    &mut batch,
-                    &output.script_pubkey.0,
-                    task.height,
-                    offset as u32,
-                    txid,
-                )
+            tx_idx
+                .batch_put(&mut batch, txid, &task.block_hash, offset as u32)
                 .ok();
+            for output in &tx.outputs {
+                addr_idx
+                    .batch_put(
+                        &mut batch,
+                        &output.script_pubkey.0,
+                        task.height,
+                        offset as u32,
+                        txid,
+                    )
+                    .ok();
             }
         }
         last_indexed_height = Some(task.height);
@@ -2458,7 +2541,9 @@ fn reindex_chainstate(db: &Database, network: rbtc_primitives::network::Network)
     let data_backed_tip = if let Some(mut cursor) = header_tip {
         let mut walked = 0u32;
         loop {
-            let Some(bi) = in_memory.block_index.get(&cursor) else { break None };
+            let Some(bi) = in_memory.block_index.get(&cursor) else {
+                break None;
+            };
             if bi.height == 0 || block_store.get_block(&cursor)?.is_some() {
                 if walked > 0 {
                     warn!(
@@ -2520,10 +2605,12 @@ fn reindex_chainstate(db: &Database, network: rbtc_primitives::network::Network)
     let mut ordered_chain: Vec<Hash256> = Vec::new();
     let mut cursor = best_tip;
     loop {
-        let bi = in_memory
-            .block_index
-            .get(&cursor)
-            .ok_or_else(|| anyhow!("reindex-chainstate: missing block index {}", cursor.to_hex()))?;
+        let bi = in_memory.block_index.get(&cursor).ok_or_else(|| {
+            anyhow!(
+                "reindex-chainstate: missing block index {}",
+                cursor.to_hex()
+            )
+        })?;
         ordered_chain.push(cursor);
         if bi.height == 0 {
             break;
@@ -2546,10 +2633,9 @@ fn reindex_chainstate(db: &Database, network: rbtc_primitives::network::Network)
         let (height, chainwork) = if let Some(stored_idx) = block_store.get_index(hash)? {
             (stored_idx.height, stored_idx.chainwork())
         } else {
-            let bi = in_memory
-                .block_index
-                .get(hash)
-                .ok_or_else(|| anyhow!("reindex-chainstate: missing block index {}", hash.to_hex()))?;
+            let bi = in_memory.block_index.get(hash).ok_or_else(|| {
+                anyhow!("reindex-chainstate: missing block index {}", hash.to_hex())
+            })?;
             if bi.height == 0 {
                 warn!(
                     "reindex-chainstate: missing stored genesis index {}, using header index fallback",
@@ -2658,10 +2744,9 @@ fn load_chain_state(chain: &mut ChainState, db: &Database) -> Result<()> {
         let mut path_rev: Vec<Hash256> = Vec::new();
         let mut cursor = tip;
         loop {
-            let bi = chain
-                .block_index
-                .get(&cursor)
-                .ok_or_else(|| anyhow!("best_block {} missing from block index", cursor.to_hex()))?;
+            let bi = chain.block_index.get(&cursor).ok_or_else(|| {
+                anyhow!("best_block {} missing from block index", cursor.to_hex())
+            })?;
             path_rev.push(cursor);
             if bi.height == 0 {
                 break;
@@ -2677,7 +2762,12 @@ fn load_chain_state(chain: &mut ChainState, db: &Database) -> Result<()> {
                 .block_index
                 .get(hash)
                 .map(|bi| bi.height as usize)
-                .ok_or_else(|| anyhow!("missing block index while rebuilding chain {}", hash.to_hex()))?;
+                .ok_or_else(|| {
+                    anyhow!(
+                        "missing block index while rebuilding chain {}",
+                        hash.to_hex()
+                    )
+                })?;
             if h >= chain.active_chain.len() {
                 chain.active_chain.resize(h + 1, Hash256::ZERO);
             }
@@ -2768,8 +2858,11 @@ fn collect_subtree_hashes(chain: &ChainState, root: Hash256) -> Result<Vec<Hash2
 fn find_fork(
     chain: &ChainState,
     new_tip: rbtc_primitives::hash::BlockHash,
-) -> Result<(u32, Vec<rbtc_primitives::hash::BlockHash>, Vec<rbtc_primitives::hash::BlockHash>)>
-{
+) -> Result<(
+    u32,
+    Vec<rbtc_primitives::hash::BlockHash>,
+    Vec<rbtc_primitives::hash::BlockHash>,
+)> {
     let mut old_chain = Vec::new();
     let mut new_chain = Vec::new();
 
@@ -2818,7 +2911,6 @@ fn tx_legacy_bytes(tx: &rbtc_primitives::transaction::Transaction) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
     use rbtc_primitives::{
         block::{Block, BlockHeader},
         hash::Hash256,
@@ -2826,6 +2918,7 @@ mod tests {
         transaction::{OutPoint, Transaction, TxIn, TxOut},
         Network,
     };
+    use tempfile::TempDir;
 
     fn coinbase_tx(value: u64) -> Transaction {
         Transaction {
@@ -2836,7 +2929,10 @@ mod tests {
                 sequence: 0xffff_ffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut { value, script_pubkey: Script::new() }],
+            outputs: vec![TxOut {
+                value,
+                script_pubkey: Script::new(),
+            }],
             lock_time: 0,
         }
     }

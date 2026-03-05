@@ -135,7 +135,7 @@ fn bip341_script_pubkey_vectors() {
         // Verify tweaked pubkey via secp256k1
         let expected_tweaked_hex = case["intermediary"]["tweakedPubkey"].as_str().unwrap();
         let secp = secp256k1::Secp256k1::new();
-        let xonly = secp256k1::XOnlyPublicKey::from_slice(&internal_key).unwrap();
+        let xonly = secp256k1::XOnlyPublicKey::from_byte_array(internal_key).unwrap();
         let scalar = secp256k1::Scalar::from_be_bytes(tweak).unwrap();
         let (tweaked, _parity) = xonly.add_tweak(&secp, &scalar).unwrap();
         let tweaked_hex = hex::encode(tweaked.serialize());
@@ -174,12 +174,12 @@ fn bip341_script_pubkey_vectors() {
 
 #[test]
 fn bip341_key_path_sighash_vectors() {
+    use rbtc_crypto::sighash::sighash_taproot;
     use rbtc_primitives::{
         codec::Decodable,
         script::Script,
         transaction::{Transaction, TxOut},
     };
-    use rbtc_crypto::sighash::sighash_taproot;
 
     let json_text = include_str!("data/bip341_wallet_vectors.json");
     let data: Value = serde_json::from_str(json_text).expect("parse bip341");
@@ -224,9 +224,9 @@ fn bip341_key_path_sighash_vectors() {
                 input_index,
                 &utxos_spent,
                 sighash_type,
-                None,  // no leaf hash (key path)
-                None,  // no annex
-                0,     // key_version = 0 for key path
+                None,     // no leaf hash (key path)
+                None,     // no annex
+                0,        // key_version = 0 for key path
                 u32::MAX, // no code separator
             );
 
@@ -244,7 +244,10 @@ fn bip341_key_path_sighash_vectors() {
         for f in &failures {
             eprintln!("  FAIL: {f}");
         }
-        panic!("{} / {total} bip341 keyPathSpending sighash cases failed", failures.len());
+        panic!(
+            "{} / {total} bip341 keyPathSpending sighash cases failed",
+            failures.len()
+        );
     }
 
     println!("bip341 keyPathSpending: {total} sighash cases all passed");

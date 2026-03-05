@@ -159,7 +159,12 @@ impl Script {
                 0x4e => {
                     i += 1;
                     if i + 3 < bytes.len() {
-                        let len = u32::from_le_bytes([bytes[i], bytes[i+1], bytes[i+2], bytes[i+3]]) as usize;
+                        let len = u32::from_le_bytes([
+                            bytes[i],
+                            bytes[i + 1],
+                            bytes[i + 2],
+                            bytes[i + 3],
+                        ]) as usize;
                         i += 3 + len;
                     }
                 }

@@ -26,8 +26,8 @@ pub fn hash160(data: &[u8]) -> Hash160 {
 pub fn tagged_hash(tag: &[u8], msg: &[u8]) -> Hash256 {
     let tag_hash = Sha256::digest(tag);
     let mut hasher = Sha256::new();
-    hasher.update(&tag_hash);
-    hasher.update(&tag_hash);
+    hasher.update(tag_hash);
+    hasher.update(tag_hash);
     hasher.update(msg);
     Hash256(hasher.finalize().into())
 }

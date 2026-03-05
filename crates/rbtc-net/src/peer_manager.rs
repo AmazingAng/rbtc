@@ -19,7 +19,7 @@ use rbtc_primitives::{
 };
 
 use crate::{
-    message::{GetBlocksMessage, HeadersMessage, Inventory, InvType, NetworkMessage},
+    message::{GetBlocksMessage, HeadersMessage, InvType, Inventory, NetworkMessage},
     peer::{run_peer, PeerCommand, PeerEvent},
 };
 
@@ -69,28 +69,68 @@ impl Default for PeerManagerConfig {
 /// Events emitted by the peer manager to the node
 #[derive(Debug)]
 pub enum NodeEvent {
-    PeerConnected { peer_id: u64, addr: SocketAddr, best_height: i32 },
-    PeerDisconnected { peer_id: u64 },
-    BlockReceived { peer_id: u64, block: Block },
-    HeadersReceived { peer_id: u64, headers: Vec<BlockHeader> },
-    TxReceived { peer_id: u64, tx: Transaction },
-    InvReceived { peer_id: u64, items: Vec<Inventory> },
+    PeerConnected {
+        peer_id: u64,
+        addr: SocketAddr,
+        best_height: i32,
+    },
+    PeerDisconnected {
+        peer_id: u64,
+    },
+    BlockReceived {
+        peer_id: u64,
+        block: Block,
+    },
+    HeadersReceived {
+        peer_id: u64,
+        headers: Vec<BlockHeader>,
+    },
+    TxReceived {
+        peer_id: u64,
+        tx: Transaction,
+    },
+    InvReceived {
+        peer_id: u64,
+        items: Vec<Inventory>,
+    },
     /// BIP152: compact block received
-    CmpctBlockReceived { peer_id: u64, cmpct: crate::compact::CompactBlock },
+    CmpctBlockReceived {
+        peer_id: u64,
+        cmpct: crate::compact::CompactBlock,
+    },
     /// BIP152: peer is requesting missing transactions
-    GetBlockTxnReceived { peer_id: u64, req: crate::compact::GetBlockTxn },
+    GetBlockTxnReceived {
+        peer_id: u64,
+        req: crate::compact::GetBlockTxn,
+    },
     /// BIP152: peer responded with missing transactions
-    BlockTxnReceived { peer_id: u64, resp: crate::compact::BlockTxn },
+    BlockTxnReceived {
+        peer_id: u64,
+        resp: crate::compact::BlockTxn,
+    },
     /// Peer announced addresses
-    AddrReceived { peer_id: u64, addrs: Vec<(u32, u64, [u8; 16], u16)> },
+    AddrReceived {
+        peer_id: u64,
+        addrs: Vec<(u32, u64, [u8; 16], u16)>,
+    },
     /// Request to ban a peer's IP (emitted by misbehave())
-    BanPeer { ip: IpAddr },
+    BanPeer {
+        ip: IpAddr,
+    },
     /// Peer replied notfound for one or more requested items (e.g. pruned node)
-    NotFound { peer_id: u64, items: Vec<Inventory> },
+    NotFound {
+        peer_id: u64,
+        items: Vec<Inventory>,
+    },
     /// Peer requested our mempool contents (BIP35)
-    MempoolRequested { peer_id: u64 },
+    MempoolRequested {
+        peer_id: u64,
+    },
     /// BIP155: peer sent addrv2 addresses
-    Addrv2Received { peer_id: u64, msg: crate::message::Addrv2Message },
+    Addrv2Received {
+        peer_id: u64,
+        msg: crate::message::Addrv2Message,
+    },
 }
 
 /// Connected peer metadata
@@ -114,7 +154,12 @@ struct ConnectedPeer {
 
 /// Registration message: associates a peer_id with its command sender channel.
 /// Sent by `connect()` / inbound listener before `run_peer` is spawned.
-type CmdRegistration = (u64, SocketAddr, mpsc::UnboundedSender<PeerCommand>, bool /* inbound */);
+type CmdRegistration = (
+    u64,
+    SocketAddr,
+    mpsc::UnboundedSender<PeerCommand>,
+    bool, /* inbound */
+);
 
 /// Central peer manager – manages connections and dispatches messages
 pub struct PeerManager {
@@ -230,11 +275,16 @@ impl PeerManager {
     /// Increment a peer's misbehavior score by `score`.
     /// If the score reaches BAN_THRESHOLD, disconnect and ban the peer's IP.
     pub fn misbehave(&mut self, peer_id: u64, score: u32) {
-        let Some(peer) = self.peers.get_mut(&peer_id) else { return };
+        let Some(peer) = self.peers.get_mut(&peer_id) else {
+            return;
+        };
         peer.misbehavior = peer.misbehavior.saturating_add(score);
         if peer.misbehavior >= BAN_THRESHOLD {
             let ip = peer.addr.ip();
-            warn!("peer {peer_id} ({ip}): misbehavior score {} ≥ {BAN_THRESHOLD}, banning", peer.misbehavior);
+            warn!(
+                "peer {peer_id} ({ip}): misbehavior score {} ≥ {BAN_THRESHOLD}, banning",
+                peer.misbehavior
+            );
             let _ = peer.cmd_tx.send(PeerCommand::Disconnect);
             self.banned_ips.insert(ip);
             let _ = self.node_event_tx.send(NodeEvent::BanPeer { ip });
@@ -273,11 +323,8 @@ impl PeerManager {
         let addr_str = addr.to_string();
 
         tokio::spawn(async move {
-            let result = tokio::time::timeout(
-                config.connect_timeout,
-                TcpStream::connect(&addr_str),
-            )
-            .await;
+            let result =
+                tokio::time::timeout(config.connect_timeout, TcpStream::connect(&addr_str)).await;
             let success = matches!(&result, Ok(Ok(_)));
 
             match result {
@@ -423,7 +470,10 @@ impl PeerManager {
 
     /// Request a specific block by hash
     pub fn request_block(&self, peer_id: u64, hash: BlockHash) {
-        let inv = vec![Inventory { inv_type: InvType::WitnessBlock, hash }];
+        let inv = vec![Inventory {
+            inv_type: InvType::WitnessBlock,
+            hash,
+        }];
         self.send_to(peer_id, NetworkMessage::GetData(inv));
     }
 
@@ -431,7 +481,10 @@ impl PeerManager {
     pub fn request_blocks(&self, peer_id: u64, hashes: &[BlockHash]) {
         let items: Vec<_> = hashes
             .iter()
-            .map(|h| Inventory { inv_type: InvType::WitnessBlock, hash: *h })
+            .map(|h| Inventory {
+                inv_type: InvType::WitnessBlock,
+                hash: *h,
+            })
             .collect();
         if !items.is_empty() {
             self.send_to(peer_id, NetworkMessage::GetData(items));
@@ -447,7 +500,11 @@ impl PeerManager {
 
     /// Get the best height among connected peers
     pub fn best_peer_height(&self) -> i32 {
-        self.peers.values().map(|p| p.best_height).max().unwrap_or(0)
+        self.peers
+            .values()
+            .map(|p| p.best_height)
+            .max()
+            .unwrap_or(0)
     }
 
     /// Get a peer with the best known height
@@ -483,12 +540,20 @@ impl PeerManager {
 
         // Drain command registrations first (must happen before Ready arrives)
         while let Ok((peer_id, addr, cmd_tx, inbound)) = self.cmd_reg_rx.try_recv() {
-            self.pending_cmd_txs.insert(peer_id, (addr, cmd_tx, inbound));
+            self.pending_cmd_txs
+                .insert(peer_id, (addr, cmd_tx, inbound));
         }
 
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
-                PeerEvent::Ready { peer_id, addr, best_height, user_agent, wtxid_relay, prefers_addrv2 } => {
+                PeerEvent::Ready {
+                    peer_id,
+                    addr,
+                    best_height,
+                    user_agent,
+                    wtxid_relay,
+                    prefers_addrv2,
+                } => {
                     info!("peer {peer_id} ready: height={best_height} ua={user_agent}");
 
                     // Retrieve the cmd_tx stored during connect / accept
@@ -497,7 +562,10 @@ impl PeerManager {
                     {
                         // Check ban list for inbound connections
                         if inbound && self.banned_ips.contains(&stored_addr.ip()) {
-                            warn!("rejected inbound peer {peer_id}: IP {} is banned", stored_addr.ip());
+                            warn!(
+                                "rejected inbound peer {peer_id}: IP {} is banned",
+                                stored_addr.ip()
+                            );
                             let _ = cmd_tx.send(PeerCommand::Disconnect);
                             continue;
                         }
@@ -551,8 +619,9 @@ impl PeerManager {
                         }
                     }
                     self.pending_cmd_txs.remove(&peer_id);
-                    let _ =
-                        self.node_event_tx.send(NodeEvent::PeerDisconnected { peer_id });
+                    let _ = self
+                        .node_event_tx
+                        .send(NodeEvent::PeerDisconnected { peer_id });
                     debug!("peer {peer_id} disconnected");
                 }
                 PeerEvent::Message { peer_id, message } => {
@@ -577,7 +646,9 @@ impl PeerManager {
             );
             self.last_reconnect = now;
             while self.outbound_count + self.connecting_addrs.len() < self.config.max_outbound {
-                let Some(candidate) = self.candidate_addrs.pop_front() else { break };
+                let Some(candidate) = self.candidate_addrs.pop_front() else {
+                    break;
+                };
                 if self.connecting_addrs.contains(&candidate)
                     || self.connected_addrs.contains(&candidate)
                     || self.banned_ips.contains(&candidate.ip())
@@ -595,7 +666,9 @@ impl PeerManager {
     async fn handle_message(&mut self, peer_id: u64, message: NetworkMessage) {
         match message {
             NetworkMessage::Block(block) => {
-                let _ = self.node_event_tx.send(NodeEvent::BlockReceived { peer_id, block });
+                let _ = self
+                    .node_event_tx
+                    .send(NodeEvent::BlockReceived { peer_id, block });
             }
             NetworkMessage::Headers(h) => {
                 let _ = self.node_event_tx.send(NodeEvent::HeadersReceived {
@@ -604,10 +677,14 @@ impl PeerManager {
                 });
             }
             NetworkMessage::Tx(tx) => {
-                let _ = self.node_event_tx.send(NodeEvent::TxReceived { peer_id, tx });
+                let _ = self
+                    .node_event_tx
+                    .send(NodeEvent::TxReceived { peer_id, tx });
             }
             NetworkMessage::Inv(items) => {
-                let _ = self.node_event_tx.send(NodeEvent::InvReceived { peer_id, items });
+                let _ = self
+                    .node_event_tx
+                    .send(NodeEvent::InvReceived { peer_id, items });
             }
             NetworkMessage::SendHeaders => {
                 // BIP130: peer prefers headers over inv for new block announcements
@@ -626,16 +703,24 @@ impl PeerManager {
                 self.handle_addr(peer_id, msg.addrs).await;
             }
             NetworkMessage::CmpctBlock(cmpct) => {
-                let _ = self.node_event_tx.send(NodeEvent::CmpctBlockReceived { peer_id, cmpct });
+                let _ = self
+                    .node_event_tx
+                    .send(NodeEvent::CmpctBlockReceived { peer_id, cmpct });
             }
             NetworkMessage::GetBlockTxn(req) => {
-                let _ = self.node_event_tx.send(NodeEvent::GetBlockTxnReceived { peer_id, req });
+                let _ = self
+                    .node_event_tx
+                    .send(NodeEvent::GetBlockTxnReceived { peer_id, req });
             }
             NetworkMessage::BlockTxn(resp) => {
-                let _ = self.node_event_tx.send(NodeEvent::BlockTxnReceived { peer_id, resp });
+                let _ = self
+                    .node_event_tx
+                    .send(NodeEvent::BlockTxnReceived { peer_id, resp });
             }
             NetworkMessage::NotFound(items) => {
-                let _ = self.node_event_tx.send(NodeEvent::NotFound { peer_id, items });
+                let _ = self
+                    .node_event_tx
+                    .send(NodeEvent::NotFound { peer_id, items });
             }
             NetworkMessage::WtxidRelay => {
                 debug!("peer {peer_id}: supports wtxid relay (BIP339)");
@@ -656,7 +741,9 @@ impl PeerManager {
                 debug!("peer {peer_id}: requested mempool contents");
                 // The node layer should respond by sending inv messages for
                 // all txids in the mempool. Emit as a node event.
-                let _ = self.node_event_tx.send(NodeEvent::MempoolRequested { peer_id });
+                let _ = self
+                    .node_event_tx
+                    .send(NodeEvent::MempoolRequested { peer_id });
             }
             other => {
                 debug!("peer {peer_id}: unhandled message: {}", other.command());
@@ -693,7 +780,9 @@ impl PeerManager {
         });
 
         // Trickling: forward to a random subset of peers (excluding sender)
-        let relay_targets: Vec<u64> = self.peers.keys()
+        let relay_targets: Vec<u64> = self
+            .peers
+            .keys()
             .filter(|&&id| id != peer_id)
             .copied()
             .take(ADDR_RELAY_FANOUT)
@@ -702,7 +791,8 @@ impl PeerManager {
         // Build the addr message with only the valid entries
         // We forward up to 10 valid entries per relay message.
         let relay_addrs: Vec<SocketAddr> = valid.into_iter().take(10).collect();
-        let relay_entries: Vec<(u32, u64, [u8; 16], u16)> = relay_addrs.iter()
+        let relay_entries: Vec<(u32, u64, [u8; 16], u16)> = relay_addrs
+            .iter()
             .map(|addr| {
                 let ip_bytes = socket_addr_to_ip_bytes(addr);
                 let ts = now_secs as u32;
@@ -710,7 +800,9 @@ impl PeerManager {
             })
             .collect();
 
-        let relay_msg = NetworkMessage::Addr(crate::message::AddrMessage { addrs: relay_entries });
+        let relay_msg = NetworkMessage::Addr(crate::message::AddrMessage {
+            addrs: relay_entries,
+        });
         for target in relay_targets {
             self.send_to(target, relay_msg.clone());
         }
@@ -746,12 +838,17 @@ impl PeerManager {
         }
 
         // Emit raw addrv2 data to node for persistence
-        let _ = self.node_event_tx.send(NodeEvent::Addrv2Received { peer_id, msg });
+        let _ = self
+            .node_event_tx
+            .send(NodeEvent::Addrv2Received { peer_id, msg });
     }
 
     /// Check if a peer supports wtxid relay (BIP339).
     pub fn peer_wtxid_relay(&self, peer_id: u64) -> bool {
-        self.peers.get(&peer_id).map(|p| p.wtxid_relay).unwrap_or(false)
+        self.peers
+            .get(&peer_id)
+            .map(|p| p.wtxid_relay)
+            .unwrap_or(false)
     }
 
     /// Main event loop – call this in a tokio task

@@ -16,7 +16,6 @@
 //!                                                   k1 = next  8 LE bytes
 //!   id   = SipHash-2-4(k0, k1, txid_le)  &  0x0000_ffff_ffff_ffff  (48 bits)
 
-
 use siphasher::sip::SipHasher24;
 use std::hash::Hasher;
 
@@ -112,7 +111,9 @@ impl CompactBlock {
             buf.extend_from_slice(&id.to_le_bytes()[..6]);
         }
         // prefilled_txns
-        VarInt(self.prefilled_txns.len() as u64).encode(&mut buf).ok();
+        VarInt(self.prefilled_txns.len() as u64)
+            .encode(&mut buf)
+            .ok();
         let mut prev_idx: u64 = 0;
         for pt in &self.prefilled_txns {
             let diff = pt.index as u64 - prev_idx;
@@ -128,7 +129,8 @@ impl CompactBlock {
         let header = BlockHeader::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
         let nonce = u64::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
 
-        let VarInt(sid_count) = VarInt::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
+        let VarInt(sid_count) =
+            VarInt::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
         let mut short_ids = Vec::with_capacity(sid_count as usize);
         for _ in 0..sid_count {
             let mut bytes = [0u8; 8];
@@ -137,11 +139,13 @@ impl CompactBlock {
             short_ids.push(u64::from_le_bytes(bytes));
         }
 
-        let VarInt(pt_count) = VarInt::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
+        let VarInt(pt_count) =
+            VarInt::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
         let mut prefilled_txns = Vec::with_capacity(pt_count as usize);
         let mut running_idx: u64 = 0;
         for _ in 0..pt_count {
-            let VarInt(diff) = VarInt::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
+            let VarInt(diff) =
+                VarInt::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
             running_idx += diff;
             let tx = Transaction::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
             prefilled_txns.push(PrefilledTransaction {
@@ -151,7 +155,12 @@ impl CompactBlock {
             running_idx += 1;
         }
 
-        Ok(Self { header, nonce, short_ids, prefilled_txns })
+        Ok(Self {
+            header,
+            nonce,
+            short_ids,
+            prefilled_txns,
+        })
     }
 }
 
@@ -172,18 +181,24 @@ impl GetBlockTxn {
 
     pub fn decode_payload(data: &[u8]) -> Result<Self> {
         let mut cur = std::io::Cursor::new(data);
-        let hash_bytes = <[u8; 32]>::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
+        let hash_bytes =
+            <[u8; 32]>::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
         let block_hash = Hash256(hash_bytes);
-        let VarInt(count) = VarInt::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
+        let VarInt(count) =
+            VarInt::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
         let mut indexes = Vec::with_capacity(count as usize);
         let mut running: u64 = 0;
         for _ in 0..count {
-            let VarInt(diff) = VarInt::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
+            let VarInt(diff) =
+                VarInt::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
             running += diff;
             indexes.push(running as u32);
             running += 1;
         }
-        Ok(Self { block_hash, indexes })
+        Ok(Self {
+            block_hash,
+            indexes,
+        })
     }
 }
 
@@ -200,9 +215,11 @@ impl BlockTxn {
 
     pub fn decode_payload(data: &[u8]) -> Result<Self> {
         let mut cur = std::io::Cursor::new(data);
-        let hash_bytes = <[u8; 32]>::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
+        let hash_bytes =
+            <[u8; 32]>::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
         let block_hash = Hash256(hash_bytes);
-        let VarInt(count) = VarInt::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
+        let VarInt(count) =
+            VarInt::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
         let mut txns = Vec::with_capacity(count as usize);
         for _ in 0..count {
             let tx = Transaction::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;

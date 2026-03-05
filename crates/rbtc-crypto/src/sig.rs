@@ -1,6 +1,6 @@
 use secp256k1::{
-    ecdsa::Signature as EcdsaSig, schnorr::Signature as SchnorrSig, Message, PublicKey,
-    Secp256k1, XOnlyPublicKey,
+    ecdsa::Signature as EcdsaSig, schnorr::Signature as SchnorrSig, Message, PublicKey, Secp256k1,
+    XOnlyPublicKey,
 };
 use std::collections::{HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
@@ -150,12 +150,16 @@ pub fn verify_schnorr(pubkey: &[u8], sig: &[u8], msg: &[u8; 32]) -> Result<(), C
 
     let secp = Secp256k1::verification_only();
 
-    let pk_arr: [u8; 32] = pubkey.try_into().map_err(|_| CryptoError::InvalidPublicKey)?;
-    let xonly = XOnlyPublicKey::from_byte_array(pk_arr)
+    let pk_arr: [u8; 32] = pubkey
+        .try_into()
         .map_err(|_| CryptoError::InvalidPublicKey)?;
+    let xonly =
+        XOnlyPublicKey::from_byte_array(pk_arr).map_err(|_| CryptoError::InvalidPublicKey)?;
 
     let sig_bytes = if sig.len() == 65 { &sig[..64] } else { sig };
-    let sig_arr: [u8; 64] = sig_bytes.try_into().map_err(|_| CryptoError::InvalidSignature)?;
+    let sig_arr: [u8; 64] = sig_bytes
+        .try_into()
+        .map_err(|_| CryptoError::InvalidSignature)?;
     let schnorr_sig = SchnorrSig::from_byte_array(sig_arr);
 
     secp.verify_schnorr(&schnorr_sig, msg, &xonly)

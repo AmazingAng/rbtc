@@ -1,7 +1,7 @@
 use rbtc_consensus::tx_verify::block_subsidy;
 use rbtc_crypto::{merkle::merkle_root, sha256d};
 use rbtc_primitives::{
-    block::{Block, BlockHeader, nbits_to_target},
+    block::{nbits_to_target, Block, BlockHeader},
     hash::{BlockHash, Hash256},
     script::Script,
     transaction::{OutPoint, Transaction, TxIn, TxOut},
@@ -69,7 +69,10 @@ pub fn build_coinbase(
             sequence: 0xffff_ffff,
             witness: vec![],
         }],
-        outputs: vec![TxOut { value, script_pubkey: output_script.clone() }],
+        outputs: vec![TxOut {
+            value,
+            script_pubkey: output_script.clone(),
+        }],
         lock_time: 0,
     }
 }
@@ -317,15 +320,8 @@ mod tests {
 
     #[test]
     fn block_template_target_hex_length() {
-        let template = BlockTemplate::new(
-            1,
-            Hash256::ZERO,
-            0x207f_ffff,
-            0,
-            0,
-            vec![],
-            Script::new(),
-        );
+        let template =
+            BlockTemplate::new(1, Hash256::ZERO, 0x207f_ffff, 0, 0, vec![], Script::new());
         let hex = template.target_hex();
         assert_eq!(hex.len(), 64); // 32 bytes = 64 hex chars
     }

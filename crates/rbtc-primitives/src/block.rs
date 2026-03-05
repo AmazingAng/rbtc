@@ -104,9 +104,7 @@ pub fn target_to_nbits(target: &[u8; 32]) -> u32 {
 
     let mut exp = msb + 1;
     let mut mantissa = if msb >= 2 {
-        ((target[msb] as u32) << 16)
-            | ((target[msb - 1] as u32) << 8)
-            | (target[msb - 2] as u32)
+        ((target[msb] as u32) << 16) | ((target[msb - 1] as u32) << 8) | (target[msb - 2] as u32)
     } else if msb == 1 {
         ((target[msb] as u32) << 16) | ((target[msb - 1] as u32) << 8)
     } else {
@@ -143,7 +141,14 @@ impl Decodable for BlockHeader {
         let time = u32::decode(r)?;
         let bits = u32::decode(r)?;
         let nonce = u32::decode(r)?;
-        Ok(Self { version, prev_block, merkle_root, time, bits, nonce })
+        Ok(Self {
+            version,
+            prev_block,
+            merkle_root,
+            time,
+            bits,
+            nonce,
+        })
     }
 }
 
@@ -176,7 +181,10 @@ impl Decodable for Block {
     fn decode<R: Read>(r: &mut R) -> Result<Self> {
         let header = BlockHeader::decode(r)?;
         let transactions = decode_list::<Transaction, _>(r)?;
-        Ok(Self { header, transactions })
+        Ok(Self {
+            header,
+            transactions,
+        })
     }
 }
 

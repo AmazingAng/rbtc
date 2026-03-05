@@ -1,13 +1,9 @@
+use rbtc_crypto::sighash::sighash_legacy_with_u32;
 /// Bitcoin Core sighash.json test harness.
 ///
 /// Format: `["raw_transaction_hex, script_hex, input_index, hashType, expected_sighash"]`
 /// First entry is the header row. Remaining 500 entries are legacy sighash test vectors.
-use rbtc_primitives::{
-    codec::Decodable,
-    script::Script,
-    transaction::Transaction,
-};
-use rbtc_crypto::sighash::sighash_legacy_with_u32;
+use rbtc_primitives::{codec::Decodable, script::Script, transaction::Transaction};
 use serde_json::Value;
 
 fn decode_hex(s: &str) -> Vec<u8> {
@@ -80,7 +76,10 @@ fn sighash_json() {
     }
 
     if !failures.is_empty() {
-        eprintln!("\n=== SIGHASH TEST FAILURES ({}/{total}) ===", failures.len());
+        eprintln!(
+            "\n=== SIGHASH TEST FAILURES ({}/{total}) ===",
+            failures.len()
+        );
         for f in &failures[..failures.len().min(20)] {
             eprintln!("  FAIL: {f}");
         }

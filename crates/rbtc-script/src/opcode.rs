@@ -79,19 +79,19 @@ pub enum Opcode {
     // Arithmetic
     Op1Add = 0x8b,
     Op1Sub = 0x8c,
-    Op2Mul = 0x8d,    // disabled
-    Op2Div = 0x8e,    // disabled
+    Op2Mul = 0x8d, // disabled
+    Op2Div = 0x8e, // disabled
     OpNegate = 0x8f,
     OpAbs = 0x90,
     OpNot = 0x91,
     Op0NotEqual = 0x92,
     OpAdd = 0x93,
     OpSub = 0x94,
-    OpMul = 0x95,     // disabled
-    OpDiv = 0x96,     // disabled
-    OpMod = 0x97,     // disabled
-    OpLShift = 0x98,  // disabled
-    OpRShift = 0x99,  // disabled
+    OpMul = 0x95,    // disabled
+    OpDiv = 0x96,    // disabled
+    OpMod = 0x97,    // disabled
+    OpLShift = 0x98, // disabled
+    OpRShift = 0x99, // disabled
     OpBoolAnd = 0x9a,
     OpBoolOr = 0x9b,
     OpNumEqual = 0x9c,

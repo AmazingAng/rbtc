@@ -6,8 +6,8 @@
 //!        + tx_offset   (4 bytes little-endian)
 //!        = 36 bytes total
 
-use rocksdb::WriteBatch;
 use rbtc_primitives::hash::Hash256;
+use rocksdb::WriteBatch;
 
 use crate::{
     db::{Database, CF_TX_INDEX},
@@ -81,8 +81,8 @@ impl<'a> TxIndexStore<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
     use crate::db::Database;
+    use tempfile::TempDir;
 
     fn make_hash(b: u8) -> Hash256 {
         Hash256([b; 32])

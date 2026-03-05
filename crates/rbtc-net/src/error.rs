@@ -35,7 +35,13 @@ mod tests {
     #[test]
     fn net_error_display() {
         let _ = format!("{}", NetError::MessageTooLarge(100));
-        let _ = format!("{}", NetError::InvalidMagic { expected: 0, got: 1 });
+        let _ = format!(
+            "{}",
+            NetError::InvalidMagic {
+                expected: 0,
+                got: 1
+            }
+        );
         let _ = format!("{}", NetError::ChecksumMismatch);
         let _ = format!("{}", NetError::UnknownCommand("x".into()));
         let _ = format!("{}", NetError::Decode("x".into()));

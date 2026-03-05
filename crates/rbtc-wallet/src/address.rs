@@ -22,7 +22,7 @@ pub enum AddressType {
 }
 
 impl AddressType {
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "legacy" | "p2pkh" => Some(Self::Legacy),
             "bech32" | "p2wpkh" | "segwit" => Some(Self::SegWit),
@@ -36,10 +36,10 @@ impl AddressType {
 
 fn bech32_hrp(network: Network) -> Hrp {
     let s = match network {
-        Network::Mainnet  => "bc",
+        Network::Mainnet => "bc",
         Network::Testnet4 => "tb",
-        Network::Regtest  => "bcrt",
-        Network::Signet   => "tb",
+        Network::Regtest => "bcrt",
+        Network::Signet => "tb",
     };
     Hrp::parse(s).expect("static HRP string is always valid")
 }
@@ -48,7 +48,7 @@ fn bech32_hrp(network: Network) -> Hrp {
 fn p2pkh_version(network: Network) -> u8 {
     match network {
         Network::Mainnet => 0x00,
-        _                => 0x6f,
+        _ => 0x6f,
     }
 }
 
@@ -57,7 +57,7 @@ fn p2pkh_version(network: Network) -> u8 {
 fn p2sh_version(network: Network) -> u8 {
     match network {
         Network::Mainnet => 0x05,
-        _                => 0xc4,
+        _ => 0xc4,
     }
 }
 
@@ -88,20 +88,16 @@ pub fn p2wpkh_address(pubkey: &PublicKey, network: Network) -> Result<String, Wa
     let h160 = hash160(&compressed);
     let hrp = bech32_hrp(network);
     let witver = Fe32::try_from(0u8).unwrap(); // witness version 0 → bech32
-    segwit::encode(hrp, witver, &h160.0)
-        .map_err(|e| WalletError::AddressEncoding(e.to_string()))
+    segwit::encode(hrp, witver, &h160.0).map_err(|e| WalletError::AddressEncoding(e.to_string()))
 }
 
 /// Compute the Taproot output key and x-only bytes for a given internal key.
 /// This follows BIP341 key-path-only tweaking: Q = P + H_TapTweak(P)*G.
-pub fn taproot_output_key(
-    keypair: &Keypair,
-) -> Result<(Keypair, XOnlyPublicKey), WalletError> {
+pub fn taproot_output_key(keypair: &Keypair) -> Result<(Keypair, XOnlyPublicKey), WalletError> {
     let secp = secp256k1::Secp256k1::new();
     let (xonly, _parity) = keypair.x_only_public_key();
     let tweak_bytes = tagged_hash(b"TapTweak", &xonly.serialize());
-    let tweak_scalar =
-        Scalar::from_be_bytes(tweak_bytes.0).map_err(|_| WalletError::InvalidKey)?;
+    let tweak_scalar = Scalar::from_be_bytes(tweak_bytes.0).map_err(|_| WalletError::InvalidKey)?;
     let tweaked = keypair
         .add_xonly_tweak(&secp, &tweak_scalar)
         .map_err(|_| WalletError::InvalidKey)?;
