@@ -47,4 +47,10 @@ pub enum MempoolError {
 
     #[error("mempool is full and incoming transaction fee rate is below eviction threshold")]
     MempoolFull,
+
+    #[error("too many in-mempool ancestors: {0} (limit {1})")]
+    TooManyAncestors(u64, u64),
+
+    #[error("too many in-mempool descendants: {0} (limit {1})")]
+    TooManyDescendants(u64, u64),
 }

@@ -16,10 +16,13 @@
 //!   0x06 = PSBT_IN_BIP32_DERIVATION
 //!   0x07 = PSBT_IN_FINAL_SCRIPTSIG
 //!   0x08 = PSBT_IN_FINAL_SCRIPTWITNESS
+//!   0x13 = PSBT_IN_TAP_KEY_SIG       (BIP371)
+//!   0x14 = PSBT_IN_TAP_INTERNAL_KEY  (BIP371)
 //!
 //! Per-output type bytes:
-//!   0x02 = PSBT_OUT_REDEEM_SCRIPT
-//!   0x03 = PSBT_OUT_WITNESS_SCRIPT
+//!   0x00 = PSBT_OUT_REDEEM_SCRIPT
+//!   0x01 = PSBT_OUT_WITNESS_SCRIPT
+//!   0x02 = PSBT_OUT_BIP32_DERIVATION
 
 use std::collections::BTreeMap;
 
@@ -60,6 +63,10 @@ pub struct PsbtInput {
     pub final_script_witness: Option<Vec<Vec<u8>>>,
     /// BIP32 derivation info: pubkey → (fingerprint, path).
     pub bip32_derivation: BTreeMap<Vec<u8>, (Vec<u8>, Vec<u32>)>,
+    /// BIP371: Taproot key-path signature (64 or 65 bytes).
+    pub tap_key_sig: Option<Vec<u8>>,
+    /// BIP371: Taproot internal key (32-byte x-only pubkey).
+    pub tap_internal_key: Option<Vec<u8>>,
     /// Unknown entries.
     pub unknown: BTreeMap<Vec<u8>, Vec<u8>>,
 }

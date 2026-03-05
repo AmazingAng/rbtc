@@ -16,6 +16,8 @@ pub const CF_WALLET: &str = "wallet";
 pub const CF_PEER_BANS: &str = "peer_bans";
 /// Peer address book: key = IP:port (18 bytes), value = last_seen u64 LE + services u64 LE
 pub const CF_PEER_ADDRS: &str = "peer_addrs";
+/// Height-to-hash index: key = height (4 bytes LE), value = block hash (32 bytes)
+pub const CF_HEIGHT_INDEX: &str = "height_index";
 
 /// Wrapper around RocksDB with Bitcoin-specific column families
 pub struct Database {
@@ -40,6 +42,7 @@ impl Database {
             ColumnFamilyDescriptor::new(CF_WALLET, Options::default()),
             ColumnFamilyDescriptor::new(CF_PEER_BANS, Options::default()),
             ColumnFamilyDescriptor::new(CF_PEER_ADDRS, Options::default()),
+            ColumnFamilyDescriptor::new(CF_HEIGHT_INDEX, Options::default()),
         ];
 
         let db = DB::open_cf_descriptors(&opts, path, cfs)?;

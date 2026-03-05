@@ -301,6 +301,9 @@ pub struct SigningInput {
     pub value: u64,
     pub script_pubkey: Script,
     pub secret_key: SecretKey,
+    /// For P2WSH inputs: the witness script (e.g. multisig OP_k <pks> OP_n OP_CHECKMULTISIG).
+    /// When set, signs using this script as the BIP143 script_code.
+    pub witness_script: Option<Script>,
 }
 
 /// Sign a transaction that has been built with `TxBuilder`.
@@ -362,6 +365,43 @@ pub fn sign_transaction(
             let pub_bytes = pubkey.serialize();
             signed.inputs[i].script_sig = Script::new();
             signed.inputs[i].witness = vec![sig_bytes, pub_bytes.to_vec()];
+        } else if spk.is_p2wsh() {
+            // P2WSH — requires witness_script in the SigningInput
+            if let Some(ref ws) = si.witness_script {
+                let sighash = sighash_segwit_v0(tx, i, ws, si.value, SighashType::All);
+                let msg = Message::from_digest(sighash.0);
+                let sig = secp.sign_ecdsa(msg, &si.secret_key);
+                let mut sig_bytes = sig.serialize_der().to_vec();
+                sig_bytes.push(0x01); // SIGHASH_ALL
+
+                // For multisig, build witness: OP_0 <sig1> ... <sigN> <witness_script>
+                // Here we provide just our signature; the caller must combine sigs
+                // for multi-party multisig. For single-signer or threshold cases
+                // where this key suffices, we build a complete witness.
+                signed.inputs[i].script_sig = Script::new();
+                // Detect multisig: OP_k ... OP_n OP_CHECKMULTISIG (0xae at end)
+                let ws_bytes = ws.as_bytes();
+                if ws_bytes.last() == Some(&0xae) {
+                    // Multisig witness: OP_0 <sig> <witness_script>
+                    signed.inputs[i].witness = vec![
+                        vec![],   // OP_0 dummy (CHECKMULTISIG bug)
+                        sig_bytes,
+                        ws_bytes.to_vec(),
+                    ];
+                } else {
+                    // Generic P2WSH: <sig> <pubkey> <witness_script>
+                    let pubkey = secp256k1::PublicKey::from_secret_key(&secp, &si.secret_key);
+                    signed.inputs[i].witness = vec![
+                        sig_bytes,
+                        pubkey.serialize().to_vec(),
+                        ws_bytes.to_vec(),
+                    ];
+                }
+            } else {
+                tracing::warn!(
+                    "sign_transaction: P2WSH input {i} missing witness_script"
+                );
+            }
         } else if spk.is_p2tr() {
             // Taproot key-path spend (P2TR)
             let keypair = Keypair::from_secret_key(&secp, &si.secret_key);

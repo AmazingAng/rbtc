@@ -136,6 +136,13 @@ async fn run_peer_inner(
                     peer_ua = v.user_agent.clone();
                     peer_services = v.services;
                     got_version = true;
+                    // Reject peers with protocol version too old to support
+                    // modern features (SegWit, compact blocks, etc.)
+                    if peer_version < 70015 {
+                        return Err(NetError::HandshakeFailed(
+                            format!("peer protocol version {} too old (minimum 70015)", peer_version),
+                        ));
+                    }
                     // BIP339: send wtxidrelay before verack
                     let wtxid = Message::new(magic, NetworkMessage::WtxidRelay).encode_to_bytes();
                     write_half.write_all(&wtxid).await?;

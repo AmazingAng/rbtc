@@ -10,12 +10,16 @@
 //!   2. Computes the correct sighash.
 //!   3. Appends to `partial_sigs`.
 
-use secp256k1::{Secp256k1, SecretKey};
+use rand::RngCore;
+use secp256k1::{Keypair, Secp256k1, SecretKey};
 
+use rbtc_crypto::sighash::{sighash_taproot, SighashType};
 use rbtc_primitives::{
     hash::Hash256,
     script::Script,
+    transaction::TxOut,
 };
+use rbtc_wallet::address::taproot_output_key;
 
 use crate::{
     error::{PsbtError, Result},
@@ -36,20 +40,25 @@ impl Psbt {
             .and_then(|i| i.sighash_type)
             .unwrap_or(1); // SIGHASH_ALL
 
-        let sig_bytes = if let Some(txout) = self.inputs.get(index)
+        if let Some(txout) = self.inputs.get(index)
             .and_then(|i| i.witness_utxo.as_ref())
+            .cloned()
         {
+            if txout.script_pubkey.is_p2tr() {
+                // Taproot key-path spend (BIP341 + BIP371)
+                return self.sign_input_taproot(index, secret_key, &txout);
+            }
             // SegWit v0 path: derive P2WPKH sighash (BIP143)
             let script_code = p2wpkh_script_code(&pubkey_bytes)?;
-            let amount = txout.value;
             let sighash = compute_p2wpkh_sighash(
                 &self.global.unsigned_tx,
                 index,
                 &script_code,
-                amount,
+                txout.value,
                 sighash_type,
             )?;
-            ecdsa_sign(&secp, secret_key, &sighash, sighash_type)
+            let sig_bytes = ecdsa_sign(&secp, secret_key, &sighash, sighash_type);
+            self.inputs[index].partial_sigs.insert(pubkey_bytes, sig_bytes);
         } else if self.inputs.get(index)
             .and_then(|i| i.non_witness_utxo.as_ref())
             .is_some()
@@ -61,14 +70,75 @@ impl Psbt {
                 &p2pkh_script_code(&pubkey_bytes),
                 sighash_type,
             )?;
-            ecdsa_sign(&secp, secret_key, &sighash, sighash_type)
+            let sig_bytes = ecdsa_sign(&secp, secret_key, &sighash, sighash_type);
+            self.inputs[index].partial_sigs.insert(pubkey_bytes, sig_bytes);
         } else {
             return Err(PsbtError::MissingField("witness_utxo or non_witness_utxo"));
+        }
+
+        Ok(())
+    }
+
+    /// Sign a P2TR (Taproot) key-path input using BIP341 sighash + Schnorr.
+    fn sign_input_taproot(
+        &mut self,
+        index: usize,
+        secret_key: &SecretKey,
+        _witness_utxo: &TxOut,
+    ) -> Result<()> {
+        let secp = Secp256k1::new();
+        let keypair = Keypair::from_secret_key(&secp, secret_key);
+
+        // Apply BIP341 TapTweak
+        let (tweaked_kp, _tweaked_xonly) =
+            taproot_output_key(&keypair).map_err(|_| PsbtError::MissingField("taproot tweak"))?;
+
+        // Collect all prevouts from witness_utxo fields (required for Taproot sighash)
+        let mut prevouts: Vec<TxOut> = Vec::with_capacity(self.inputs.len());
+        for inp in self.inputs.iter() {
+            let txout = inp
+                .witness_utxo
+                .clone()
+                .ok_or(PsbtError::MissingField(
+                    "witness_utxo required for all inputs when signing Taproot",
+                ))?;
+            prevouts.push(txout);
+        }
+
+        let sighash_type_u32 = self.inputs[index].sighash_type.unwrap_or(0);
+        let sighash_type = if sighash_type_u32 == 0 {
+            SighashType::TaprootDefault
+        } else {
+            SighashType::from_u32(sighash_type_u32)
+                .ok_or(PsbtError::Decode("invalid taproot sighash type".into()))?
         };
 
-        self.inputs[index]
-            .partial_sigs
-            .insert(pubkey_bytes, sig_bytes);
+        let sighash = sighash_taproot(
+            &self.global.unsigned_tx,
+            index,
+            &prevouts,
+            sighash_type,
+            None,  // key-path spend: no leaf hash
+            None,  // no annex
+            0,     // key_version = 0
+            u32::MAX, // code_separator_pos
+        );
+
+        let mut aux_rand = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut aux_rand);
+        let sig = secp.sign_schnorr_with_aux_rand(&sighash.0, &tweaked_kp, &aux_rand);
+
+        // Build signature: 64 bytes for TaprootDefault, 65 bytes otherwise
+        let mut sig_bytes = sig.as_ref().to_vec();
+        if sighash_type != SighashType::TaprootDefault {
+            sig_bytes.push(sighash_type_u32 as u8);
+        }
+
+        // Store as BIP371 tap_key_sig
+        self.inputs[index].tap_key_sig = Some(sig_bytes);
+        // Store internal key
+        let (xonly, _) = keypair.x_only_public_key();
+        self.inputs[index].tap_internal_key = Some(xonly.serialize().to_vec());
 
         Ok(())
     }
@@ -231,5 +301,43 @@ mod tests {
         let sk = SecretKey::from_byte_array([1u8; 32]).unwrap();
         psbt.sign_input(0, &sk).unwrap();
         assert_eq!(psbt.inputs[0].partial_sigs.len(), 1);
+    }
+
+    #[test]
+    fn sign_input_taproot_key_path() {
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_byte_array([2u8; 32]).unwrap();
+        let keypair = secp256k1::Keypair::from_secret_key(&secp, &sk);
+        let (_, output_xonly) = rbtc_wallet::address::taproot_output_key(&keypair).unwrap();
+
+        // Build a P2TR scriptPubKey: OP_1 <32 bytes>
+        let mut p2tr_spk = vec![0x51, 0x20];
+        p2tr_spk.extend_from_slice(&output_xonly.serialize());
+
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: Hash256([1; 32]), vout: 0 },
+                script_sig: Script::new(),
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 49_000, script_pubkey: Script::new() }],
+            lock_time: 0,
+        };
+        let mut psbt = Psbt::create(tx);
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: 50_000,
+            script_pubkey: Script::from_bytes(p2tr_spk),
+        });
+
+        psbt.sign_input(0, &sk).unwrap();
+
+        // P2TR signing stores tap_key_sig, not partial_sigs
+        assert!(psbt.inputs[0].tap_key_sig.is_some());
+        assert!(psbt.inputs[0].tap_internal_key.is_some());
+        // Default sighash → 64-byte sig (no sighash byte appended)
+        assert_eq!(psbt.inputs[0].tap_key_sig.as_ref().unwrap().len(), 64);
+        assert!(psbt.inputs[0].partial_sigs.is_empty());
     }
 }

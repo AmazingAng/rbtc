@@ -20,6 +20,13 @@ use crate::{
 /// Default maximum total vsize (~300 MB).
 const DEFAULT_MAX_VSIZE: u64 = 300_000_000;
 
+/// Bitcoin Core default: max ancestor/descendant count (including the tx itself).
+const DEFAULT_MAX_ANCESTOR_COUNT: u64 = 25;
+const DEFAULT_MAX_DESCENDANT_COUNT: u64 = 25;
+
+/// Bitcoin Core default: mempool transaction expiry time (336 hours = 14 days).
+const DEFAULT_MEMPOOL_EXPIRY: std::time::Duration = std::time::Duration::from_secs(336 * 3600);
+
 /// In-memory transaction pool
 pub struct Mempool {
     entries: HashMap<TxId, MempoolEntry>,
@@ -214,6 +221,28 @@ impl Mempool {
             self.count_ancestors_inner(&tx, &mut visited) + 1
         };
 
+        // ── Ancestor/descendant count limits (Bitcoin Core default: 25) ──
+        if ancestor_count > DEFAULT_MAX_ANCESTOR_COUNT {
+            return Err(MempoolError::TooManyAncestors(
+                ancestor_count,
+                DEFAULT_MAX_ANCESTOR_COUNT,
+            ));
+        }
+
+        // Check that adding this tx won't push any parent's descendant count over the limit
+        for input in &tx.inputs {
+            let ptxid = &input.previous_output.txid;
+            if let Some(parent) = self.entries.get(ptxid) {
+                // parent.descendant_count doesn't include the new tx yet, so +1
+                if parent.descendant_count + 1 >= DEFAULT_MAX_DESCENDANT_COUNT {
+                    return Err(MempoolError::TooManyDescendants(
+                        parent.descendant_count + 1,
+                        DEFAULT_MAX_DESCENDANT_COUNT,
+                    ));
+                }
+            }
+        }
+
         let entry = MempoolEntry {
             tx,
             txid,
@@ -310,6 +339,28 @@ impl Mempool {
     pub fn min_fee_rate(&self) -> u64 {
         self.entries.values().map(|e| e.fee_rate).min()
             .unwrap_or(self.min_relay_fee_rate)
+    }
+
+    /// Remove transactions that have been in the mempool longer than the expiry
+    /// duration (default 336 hours / 14 days, matching Bitcoin Core).
+    /// Returns the number of expired transactions removed.
+    pub fn expire_old_transactions(&mut self) -> usize {
+        let now = std::time::Instant::now();
+        let expired: Vec<TxId> = self
+            .entries
+            .values()
+            .filter(|e| now.duration_since(e.added_at) >= DEFAULT_MEMPOOL_EXPIRY)
+            .map(|e| e.txid)
+            .collect();
+        let count = expired.len();
+        if count > 0 {
+            for txid in &expired {
+                self.entries.remove(txid);
+            }
+            self.rebuild_mempool_utxos();
+            info!("mempool: expired {count} old transactions");
+        }
+        count
     }
 
     // ── CPFP ancestor computation ─────────────────────────────────────────────

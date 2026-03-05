@@ -845,27 +845,39 @@ async fn rpc_getnetworkhashps(state: &RpcState, params: &Value) -> RpcResult {
 }
 
 async fn rpc_estimatesmartfee(state: &RpcState, params: &Value) -> RpcResult {
-    let _conf_target = params.get(0).and_then(Value::as_u64).unwrap_or(6);
+    let conf_target = params.get(0).and_then(Value::as_u64).unwrap_or(6) as u32;
 
     let mp = state.mempool.read().await;
-    let txids = mp.txids_by_fee_rate();
+    let txids = mp.txids_by_fee_rate(); // sorted descending by ancestor fee rate
 
-    // Median fee rate across mempool transactions (sat/vB)
     let fee_rate = if txids.is_empty() {
-        1.0f64 // default floor
+        1.0f64 // default floor: 1 sat/vB
     } else {
+        // Collect fee rates sorted descending (highest first)
         let rates: Vec<f64> = txids
             .iter()
             .filter_map(|id| mp.get(id))
             .map(|e| e.fee_rate as f64)
             .collect();
-        let median_idx = rates.len() / 2;
-        rates[median_idx]
+
+        // Pick percentile based on confirmation target:
+        //   1 block  → 90th percentile (index near top)
+        //   2-3      → 75th percentile
+        //   4-6      → 50th percentile (median)
+        //   7+       → 25th percentile
+        let percentile = match conf_target {
+            0..=1 => 0.10,  // top 10% → index = len * 0.10
+            2..=3 => 0.25,
+            4..=6 => 0.50,
+            _ => 0.75,
+        };
+        let idx = ((rates.len() as f64 * percentile) as usize).min(rates.len() - 1);
+        rates[idx].max(1.0)
     };
 
     Ok(json!({
         "feerate": fee_rate / 1000.0,   // convert sat/vB to BTC/kB
-        "blocks":  _conf_target,
+        "blocks":  conf_target,
     }))
 }
 
@@ -1797,38 +1809,127 @@ async fn rpc_createmultisig(_state: &RpcState, params: &Value) -> RpcResult {
     }))
 }
 
+/// Compute the Bitcoin Signed Message hash.
+/// Format: SHA256d("\x18Bitcoin Signed Message:\n" + varint(len) + message)
+fn message_hash(message: &str) -> Hash256 {
+    use rbtc_primitives::codec::{Encodable, VarInt};
+    let mut buf = Vec::new();
+    // The prefix is length-prefixed itself: 0x18 = 24 = len("Bitcoin Signed Message:\n")
+    buf.push(0x18);
+    buf.extend_from_slice(b"Bitcoin Signed Message:\n");
+    VarInt(message.len() as u64).encode(&mut buf).ok();
+    buf.extend_from_slice(message.as_bytes());
+    rbtc_crypto::sha256d(&buf)
+}
+
 async fn rpc_verifymessage(_state: &RpcState, params: &Value) -> RpcResult {
-    let _address = params
+    let address = params
         .get(0)
         .and_then(Value::as_str)
         .ok_or((-32602, "Expected address".to_string()))?;
-    let _signature = params
+    let signature_b64 = params
         .get(1)
         .and_then(Value::as_str)
         .ok_or((-32602, "Expected signature".to_string()))?;
-    let _message = params
+    let message = params
         .get(2)
         .and_then(Value::as_str)
         .ok_or((-32602, "Expected message".to_string()))?;
 
-    // Bitcoin message signing requires ECDSA recovery which needs
-    // secp256k1 recovery feature. Return a stub for now.
-    // Full implementation requires: hash the message with Bitcoin Signed Message
-    // prefix, recover pubkey from compact sig, compare with address.
-    Err((-1, "verifymessage not yet fully implemented".to_string()))
+    // Decode base64 signature (65 bytes: 1 recovery + 32 r + 32 s)
+    use base64::{engine::general_purpose::STANDARD as B64, Engine};
+    let sig_bytes = B64
+        .decode(signature_b64)
+        .map_err(|_| (-8, "Invalid base64 signature".to_string()))?;
+    if sig_bytes.len() != 65 {
+        return Err((-8, "Signature must be 65 bytes".to_string()));
+    }
+
+    let hash = message_hash(message);
+    let msg = secp256k1::Message::from_digest(hash.0);
+
+    // Parse compact signature: first byte encodes recovery_id + compression flag
+    let flag = sig_bytes[0];
+    let recovery_id_raw = (flag - 27) & 3;
+    let compressed = (flag - 27) & 4 != 0;
+    let rec_id = secp256k1::ecdsa::RecoveryId::from_u8_masked(recovery_id_raw);
+    let rec_sig = secp256k1::ecdsa::RecoverableSignature::from_compact(&sig_bytes[1..65], rec_id)
+        .map_err(|_| (-8, "Invalid compact signature".to_string()))?;
+
+    let secp = secp256k1::Secp256k1::new();
+    let recovered_pk = secp
+        .recover_ecdsa(msg, &rec_sig)
+        .map_err(|_| (-8, "Failed to recover public key".to_string()))?;
+
+    // Derive P2PKH address from recovered pubkey and compare
+    use rbtc_primitives::network::Network;
+    let network = if address.starts_with('1') || address.starts_with('3') {
+        Network::Mainnet
+    } else {
+        Network::Testnet4
+    };
+    let recovered_addr = if compressed {
+        rbtc_wallet::address::p2pkh_address(&recovered_pk, network)
+    } else {
+        // For uncompressed keys, serialize uncompressed and hash
+        let uncompressed = recovered_pk.serialize_uncompressed();
+        let h160 = rbtc_crypto::hash160(&uncompressed);
+        let version = if network == Network::Mainnet { 0x00u8 } else { 0x6fu8 };
+        let mut payload = vec![version];
+        payload.extend_from_slice(&h160.0);
+        use sha2::{Digest, Sha256};
+        let checksum = Sha256::digest(Sha256::digest(&payload));
+        payload.extend_from_slice(&checksum[..4]);
+        bs58::encode(payload).into_string()
+    };
+
+    Ok(json!(recovered_addr == address))
 }
 
 async fn rpc_signmessagewithprivkey(_state: &RpcState, params: &Value) -> RpcResult {
-    let _privkey = params
+    let privkey_wif = params
         .get(0)
         .and_then(Value::as_str)
-        .ok_or((-32602, "Expected privkey".to_string()))?;
-    let _message = params
+        .ok_or((-32602, "Expected privkey (WIF)".to_string()))?;
+    let message = params
         .get(1)
         .and_then(Value::as_str)
         .ok_or((-32602, "Expected message".to_string()))?;
 
-    Err((-1, "signmessagewithprivkey not yet fully implemented".to_string()))
+    // Decode WIF to get both secret key and compressed flag
+    let decoded = bs58::decode(privkey_wif)
+        .with_check(None)
+        .into_vec()
+        .map_err(|_| (-8, "Invalid WIF".to_string()))?;
+    if decoded.len() < 33 || decoded.len() > 34 {
+        return Err((-8, "Invalid WIF length".to_string()));
+    }
+    let compressed = decoded.len() == 34;
+    let key_arr: [u8; 32] = decoded[1..33]
+        .try_into()
+        .map_err(|_| (-8, "Bad key bytes".to_string()))?;
+    let secret_key = secp256k1::SecretKey::from_byte_array(key_arr)
+        .map_err(|_| (-8, "Invalid secret key".to_string()))?;
+
+    let hash = message_hash(message);
+    let msg = secp256k1::Message::from_digest(hash.0);
+    let secp = secp256k1::Secp256k1::new();
+    let rec_sig = secp.sign_ecdsa_recoverable(msg, &secret_key);
+    let (rec_id, compact) = rec_sig.serialize_compact();
+
+    // Build 65-byte compact sig: flag + 64 bytes
+    let rec_id_val: u8 = match rec_id {
+        secp256k1::ecdsa::RecoveryId::Zero => 0,
+        secp256k1::ecdsa::RecoveryId::One => 1,
+        secp256k1::ecdsa::RecoveryId::Two => 2,
+        secp256k1::ecdsa::RecoveryId::Three => 3,
+    };
+    let flag = 27 + rec_id_val + if compressed { 4 } else { 0 };
+    let mut sig_bytes = vec![flag];
+    sig_bytes.extend_from_slice(&compact);
+
+    use base64::{engine::general_purpose::STANDARD as B64, Engine};
+    Ok(json!(B64.encode(&sig_bytes)))
 }
 
 // ── Phase D: Network RPCs ────────────────────────────────────────────────────
@@ -2278,12 +2379,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn signmessagewithprivkey_stub_returns_error() {
+    async fn signmessagewithprivkey_returns_base64() {
         let (state, _tmpdir) = test_state();
         let result = rpc_signmessagewithprivkey(
             &state,
             &json!(["KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU73sVHnoWn", "hello"]),
         ).await;
-        assert!(result.is_err());
+        let sig = result.unwrap();
+        // Should be a base64 string
+        assert!(sig.as_str().unwrap().len() > 0);
     }
 }

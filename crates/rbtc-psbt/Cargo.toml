@@ -12,5 +12,6 @@ rbtc-wallet     = { workspace = true }
 secp256k1       = { workspace = true }
 base64          = { workspace = true }
 thiserror       = { workspace = true }
+rand            = { workspace = true }
 
 [dev-dependencies]

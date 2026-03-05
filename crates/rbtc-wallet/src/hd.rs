@@ -162,6 +162,37 @@ pub struct ExtendedPubKey {
 }
 
 impl ExtendedPubKey {
+    /// Decode from a Base58Check-encoded xpub/tpub string (BIP32 serialization).
+    ///
+    /// Format: 4 version + 1 depth + 4 fingerprint + 4 child_number + 32 chaincode + 33 pubkey = 78 bytes
+    pub fn from_base58(s: &str) -> Result<Self, WalletError> {
+        let decoded = bs58::decode(s)
+            .with_check(None)
+            .into_vec()
+            .map_err(|_| WalletError::InvalidKey)?;
+        if decoded.len() != 78 {
+            return Err(WalletError::InvalidKey);
+        }
+        // Version bytes: 0x0488B21E (xpub) or 0x043587CF (tpub)
+        // We accept both without checking — the caller knows the network.
+        let depth = decoded[4];
+        let mut parent_fingerprint = [0u8; 4];
+        parent_fingerprint.copy_from_slice(&decoded[5..9]);
+        let child_number = u32::from_be_bytes(decoded[9..13].try_into().unwrap());
+        let mut chaincode = [0u8; 32];
+        chaincode.copy_from_slice(&decoded[13..45]);
+        let public_key = PublicKey::from_slice(&decoded[45..78])
+            .map_err(|_| WalletError::InvalidKey)?;
+
+        Ok(Self {
+            depth,
+            parent_fingerprint,
+            child_number,
+            chaincode,
+            public_key,
+        })
+    }
+
     /// Derive from `ExtendedPrivKey`.
     pub fn from_xprv(xprv: &ExtendedPrivKey) -> Self {
         Self {

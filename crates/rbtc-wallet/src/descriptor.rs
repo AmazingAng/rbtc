@@ -121,11 +121,11 @@ impl Descriptor {
 
     /// Derive the scriptPubKey for this descriptor at the given index
     /// (index is used for wildcard `*` paths in xpub descriptors).
-    pub fn to_script(&self, _index: u32) -> Result<Script, WalletError> {
+    pub fn to_script(&self, index: u32) -> Result<Script, WalletError> {
         match self {
             Descriptor::Addr(addr) => address_to_script(addr),
             Descriptor::Pk(key) => {
-                let pk = key.to_pubkey()?;
+                let pk = key.to_pubkey_at(index)?;
                 // Raw pk: just push the pubkey
                 let bytes = pk.serialize();
                 let mut s = vec![bytes.len() as u8];
@@ -133,11 +133,11 @@ impl Descriptor {
                 s.push(0xac); // OP_CHECKSIG
                 Ok(Script::from_bytes(s))
             }
-            Descriptor::Pkh(key) => Ok(p2pkh_script(&key.to_pubkey()?)),
-            Descriptor::Wpkh(key) => Ok(p2wpkh_script(&key.to_pubkey()?)),
+            Descriptor::Pkh(key) => Ok(p2pkh_script(&key.to_pubkey_at(index)?)),
+            Descriptor::Wpkh(key) => Ok(p2wpkh_script(&key.to_pubkey_at(index)?)),
             Descriptor::ShWpkh(key) => {
                 // P2SH-P2WPKH: scriptPubKey = OP_HASH160 <hash(witness_program)> OP_EQUAL
-                let pk = key.to_pubkey()?;
+                let pk = key.to_pubkey_at(index)?;
                 let witness_prog = p2wpkh_script(&pk);
                 let h = rbtc_crypto::hash160(witness_prog.as_bytes());
                 let mut s = Vec::with_capacity(23);
@@ -148,7 +148,7 @@ impl Descriptor {
                 Ok(Script::from_bytes(s))
             }
             Descriptor::Tr(key) => {
-                let pk = key.to_pubkey()?;
+                let pk = key.to_pubkey_at(index)?;
                 let secp = secp256k1::Secp256k1::new();
                 let sk_bytes = [1u8; 32]; // dummy — we only need the xonly from pubkey
                 // For tr() with just a pubkey, we treat it as the internal key and tweak
@@ -164,17 +164,17 @@ impl Descriptor {
             }
             Descriptor::Multi(k, keys) => {
                 let pubkeys: Result<Vec<PublicKey>, _> =
-                    keys.iter().map(|k| k.to_pubkey()).collect();
+                    keys.iter().map(|k| k.to_pubkey_at(index)).collect();
                 Ok(build_multisig_script(*k, &pubkeys?))
             }
             Descriptor::SortedMulti(k, keys) => {
                 let mut pubkeys: Vec<PublicKey> =
-                    keys.iter().map(|k| k.to_pubkey()).collect::<Result<_, _>>()?;
+                    keys.iter().map(|k| k.to_pubkey_at(index)).collect::<Result<_, _>>()?;
                 pubkeys.sort_by(|a, b| a.serialize().cmp(&b.serialize()));
                 Ok(build_multisig_script(*k, &pubkeys))
             }
             Descriptor::Wsh(inner) => {
-                let witness_script = inner.to_script(_index)?;
+                let witness_script = inner.to_script(index)?;
                 use sha2::Digest;
                 let hash: [u8; 32] = sha2::Sha256::digest(witness_script.as_bytes()).into();
                 let mut s = Vec::with_capacity(34);
@@ -184,7 +184,7 @@ impl Descriptor {
                 Ok(Script::from_bytes(s))
             }
             Descriptor::Sh(inner) => {
-                let redeem_script = inner.to_script(_index)?;
+                let redeem_script = inner.to_script(index)?;
                 let h = rbtc_crypto::hash160(redeem_script.as_bytes());
                 let mut s = Vec::with_capacity(23);
                 s.push(0xa9); // OP_HASH160
@@ -244,21 +244,37 @@ impl DescriptorKey {
         Err(WalletError::InvalidAddress(format!("unrecognized key: {s}")))
     }
 
-    /// Resolve to a concrete `PublicKey`. For xpub keys, this currently
-    /// returns the base key (index 0). Full xpub derivation is a TODO.
-    fn to_pubkey(&self) -> Result<PublicKey, WalletError> {
+    /// Resolve to a concrete `PublicKey` at the given derivation index.
+    /// For fixed keys, the index is ignored.
+    /// For xpub keys, the path suffix is applied (replacing `*` with `index`).
+    fn to_pubkey_at(&self, index: u32) -> Result<PublicKey, WalletError> {
         match self {
             DescriptorKey::Fixed(bytes) => PublicKey::from_slice(bytes)
                 .map_err(|_| WalletError::InvalidKey),
-            DescriptorKey::Xpub { key, .. } => {
-                // Decode xpub to get the public key
-                // For now, return an error — full xpub derivation requires
-                // Base58 decoding of the extended key format
-                Err(WalletError::InvalidAddress(format!(
-                    "xpub derivation not yet supported for {key}"
-                )))
+            DescriptorKey::Xpub { key, path_suffix } => {
+                let xpub = crate::hd::ExtendedPubKey::from_base58(key)?;
+                // Apply path suffix if present, e.g., "/0/*" → derive child 0, then child `index`
+                let mut current = xpub;
+                if let Some(suffix) = path_suffix {
+                    for component in suffix.split('/').filter(|s| !s.is_empty()) {
+                        let child_idx = if component == "*" {
+                            index
+                        } else {
+                            component.parse::<u32>().map_err(|_| {
+                                WalletError::InvalidPath(format!("bad path component: {component}"))
+                            })?
+                        };
+                        current = current.derive_child(child_idx)?;
+                    }
+                }
+                Ok(current.public_key)
             }
         }
+    }
+
+    /// Convenience: resolve at index 0 (for non-ranged descriptors).
+    fn to_pubkey(&self) -> Result<PublicKey, WalletError> {
+        self.to_pubkey_at(0)
     }
 }
 

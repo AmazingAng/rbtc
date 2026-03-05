@@ -34,7 +34,7 @@ rbtc-miner      = { path = "crates/rbtc-miner" }
 rbtc-psbt       = { path = "crates/rbtc-psbt" }
 
 # Cryptography
-secp256k1 = { version = "0.31", features = ["global-context"] }
+secp256k1 = { version = "0.31", features = ["global-context", "recovery"] }
 sha2      = "0.10"
 ripemd    = "0.2.0-rc.5"
 hmac      = "0.12"

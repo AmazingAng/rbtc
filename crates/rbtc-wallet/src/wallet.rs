@@ -367,6 +367,7 @@ impl Wallet {
                     value: utxo.value,
                     script_pubkey: utxo.script_pubkey.clone(),
                     secret_key: sk,
+                    witness_script: None,
                 }
             })
             .collect();
@@ -391,6 +392,7 @@ impl Wallet {
                         value: utxo.value,
                         script_pubkey: utxo.script_pubkey.clone(),
                         secret_key: sk,
+                        witness_script: None,
                     }
                 } else {
                     // Unknown input — use dummy key (will produce invalid sig)
@@ -399,6 +401,7 @@ impl Wallet {
                         value: 0,
                         script_pubkey: Script::new(),
                         secret_key: SecretKey::from_slice(&[1u8; 32]).unwrap(),
+                        witness_script: None,
                     }
                 }
             })

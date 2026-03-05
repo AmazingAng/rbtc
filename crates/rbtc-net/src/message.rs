@@ -177,7 +177,7 @@ impl VersionMessage {
     pub fn new(best_height: i32, nonce: u64) -> Self {
         Self {
             version: 70016,
-            services: 0x0000000000000409, // NODE_NETWORK | NODE_BLOOM | NODE_WITNESS
+            services: 0x0000000000000401, // NODE_NETWORK | NODE_WITNESS
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -185,7 +185,7 @@ impl VersionMessage {
             recv_services: 0,
             recv_addr: [0u8; 16],
             recv_port: 0,
-            from_services: 0x0000000000000409,
+            from_services: 0x0000000000000401,
             from_addr: [0u8; 16],
             from_port: 0,
             nonce,

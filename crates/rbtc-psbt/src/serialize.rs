@@ -207,6 +207,19 @@ impl Psbt {
                     [0x05] => {
                         inp.witness_script = Some(Script::from_bytes(value));
                     }
+                    k if k.first() == Some(&0x06) && k.len() == 34 => {
+                        // BIP32 derivation: key = 0x06 || pubkey(33)
+                        // value = fingerprint(4) || path(n * 4 bytes LE u32)
+                        let pubkey = k[1..].to_vec();
+                        if value.len() >= 4 && (value.len() - 4) % 4 == 0 {
+                            let fingerprint = value[..4].to_vec();
+                            let path: Vec<u32> = value[4..]
+                                .chunks_exact(4)
+                                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                                .collect();
+                            inp.bip32_derivation.insert(pubkey, (fingerprint, path));
+                        }
+                    }
                     [0x07] => {
                         inp.final_script_sig = Some(Script::from_bytes(value));
                     }
@@ -227,6 +240,12 @@ impl Psbt {
                             inp.final_script_witness = Some(witness);
                         }
                     }
+                    [0x13] => {
+                        inp.tap_key_sig = Some(value);
+                    }
+                    [0x14] => {
+                        inp.tap_internal_key = Some(value);
+                    }
                     _ => { inp.unknown.insert(key, value); }
                 }
             }
@@ -240,8 +259,19 @@ impl Psbt {
             let mut out = PsbtOutput::default();
             for (key, value) in entries {
                 match key.as_slice() {
-                    [0x02] => { out.redeem_script = Some(Script::from_bytes(value)); }
-                    [0x03] => { out.witness_script = Some(Script::from_bytes(value)); }
+                    [0x00] => { out.redeem_script = Some(Script::from_bytes(value)); }
+                    [0x01] => { out.witness_script = Some(Script::from_bytes(value)); }
+                    k if k.first() == Some(&0x02) && k.len() == 34 => {
+                        let pubkey = k[1..].to_vec();
+                        if value.len() >= 4 && (value.len() - 4) % 4 == 0 {
+                            let fingerprint = value[..4].to_vec();
+                            let path: Vec<u32> = value[4..]
+                                .chunks_exact(4)
+                                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                                .collect();
+                            out.bip32_derivation.insert(pubkey, (fingerprint, path));
+                        }
+                    }
                     _ => { out.unknown.insert(key, value); }
                 }
             }
@@ -279,6 +309,15 @@ fn encode_input(inp: &PsbtInput, buf: &mut Vec<u8>) {
     if let Some(ref s) = inp.witness_script {
         write_kv(buf, &[0x05], s.as_bytes());
     }
+    for (pubkey, (fingerprint, path)) in &inp.bip32_derivation {
+        let mut key = vec![0x06];
+        key.extend_from_slice(pubkey);
+        let mut val = fingerprint.clone();
+        for &idx in path {
+            val.extend_from_slice(&idx.to_le_bytes());
+        }
+        write_kv(buf, &key, &val);
+    }
     if let Some(ref s) = inp.final_script_sig {
         write_kv(buf, &[0x07], s.as_bytes());
     }
@@ -291,6 +330,12 @@ fn encode_input(inp: &PsbtInput, buf: &mut Vec<u8>) {
         }
         write_kv(buf, &[0x08], &w_buf);
     }
+    if let Some(ref sig) = inp.tap_key_sig {
+        write_kv(buf, &[0x13], sig);
+    }
+    if let Some(ref key) = inp.tap_internal_key {
+        write_kv(buf, &[0x14], key);
+    }
     for (k, v) in &inp.unknown {
         write_kv(buf, k, v);
     }
@@ -299,10 +344,19 @@ fn encode_input(inp: &PsbtInput, buf: &mut Vec<u8>) {
 
 fn encode_output(out: &PsbtOutput, buf: &mut Vec<u8>) {
     if let Some(ref s) = out.redeem_script {
-        write_kv(buf, &[0x02], s.as_bytes());
+        write_kv(buf, &[0x00], s.as_bytes());
     }
     if let Some(ref s) = out.witness_script {
-        write_kv(buf, &[0x03], s.as_bytes());
+        write_kv(buf, &[0x01], s.as_bytes());
+    }
+    for (pubkey, (fingerprint, path)) in &out.bip32_derivation {
+        let mut key = vec![0x02];
+        key.extend_from_slice(pubkey);
+        let mut val = fingerprint.clone();
+        for &idx in path {
+            val.extend_from_slice(&idx.to_le_bytes());
+        }
+        write_kv(buf, &key, &val);
     }
     for (k, v) in &out.unknown {
         write_kv(buf, k, v);
@@ -354,6 +408,46 @@ mod tests {
             decoded.global.unsigned_tx.inputs.len(),
             psbt.global.unsigned_tx.inputs.len()
         );
+    }
+
+    #[test]
+    fn psbt_bip32_derivation_roundtrip() {
+        let tx = make_tx();
+        let mut inp = PsbtInput::default();
+        // Fake 33-byte compressed pubkey
+        let pubkey = vec![0x02; 33];
+        let fingerprint = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let path = vec![44 | 0x80000000, 0 | 0x80000000, 0 | 0x80000000, 0, 0];
+        inp.bip32_derivation.insert(pubkey.clone(), (fingerprint.clone(), path.clone()));
+
+        let mut out = PsbtOutput::default();
+        out.bip32_derivation.insert(pubkey.clone(), (fingerprint.clone(), path.clone()));
+        out.redeem_script = Some(Script::from_bytes(vec![0x51]));
+
+        let psbt = Psbt {
+            inputs: vec![inp],
+            outputs: vec![out],
+            global: PsbtGlobal {
+                version: 0,
+                unknown: Default::default(),
+                unsigned_tx: tx,
+            },
+        };
+        let bytes = psbt.serialize();
+        let decoded = Psbt::deserialize(&bytes).expect("decode failed");
+
+        // Check input BIP32 derivation
+        let (fp, p) = decoded.inputs[0].bip32_derivation.get(&pubkey).expect("missing input bip32");
+        assert_eq!(fp, &fingerprint);
+        assert_eq!(p, &path);
+
+        // Check output BIP32 derivation
+        let (fp, p) = decoded.outputs[0].bip32_derivation.get(&pubkey).expect("missing output bip32");
+        assert_eq!(fp, &fingerprint);
+        assert_eq!(p, &path);
+
+        // Check output redeem_script survived
+        assert!(decoded.outputs[0].redeem_script.is_some());
     }
 
     #[test]

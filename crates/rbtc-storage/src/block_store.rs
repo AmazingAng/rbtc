@@ -5,7 +5,7 @@ use rbtc_primitives::{
 };
 
 use crate::{
-    db::{Database, CF_BLOCK_DATA, CF_BLOCK_INDEX, CF_UNDO},
+    db::{Database, CF_BLOCK_DATA, CF_BLOCK_INDEX, CF_HEIGHT_INDEX, CF_UNDO},
     error::{Result, StorageError},
 };
 
@@ -121,6 +121,41 @@ impl<'db> BlockStore<'db> {
                 .collect(),
             Err(_) => Vec::new(),
         }
+    }
+
+    // ── Height → Hash index ────────────────────────────────────────────────────
+
+    /// Store a height → block hash mapping.
+    pub fn put_height_hash(&self, height: u32, hash: &BlockHash) -> Result<()> {
+        self.db.put_cf(CF_HEIGHT_INDEX, &height.to_le_bytes(), &hash.0)
+    }
+
+    /// Look up the block hash at a given height.
+    pub fn get_hash_by_height(&self, height: u32) -> Result<Option<BlockHash>> {
+        match self.db.get_cf(CF_HEIGHT_INDEX, &height.to_le_bytes())? {
+            Some(bytes) if bytes.len() == 32 => {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&bytes);
+                Ok(Some(Hash256(arr)))
+            }
+            Some(_) => Err(StorageError::Corruption("invalid height index entry".into())),
+            None => Ok(None),
+        }
+    }
+
+    /// Delete a height → hash mapping (used during reorg).
+    pub fn delete_height_hash(&self, height: u32) -> Result<()> {
+        self.db.delete_cf(CF_HEIGHT_INDEX, &height.to_le_bytes())
+    }
+
+    /// Batch-insert a height → hash mapping.
+    pub fn batch_put_height_hash(
+        &self,
+        batch: &mut rocksdb::WriteBatch,
+        height: u32,
+        hash: &BlockHash,
+    ) -> Result<()> {
+        self.db.batch_put_cf(batch, CF_HEIGHT_INDEX, &height.to_le_bytes(), &hash.0)
     }
 
     // ── Undo data (spent UTXOs per block, needed for reorg) ───────────────────
