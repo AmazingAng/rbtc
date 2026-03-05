@@ -1,4 +1,5 @@
 pub mod address;
+pub mod descriptor;
 pub mod error;
 pub mod hd;
 pub mod mnemonic;
@@ -8,6 +9,7 @@ pub mod wallet_store;
 pub mod wif;
 
 pub use address::AddressType;
+pub use descriptor::Descriptor;
 pub use error::WalletError;
 pub use hd::{DerivationPath, ExtendedPrivKey, ExtendedPubKey, HARDENED};
 pub use mnemonic::Mnemonic;

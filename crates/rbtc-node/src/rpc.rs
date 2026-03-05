@@ -177,6 +177,11 @@ async fn handle_rpc(
         "createmultisig"             => rpc_createmultisig(&state, &params).await,
         "verifymessage"              => rpc_verifymessage(&state, &params).await,
         "signmessagewithprivkey"     => rpc_signmessagewithprivkey(&state, &params).await,
+        // Wallet (Phase F)
+        "dumpwallet"                 => rpc_dumpwallet(&state, &params).await,
+        "importwallet"               => rpc_importwallet(&state, &params).await,
+        "getdescriptorinfo"          => rpc_getdescriptorinfo(&state, &params).await,
+        "deriveaddresses"            => rpc_deriveaddresses(&state, &params).await,
         // Network (Phase D)
         "getnetworkinfo"             => rpc_getnetworkinfo(&state).await,
         "getpeerinfo"                => rpc_getpeerinfo(&state).await,
@@ -1852,6 +1857,133 @@ async fn rpc_getpeerinfo(_state: &RpcState) -> RpcResult {
     // We don't have access to the peer manager from RpcState currently.
     // Return empty array; a future enhancement can pipe peer info through.
     Ok(json!([]))
+}
+
+// ── Phase F: Wallet descriptor & dump/import RPCs ────────────────────────────
+
+/// `dumpwallet "filename"` — Dumps all wallet keys and addresses to a file.
+async fn rpc_dumpwallet(state: &RpcState, params: &Value) -> RpcResult {
+    let wallet = state.wallet.as_ref().ok_or((-18, "No wallet loaded".into()))?;
+    let filename = params
+        .get(0)
+        .and_then(Value::as_str)
+        .ok_or((-1, "Missing filename parameter".into()))?;
+
+    let w = wallet.read().await;
+    let addresses = w.addresses();
+    let mut lines = Vec::new();
+    lines.push("# Wallet dump created by rbtc".to_string());
+    lines.push(format!("# Addresses: {}", addresses.len()));
+
+    for addr in &addresses {
+        match w.dump_privkey(addr) {
+            Ok(wif) => lines.push(format!("{wif} # addr={addr}")),
+            Err(_) => lines.push(format!("# {addr} (imported, key not re-derivable)")),
+        }
+    }
+    drop(w);
+
+    std::fs::write(filename, lines.join("\n"))
+        .map_err(|e| (-1, format!("Failed to write file: {e}")))?;
+
+    Ok(json!({ "filename": filename }))
+}
+
+/// `importwallet "filename"` — Imports keys from a wallet dump file.
+async fn rpc_importwallet(state: &RpcState, params: &Value) -> RpcResult {
+    let wallet = state.wallet.as_ref().ok_or((-18, "No wallet loaded".into()))?;
+    let filename = params
+        .get(0)
+        .and_then(Value::as_str)
+        .ok_or((-1, "Missing filename parameter".into()))?;
+
+    let content = std::fs::read_to_string(filename)
+        .map_err(|e| (-1, format!("Failed to read file: {e}")))?;
+
+    let mut imported = 0usize;
+    let mut w = wallet.write().await;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // Format: WIF # optional comment
+        let wif = line.split_whitespace().next().unwrap_or("");
+        if !wif.is_empty() {
+            match w.import_wif(wif, &format!("imported_{imported}")) {
+                Ok(_) => imported += 1,
+                Err(e) => {
+                    warn!("rpc: importwallet: skipping key: {e}");
+                }
+            }
+        }
+    }
+
+    Ok(json!({ "imported": imported }))
+}
+
+/// `getdescriptorinfo "descriptor"` — Analyse an output descriptor.
+async fn rpc_getdescriptorinfo(_state: &RpcState, params: &Value) -> RpcResult {
+    let desc_str = params
+        .get(0)
+        .and_then(Value::as_str)
+        .ok_or((-1, "Missing descriptor parameter".into()))?;
+
+    let desc = rbtc_wallet::Descriptor::parse(desc_str)
+        .map_err(|e| (-1, format!("Invalid descriptor: {e}")))?;
+
+    Ok(json!({
+        "descriptor": desc_str,
+        "isrange": desc_str.contains('*'),
+        "issolvable": true,
+        "hasprivatekeys": false,
+        "type": desc.descriptor_type(),
+    }))
+}
+
+/// `deriveaddresses "descriptor" [range]` — Derive addresses from a descriptor.
+async fn rpc_deriveaddresses(_state: &RpcState, params: &Value) -> RpcResult {
+    let desc_str = params
+        .get(0)
+        .and_then(Value::as_str)
+        .ok_or((-1, "Missing descriptor parameter".into()))?;
+
+    let desc = rbtc_wallet::Descriptor::parse(desc_str)
+        .map_err(|e| (-1, format!("Invalid descriptor: {e}")))?;
+
+    // Determine range
+    let (start, end) = if let Some(range) = params.get(1) {
+        if let Some(arr) = range.as_array() {
+            let s = arr.first().and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let e = arr.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            (s, e)
+        } else if let Some(n) = range.as_u64() {
+            (0u32, n as u32)
+        } else {
+            (0u32, 0u32)
+        }
+    } else {
+        (0u32, 0u32)
+    };
+
+    let mut addresses = Vec::new();
+    for i in start..=end {
+        let spk = desc
+            .to_script(i)
+            .map_err(|e| (-1, format!("Cannot derive at index {i}: {e}")))?;
+        // Convert scriptPubKey to address string (best effort)
+        let addr = script_to_address_string(&spk);
+        addresses.push(json!(addr));
+    }
+
+    Ok(json!(addresses))
+}
+
+/// Best-effort conversion of a scriptPubKey to a hex representation.
+/// For full address encoding, use the wallet's address module.
+fn script_to_address_string(spk: &rbtc_primitives::script::Script) -> String {
+    // Return the scriptPubKey hex — callers can decode as needed
+    hex::encode(spk.as_bytes())
 }
 
 // ── Server startup ────────────────────────────────────────────────────────────

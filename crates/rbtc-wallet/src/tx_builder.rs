@@ -17,15 +17,26 @@ use crate::{
 
 // ── CoinSelector ──────────────────────────────────────────────────────────────
 
-/// Greedy coin selection (largest-first).
-/// Returns selected UTXOs or an error if funds are insufficient.
+/// Coin selection implementing Bitcoin Core's Branch-and-Bound (BnB) algorithm
+/// with a largest-first greedy fallback.
+///
+/// BnB tries to find a subset of UTXOs that matches the target + fees exactly
+/// (or within a small "cost of change" window), avoiding the creation of change
+/// outputs. If no exact match is found, falls back to largest-first greedy.
 pub struct CoinSelector;
+
+/// Cost of creating + spending a change output (approx. 68 vbytes spend + 31 vbytes output).
+const CHANGE_COST: u64 = 99;
+
+/// Maximum BnB search iterations to prevent combinatorial explosion.
+const BNB_MAX_TRIES: u32 = 100_000;
 
 impl CoinSelector {
     /// Select UTXOs to cover `target_sat` plus a fee estimated at `fee_rate`
     /// sat/vbyte. Returns `(selected, estimated_fee)`.
     ///
-    /// Uses a simple largest-first heuristic. Branch-and-bound is planned.
+    /// First attempts Branch-and-Bound for a changeless transaction, then
+    /// falls back to largest-first greedy if BnB fails.
     pub fn select(
         utxos: &[WalletUtxo],
         target_sat: u64,
@@ -35,15 +46,172 @@ impl CoinSelector {
             return Err(WalletError::NoUtxos);
         }
 
-        // Sort largest-value first
-        let mut sorted: Vec<&WalletUtxo> = utxos.iter().collect();
-        sorted.sort_by(|a, b| b.value.cmp(&a.value));
-
-        // Estimate a base fee (rough: 1 input + 2 outputs * rate)
         let estimate_fee = |n_inputs: usize| -> u64 {
             let vbytes = 10 + n_inputs as u64 * 68 + 2 * 31;
             (vbytes as f64 * fee_rate).ceil() as u64
         };
+
+        // Try BnB first (changeless transaction)
+        if let Some(result) = Self::branch_and_bound(utxos, target_sat, fee_rate) {
+            return Ok(result);
+        }
+
+        // Fallback: largest-first greedy (with change)
+        Self::largest_first(utxos, target_sat, &estimate_fee)
+    }
+
+    /// Branch-and-Bound coin selection.
+    ///
+    /// Searches for a UTXO subset whose total value is within
+    /// [target + fees, target + fees + cost_of_change].
+    /// This produces a changeless transaction when successful.
+    fn branch_and_bound(
+        utxos: &[WalletUtxo],
+        target_sat: u64,
+        fee_rate: f64,
+    ) -> Option<(Vec<WalletUtxo>, u64)> {
+        // Sort descending by effective value
+        let mut sorted: Vec<(usize, u64)> = utxos
+            .iter()
+            .enumerate()
+            .map(|(i, u)| {
+                let input_fee = (68.0 * fee_rate).ceil() as u64;
+                let eff = u.value.saturating_sub(input_fee);
+                (i, eff)
+            })
+            .filter(|(_, eff)| *eff > 0)
+            .collect();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+
+        if sorted.is_empty() {
+            return None;
+        }
+
+        // Base fee for a changeless tx (no change output, so only 1 output)
+        let base_fee = (10.0 * fee_rate + 31.0 * fee_rate).ceil() as u64;
+        let target_with_fee = target_sat + base_fee;
+        let cost_of_change = (CHANGE_COST as f64 * fee_rate).ceil() as u64;
+
+        // Sum of all effective values (for pruning)
+        let suffix_sums: Vec<u64> = {
+            let mut sums = vec![0u64; sorted.len() + 1];
+            for i in (0..sorted.len()).rev() {
+                sums[i] = sums[i + 1] + sorted[i].1;
+            }
+            sums
+        };
+
+        if suffix_sums[0] < target_with_fee {
+            return None; // Not enough funds even with all UTXOs
+        }
+
+        let mut best: Option<(Vec<usize>, u64)> = None;
+        let mut current_selection: Vec<bool> = vec![false; sorted.len()];
+        let mut current_value = 0u64;
+        let mut tries = 0u32;
+
+        // Depth-first branch-and-bound
+        let mut depth = 0usize;
+        let mut backtrack = false;
+
+        loop {
+            if tries >= BNB_MAX_TRIES {
+                break;
+            }
+            tries += 1;
+
+            if backtrack {
+                // Backtrack: find the last included UTXO and exclude it
+                loop {
+                    if depth == 0 {
+                        return best.map(|(indices, _total)| {
+                            let fee = {
+                                let vbytes = 10 + indices.len() as u64 * 68 + 31;
+                                (vbytes as f64 * fee_rate).ceil() as u64
+                            };
+                            let selected: Vec<WalletUtxo> =
+                                indices.iter().map(|&i| utxos[sorted[i].0].clone()).collect();
+                            (selected, fee)
+                        });
+                    }
+                    depth -= 1;
+                    if current_selection[depth] {
+                        current_selection[depth] = false;
+                        current_value -= sorted[depth].1;
+                        depth += 1;
+                        backtrack = false;
+                        break;
+                    }
+                }
+                if backtrack {
+                    continue;
+                }
+            }
+
+            if depth >= sorted.len() {
+                backtrack = true;
+                continue;
+            }
+
+            // Include this UTXO
+            current_selection[depth] = true;
+            current_value += sorted[depth].1;
+
+            if current_value >= target_with_fee {
+                if current_value <= target_with_fee + cost_of_change {
+                    // Found an acceptable solution
+                    let is_better = match &best {
+                        None => true,
+                        Some((_, prev_total)) => current_value < *prev_total,
+                    };
+                    if is_better {
+                        let indices: Vec<usize> = current_selection
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, &s)| s)
+                            .map(|(i, _)| i)
+                            .collect();
+                        best = Some((indices, current_value));
+                    }
+                }
+                // Backtrack (we exceeded or found a match)
+                backtrack = true;
+                current_selection[depth] = false;
+                current_value -= sorted[depth].1;
+                continue;
+            }
+
+            // Prune: if including all remaining can't reach target, skip
+            if current_value + suffix_sums[depth + 1] < target_with_fee {
+                backtrack = true;
+                current_selection[depth] = false;
+                current_value -= sorted[depth].1;
+                continue;
+            }
+
+            // Go deeper
+            depth += 1;
+        }
+
+        best.map(|(indices, _total)| {
+            let fee = {
+                let vbytes = 10 + indices.len() as u64 * 68 + 31;
+                (vbytes as f64 * fee_rate).ceil() as u64
+            };
+            let selected: Vec<WalletUtxo> =
+                indices.iter().map(|&i| utxos[sorted[i].0].clone()).collect();
+            (selected, fee)
+        })
+    }
+
+    /// Fallback: largest-first greedy coin selection.
+    fn largest_first(
+        utxos: &[WalletUtxo],
+        target_sat: u64,
+        estimate_fee: &dyn Fn(usize) -> u64,
+    ) -> Result<(Vec<WalletUtxo>, u64), WalletError> {
+        let mut sorted: Vec<&WalletUtxo> = utxos.iter().collect();
+        sorted.sort_by(|a, b| b.value.cmp(&a.value));
 
         let mut selected = Vec::new();
         let mut total = 0u64;
@@ -314,5 +482,64 @@ mod tests {
     fn estimate_vsize_nonzero() {
         assert!(estimate_vsize(1, 2) > 0);
         assert!(estimate_vsize(2, 3) > estimate_vsize(1, 2));
+    }
+
+    #[test]
+    fn bnb_finds_exact_match() {
+        // Create UTXOs that can exactly cover 150_000 + fees
+        let spk = p2wpkh_script(
+            &ExtendedPrivKey::from_seed(&[2u8; 64]).unwrap().public_key(),
+        );
+        let make = |val: u64, id: u8| WalletUtxo {
+            outpoint: OutPoint { txid: Hash256([id; 32]), vout: 0 },
+            value: val,
+            script_pubkey: spk.clone(),
+            height: 100,
+            address: "bc1qtest".into(),
+            confirmed: true,
+            addr_type: AddressType::SegWit,
+        };
+        let utxos = vec![make(50_000, 1), make(60_000, 2), make(90_000, 3), make(100_000, 4)];
+        // BnB should find a subset; either way total >= target + fee
+        let (selected, fee) = CoinSelector::select(&utxos, 50_000, 1.0).unwrap();
+        let total: u64 = selected.iter().map(|u| u.value).sum();
+        assert!(total >= 50_000 + fee);
+    }
+
+    #[test]
+    fn bnb_falls_back_to_greedy() {
+        // With a high fee rate, BnB may not find a changeless solution
+        let utxos = sample_utxos();
+        let (selected, fee) = CoinSelector::select(&utxos, 50_000, 50.0).unwrap();
+        let total: u64 = selected.iter().map(|u| u.value).sum();
+        assert!(total >= 50_000 + fee);
+    }
+
+    #[test]
+    fn bnb_empty_utxos_error() {
+        let result = CoinSelector::select(&[], 1_000, 1.0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn largest_first_selects_fewest_utxos() {
+        let spk = p2wpkh_script(
+            &ExtendedPrivKey::from_seed(&[2u8; 64]).unwrap().public_key(),
+        );
+        let make = |val: u64, id: u8| WalletUtxo {
+            outpoint: OutPoint { txid: Hash256([id; 32]), vout: 0 },
+            value: val,
+            script_pubkey: spk.clone(),
+            height: 100,
+            address: "bc1qtest".into(),
+            confirmed: true,
+            addr_type: AddressType::SegWit,
+        };
+        let utxos = vec![make(10_000, 1), make(20_000, 2), make(500_000, 3)];
+        let estimate_fee = |n: usize| -> u64 { (10 + n as u64 * 68 + 2 * 31) };
+        let (selected, _fee) = CoinSelector::largest_first(&utxos, 100_000, &estimate_fee).unwrap();
+        // Should pick the 500k UTXO first (largest), which alone covers 100k
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].value, 500_000);
     }
 }

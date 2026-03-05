@@ -132,6 +132,42 @@ impl<'a> WalletStore<'a> {
             .map_err(|e| WalletError::Storage(e.to_string()))
     }
 
+    // ── Imported private keys ──────────────────────────────────────────────
+
+    /// Store an imported private key (WIF-encoded) for the given address.
+    pub fn put_imported_key(&self, address: &str, wif: &str) -> Result<(), WalletError> {
+        let key = format!("key:{address}");
+        self.db
+            .put_cf(CF_WALLET, key.as_bytes(), wif.as_bytes())
+            .map_err(|e| WalletError::Storage(e.to_string()))
+    }
+
+    /// Load an imported private key (WIF) for the given address.
+    pub fn get_imported_key(&self, address: &str) -> Result<Option<String>, WalletError> {
+        let key = format!("key:{address}");
+        self.db
+            .get_cf(CF_WALLET, key.as_bytes())
+            .map(|opt| opt.map(|bytes| String::from_utf8_lossy(&bytes).to_string()))
+            .map_err(|e| WalletError::Storage(e.to_string()))
+    }
+
+    /// Iterate all imported keys. Returns `(address, wif)` pairs.
+    pub fn iter_imported_keys(&self) -> Vec<(String, String)> {
+        let Ok(iter) = self.db.iter_cf(CF_WALLET) else {
+            return vec![];
+        };
+        iter.filter_map(|(k, v)| {
+            if k.starts_with(b"key:") {
+                let addr = String::from_utf8_lossy(&k[4..]).to_string();
+                let wif = String::from_utf8_lossy(&v).to_string();
+                Some((addr, wif))
+            } else {
+                None
+            }
+        })
+        .collect()
+    }
+
     pub fn iter_utxos(&self) -> Vec<(OutPoint, StoredWalletUtxo)> {
         let Ok(iter) = self.db.iter_cf(CF_WALLET) else {
             return vec![];

@@ -156,6 +156,9 @@ impl Wallet {
             pubkey_hex: hex::encode(pk.serialize()),
         })?;
 
+        // Persist the WIF key so it survives restarts
+        store.put_imported_key(&addr, wif)?;
+
         info!("wallet: imported key for address {addr}");
         Ok(addr)
     }
@@ -456,6 +459,28 @@ impl Wallet {
             }
         }
 
+        // Restore imported keys (re-derive their addresses)
+        for (addr, wif) in store.iter_imported_keys() {
+            if let Ok((sk, _)) = from_wif(&wif) {
+                let secp = secp256k1::Secp256k1::signing_only();
+                let pk = secp256k1::PublicKey::from_secret_key(&secp, &sk);
+                let spk = p2wpkh_script(&pk);
+                if !self.addresses.contains_key(&addr) {
+                    self.addresses.insert(
+                        addr.clone(),
+                        AddressInfo {
+                            addr_type: AddressType::SegWit,
+                            derivation_path: "imported:restored".into(),
+                            script_pubkey: spk.clone(),
+                            pubkey_bytes: pk.serialize().to_vec(),
+                        },
+                    );
+                    self.script_to_addr
+                        .insert(spk.as_bytes().to_vec(), addr.clone());
+                }
+            }
+        }
+
         // Restore UTXOs
         for (outpoint, stored_utxo) in store.iter_utxos() {
             let addr_type = self
@@ -502,7 +527,12 @@ impl Wallet {
     fn privkey_for_address(&self, address: &str) -> Result<SecretKey, WalletError> {
         let info = self.addresses.get(address).ok_or(WalletError::AddressNotFound)?;
         if info.derivation_path.starts_with("imported:") {
-            // Cannot re-derive imported keys from the master — we don't store them
+            // Look up the persisted WIF key
+            let store = WalletStore::new(&self.db);
+            if let Some(wif) = store.get_imported_key(address)? {
+                let (sk, _) = from_wif(&wif)?;
+                return Ok(sk);
+            }
             return Err(WalletError::AddressNotFound);
         }
         let path = DerivationPath::parse(&info.derivation_path)?;
