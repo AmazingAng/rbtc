@@ -114,16 +114,21 @@ impl CachedUtxoSet {
         txids: &[TxId],
         txs: &[Transaction],
         height: u32,
-    ) -> Vec<Vec<(OutPoint, Utxo)>> {
+    ) -> Result<Vec<Vec<(OutPoint, Utxo)>>, String> {
         let mut undo: Vec<Vec<(OutPoint, Utxo)>> = Vec::with_capacity(txs.len());
         for (txid, tx) in txids.iter().zip(txs.iter()) {
             let mut spent = Vec::new();
             if !tx.is_coinbase() {
                 for input in &tx.inputs {
                     let outpoint = input.previous_output.clone();
-                    if let Some(utxo) = self.get_utxo(&outpoint) {
-                        spent.push((outpoint.clone(), utxo));
-                    }
+                    let Some(utxo) = self.get_utxo(&outpoint) else {
+                        return Err(format!(
+                            "utxo cache invariant violation while connecting block: missing {}:{}",
+                            outpoint.txid.to_hex(),
+                            outpoint.vout
+                        ));
+                    };
+                    spent.push((outpoint.clone(), utxo));
                     // Mark as spent in dirty and remove stale hot entry.
                     self.dirty.insert(outpoint.clone(), None);
                     if self.hot.remove(&outpoint).is_some() {
@@ -148,7 +153,7 @@ impl CachedUtxoSet {
                 );
             }
         }
-        undo
+        Ok(undo)
     }
 
     /// Undo a connected block (for reorg): remove created outputs, restore spent inputs.
@@ -272,11 +277,18 @@ impl UtxoLookup for CachedUtxoSet {
             return Some(utxo.clone());
         }
         // 3. RocksDB fallback for cache misses.
-        UtxoStore::new(&self.db)
-            .get(outpoint)
-            .ok()
-            .flatten()
-            .map(|s| stored_to_utxo(&s))
+        match UtxoStore::new(&self.db).get(outpoint) {
+            Ok(Some(s)) => Some(stored_to_utxo(&s)),
+            Ok(None) => None,
+            Err(e) => {
+                panic!(
+                    "fatal UTXO DB read error at {}:{}: {}",
+                    outpoint.txid.to_hex(),
+                    outpoint.vout,
+                    e
+                );
+            }
+        }
     }
 
     fn has_unspent_txid(&self, txid: &TxId) -> bool {
@@ -300,10 +312,12 @@ impl UtxoLookup for CachedUtxoSet {
             return true;
         }
 
-        let rows = self
-            .db
-            .iter_cf_prefix(rbtc_storage::db::CF_UTXO, &txid.0)
-            .unwrap_or_default();
+        let rows = match self.db.iter_cf_prefix(rbtc_storage::db::CF_UTXO, &txid.0) {
+            Ok(rows) => rows,
+            Err(e) => {
+                panic!("fatal UTXO DB prefix-iterate error for txid {}: {}", txid.to_hex(), e);
+            }
+        };
         for (k, _) in rows {
             if k.len() != 36 {
                 continue;
@@ -452,6 +466,34 @@ mod tests {
         cache.flush_dirty(&mut batch).unwrap();
 
         assert!(!cache.hot.contains_key(&op));
+    }
+
+    #[test]
+    fn connect_block_with_undo_errors_on_missing_input() {
+        use rbtc_primitives::transaction::{Transaction, TxIn, TxOut};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open(tmp.path()).unwrap());
+        let mut cache = CachedUtxoSet::new(db, None);
+
+        let prev = dummy_outpoint(9);
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: prev,
+                script_sig: Script::new(),
+                sequence: 0xffff_ffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 1, script_pubkey: Script::new() }],
+            lock_time: 0,
+        };
+
+        let txid = Hash256([8; 32]);
+        let err = cache
+            .connect_block_with_undo(&[txid], &[tx], 1)
+            .expect_err("missing prevout must fail");
+        assert!(err.contains("invariant violation"));
     }
 
 }

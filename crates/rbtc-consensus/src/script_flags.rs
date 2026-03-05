@@ -61,6 +61,9 @@ pub fn script_flags_for_block(
         verify_checklocktimeverify,
         verify_checksequenceverify,
         verify_taproot,
+        // Additional policy flags are not enabled at the consensus (block)
+        // validation level; they apply to mempool relay and relay policy.
+        ..Default::default()
     }
 }
 

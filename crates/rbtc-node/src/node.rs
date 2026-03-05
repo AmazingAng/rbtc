@@ -19,6 +19,7 @@ use rbtc_net::{
 };
 use rbtc_primitives::hash::Hash256;
 use rbtc_primitives::codec::Encodable;
+use rbtc_primitives::transaction::OutPoint;
 use rbtc_storage::{
     encode_block_undo, decode_block_undo, AddrIndexStore, BlockStore, ChainStore, Database,
     PeerStore, StoredBlockIndex, StoredUtxo, TxIndexStore, UtxoStore,
@@ -1504,7 +1505,8 @@ impl Node {
                 // Update UTXO cache and collect per-tx undo.
                 let undo = self
                     .utxo_cache
-                    .connect_block_with_undo(&txids, &block.transactions, height);
+                    .connect_block_with_undo(&txids, &block.transactions, height)
+                    .map_err(|e| anyhow!("failed to connect block UTXO state: {e}"))?;
                 // Convert undo data to storage format and persist
                 let undo_stored: Vec<Vec<(rbtc_primitives::transaction::OutPoint, StoredUtxo)>> =
                     undo.iter()
@@ -1644,6 +1646,32 @@ impl Node {
                 );
             }
             Err(e) => {
+                // Core-style fail-fast: if validation reports MissingUtxo but the
+                // coin is actually present in chainstate DB, this is an internal
+                // consistency bug (view/cache mismatch), not a bad peer block.
+                if let rbtc_consensus::ConsensusError::MissingUtxo(txid_hex, vout) = &e {
+                    let txid = Hash256::from_hex(txid_hex)
+                        .map_err(|_| anyhow!("invalid txid in MissingUtxo error: {txid_hex}"))?;
+                    let outpoint = OutPoint { txid, vout: *vout };
+                    match UtxoStore::new(&self.db).get(&outpoint) {
+                        Ok(Some(_)) => {
+                            return Err(anyhow!(
+                                "fatal chainstate inconsistency: validator reported missing {}:{}, but RocksDB has it; refusing to continue",
+                                txid_hex,
+                                vout
+                            ));
+                        }
+                        Ok(None) => {}
+                        Err(db_err) => {
+                            return Err(anyhow!(
+                                "fatal UTXO DB read error while checking MissingUtxo {}:{}: {}",
+                                txid_hex,
+                                vout,
+                                db_err
+                            ));
+                        }
+                    }
+                }
                 warn!("block {} rejected from peer {peer_id}: {e}", block_hash.to_hex());
             }
         }

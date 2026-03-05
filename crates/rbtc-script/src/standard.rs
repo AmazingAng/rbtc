@@ -9,7 +9,7 @@ use rbtc_crypto::{
     sighash::{sighash_segwit_v0_with_u32, sighash_taproot, SighashType},
 };
 
-use crate::engine::{ScriptEngine, ScriptError, ScriptFlags, SigVersion};
+use crate::engine::{ScriptEngine, ScriptError, ScriptFlags, SigVersion, is_compressed_pubkey};
 
 fn push_compact_size(dst: &mut Vec<u8>, n: usize) {
     match n {
@@ -45,6 +45,11 @@ pub fn verify_input(ctx: &ScriptContext<'_>) -> Result<(), ScriptError> {
     let script_pubkey = &ctx.prevout.script_pubkey;
     let engine = ScriptEngine::new(ctx.flags);
     let mut had_witness = false;
+
+    // ── SIGPUSHONLY: scriptSig must only contain data-push opcodes ─────────
+    if ctx.flags.verify_sigpushonly {
+        check_push_only(&input.script_sig)?;
+    }
 
     // ── P2SH ──────────────────────────────────────────────────────────────
     if ctx.flags.verify_p2sh && script_pubkey.is_p2sh() {
@@ -161,13 +166,19 @@ fn verify_witness_program(
         }
     } else if version == 1 && program.len() == 32 && !is_p2sh {
         if !ctx.flags.verify_taproot {
+            if ctx.flags.verify_discourage_upgradable_witness_program {
+                return Err(ScriptError::DiscourageUpgradableWitnessProgram);
+            }
             return Ok(());
         }
         let mut out_key = [0u8; 32];
         out_key.copy_from_slice(program);
         verify_p2tr(ctx, &out_key)
     } else {
-        // Future witness versions are consensus-valid (soft-fork forward compat).
+        // Unknown witness version or wrong-length Taproot program.
+        if ctx.flags.verify_discourage_upgradable_witness_program {
+            return Err(ScriptError::DiscourageUpgradableWitnessProgram);
+        }
         Ok(())
     }
 }
@@ -180,6 +191,10 @@ fn verify_p2wpkh(ctx: &ScriptContext<'_>, pubkey_hash: &[u8; 20]) -> Result<(), 
     }
     let sig = &witness[0];
     let pubkey = &witness[1];
+
+    if ctx.flags.verify_witness_pubkeytype && !is_compressed_pubkey(pubkey) {
+        return Err(ScriptError::WitnessPubkeyType);
+    }
 
     // Verify pubkey hash
     if hash160(pubkey).0 != *pubkey_hash {
@@ -462,6 +477,9 @@ fn verify_p2sh(
     )?;
 
     check_stack_true(&stack)?;
+    if ctx.flags.verify_cleanstack && stack.len() != 1 {
+        return Err(ScriptError::CleanStack);
+    }
     Ok(false)
 }
 
@@ -627,13 +645,10 @@ mod tests {
             prevout: &prevout,
             flags: ScriptFlags {
                 verify_p2sh: true,
-                verify_dersig: false,
                 verify_witness: true,
-                verify_nulldummy: false,
                 verify_cleanstack: true,
-                verify_checklocktimeverify: false,
-                verify_checksequenceverify: false,
                 verify_taproot: true,
+                ..Default::default()
             },
             all_prevouts: &all_prevouts,
         };
@@ -656,13 +671,9 @@ mod tests {
             prevout: &prevout,
             flags: ScriptFlags {
                 verify_p2sh: true,
-                verify_dersig: false,
                 verify_witness: true,
-                verify_nulldummy: false,
-                verify_cleanstack: false,
-                verify_checklocktimeverify: false,
-                verify_checksequenceverify: false,
                 verify_taproot: true,
+                ..Default::default()
             },
             all_prevouts: &[prevout.clone()],
         };
@@ -1025,10 +1036,10 @@ mod tests {
             verify_dersig: true,
             verify_witness: true,
             verify_nulldummy: true,
-            verify_cleanstack: false,
             verify_checklocktimeverify: true,
             verify_checksequenceverify: true,
             verify_taproot: true,
+            ..Default::default()
         };
 
         for case in cases {
@@ -1107,10 +1118,9 @@ mod tests {
                 verify_dersig: true,
                 verify_witness: true,
                 verify_nulldummy: true,
-                verify_cleanstack: false,
                 verify_checklocktimeverify: true,
                 verify_checksequenceverify: true,
-                verify_taproot: false,
+                ..Default::default()
             },
             all_prevouts: &[prevout.clone()],
         };
@@ -1136,10 +1146,9 @@ mod tests {
                 verify_dersig: true,
                 verify_witness: true,
                 verify_nulldummy: true,
-                verify_cleanstack: false,
                 verify_checklocktimeverify: true,
                 verify_checksequenceverify: true,
-                verify_taproot: false,
+                ..Default::default()
             },
             all_prevouts: &[prevout.clone()],
         };
@@ -1163,13 +1172,7 @@ mod tests {
             prevout: &prevout,
             flags: ScriptFlags {
                 verify_p2sh: true,
-                verify_dersig: false,
-                verify_witness: false,
-                verify_nulldummy: false,
-                verify_cleanstack: false,
-                verify_checklocktimeverify: false,
-                verify_checksequenceverify: false,
-                verify_taproot: false,
+                ..Default::default()
             },
             all_prevouts: &all_prevouts,
         };
@@ -1194,13 +1197,7 @@ mod tests {
             prevout: &prevout,
             flags: ScriptFlags {
                 verify_p2sh: true,
-                verify_dersig: false,
-                verify_witness: false,
-                verify_nulldummy: false,
-                verify_cleanstack: false,
-                verify_checklocktimeverify: false,
-                verify_checksequenceverify: false,
-                verify_taproot: false,
+                ..Default::default()
             },
             all_prevouts: &all_prevouts,
         };
@@ -1223,4 +1220,49 @@ mod tests {
 
         assert_ne!(good, old);
     }
+}
+
+/// Check that every opcode in `script` is a data-push opcode (SIGPUSHONLY policy).
+pub fn check_push_only(script: &Script) -> Result<(), ScriptError> {
+    let bytes = script.as_bytes();
+    let mut pc = 0usize;
+    while pc < bytes.len() {
+        let op = bytes[pc];
+        pc += 1;
+        match op {
+            0x00 => {}         // OP_0 – OK
+            0x01..=0x4b => {   // direct push
+                let len = op as usize;
+                if pc + len > bytes.len() {
+                    return Err(ScriptError::PushOnly);
+                }
+                pc += len;
+            }
+            0x4c => {          // OP_PUSHDATA1
+                if pc >= bytes.len() { return Err(ScriptError::PushOnly); }
+                let len = bytes[pc] as usize;
+                pc += 1;
+                if pc + len > bytes.len() { return Err(ScriptError::PushOnly); }
+                pc += len;
+            }
+            0x4d => {          // OP_PUSHDATA2
+                if pc + 1 >= bytes.len() { return Err(ScriptError::PushOnly); }
+                let len = u16::from_le_bytes([bytes[pc], bytes[pc+1]]) as usize;
+                pc += 2;
+                if pc + len > bytes.len() { return Err(ScriptError::PushOnly); }
+                pc += len;
+            }
+            0x4e => {          // OP_PUSHDATA4
+                if pc + 3 >= bytes.len() { return Err(ScriptError::PushOnly); }
+                let len = u32::from_le_bytes([bytes[pc], bytes[pc+1], bytes[pc+2], bytes[pc+3]]) as usize;
+                pc += 4;
+                if pc + len > bytes.len() { return Err(ScriptError::PushOnly); }
+                pc += len;
+            }
+            0x4f => {}         // OP_1NEGATE – OK
+            0x51..=0x60 => {}  // OP_1–OP_16 – OK
+            _ => return Err(ScriptError::PushOnly),
+        }
+    }
+    Ok(())
 }
