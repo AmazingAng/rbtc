@@ -641,14 +641,20 @@ impl Node {
             }
 
             NodeEvent::MempoolRequested { peer_id } => {
-                // Send inv for all txids in our mempool
+                // BIP35: send inv for all txids in our mempool
+                let inv_type = if self.peer_manager.peer_wtxid_relay(peer_id) {
+                    InvType::WitnessTx
+                } else {
+                    InvType::Tx
+                };
                 let mp = self.mempool.read().await;
                 let inv_items: Vec<Inventory> = mp.txids().iter().map(|txid| {
-                    Inventory { inv_type: InvType::Tx, hash: *txid }
+                    Inventory { inv_type, hash: *txid }
                 }).collect();
                 drop(mp);
-                if !inv_items.is_empty() {
-                    self.peer_manager.send_to(peer_id, NetworkMessage::Inv(inv_items));
+                // BIP35: batch at most 50000 inv items per message
+                for chunk in inv_items.chunks(50000) {
+                    self.peer_manager.send_to(peer_id, NetworkMessage::Inv(chunk.to_vec()));
                 }
             }
 
@@ -1122,7 +1128,11 @@ impl Node {
                 let chain = self.chain.read().await;
                 Self::is_block_connected(&chain, &frontier_hash)
             };
-            if !frontier_connected {
+            // If frontier block is already cached in pending_blocks, it will be
+            // drained automatically once the chain tip advances — no need to
+            // treat it as pending or preempt peers for it.
+            let frontier_cached = self.pending_blocks.contains_key(&frontier);
+            if !frontier_connected && !frontier_cached {
                 frontier_pending = true;
                 let frontier_owners: Vec<(u64, Duration)> = self
                     .ibd
@@ -1134,10 +1144,12 @@ impl Node {
                 let stale_owner_exists = frontier_owners
                     .iter()
                     .any(|(_, age)| *age >= Self::FRONTIER_RETRY_TIMEOUT);
-                let desired_owners = if stale_owner_exists {
+                // Only request redundant peers when the current owner is stale;
+                // otherwise 1 owner is sufficient and avoids wasting bandwidth.
+                let desired_owners = if stale_owner_exists || frontier_owners.is_empty() {
                     Self::FRONTIER_REDUNDANT_PEERS
                 } else {
-                    Self::FRONTIER_REDUNDANT_PEERS
+                    1
                 };
                 let mut owners = frontier_owners.len();
                 while owners < desired_owners {
@@ -1225,8 +1237,8 @@ impl Node {
         );
 
         // If frontier is still pending but no idle peer exists, preempt one
-        // far-ahead busy peer so the next assignment cycle can immediately
-        // dedicate capacity to frontier recovery.
+        // far-ahead busy peer by cancelling its assignment (without disconnecting!)
+        // and immediately reassigning it to the frontier block.
         if frontier_pending && idle_peers.is_empty() {
             let frontier_hash = frontier_hash_for_preemption;
             let victim = self
@@ -1246,15 +1258,19 @@ impl Node {
                 .max_by_key(|(_, (_, end))| *end)
                 .map(|(peer_id, _)| *peer_id);
             if let Some(victim_peer) = victim {
-                warn!(
-                    "IBD: preempting peer {} to free slot for frontier height {}",
-                    victim_peer,
-                    frontier
-                );
-                self.ibd.release_peer(victim_peer);
-                self.request_peer_disconnect(victim_peer);
-                // Wait for disconnect event to avoid immediate re-assignment races.
-                return;
+                if let Some(fh) = frontier_hash {
+                    debug!(
+                        "IBD: reassigning peer {} from ahead-work to frontier height {}",
+                        victim_peer,
+                        frontier
+                    );
+                    // Release ahead-assignment (re-queues the range for later).
+                    self.ibd.release_peer(victim_peer);
+                    // Immediately assign frontier to this peer instead of disconnecting.
+                    self.ibd.assigned_ranges.insert(victim_peer, (frontier, frontier));
+                    self.ibd.record_peer_request(victim_peer, vec![fh]);
+                    self.peer_manager.request_blocks(victim_peer, &[fh]);
+                }
             }
         }
 
@@ -1399,11 +1415,7 @@ impl Node {
         let chain_height = self.chain.read().await.height();
 
         if height > chain_height + 1 {
-            // Out-of-order block: cache it for later.
-            // Do NOT call ibd_mark_connected here — the peer stays "busy" in
-            // peer_downloads until its blocks are actually connected to the chain.
-            // This prevents the runaway where cached-but-unconnected work triggers
-            // ever-further segment assignments.
+            // Out-of-order block: cache it for later connection.
             debug!(
                 "cached out-of-order block {} at height {} (tip={}) from peer {}",
                 block_hash.to_hex(),
@@ -1412,6 +1424,12 @@ impl Node {
                 peer_id
             );
             self.pending_blocks.entry(height).or_insert((peer_id, block));
+            // Mark this block as delivered so the peer becomes idle and can be
+            // reassigned to new work (e.g., frontier recovery).  The frontier-
+            // pending logic in assign_blocks_to_peers() already prevents runaway
+            // ahead-assignment by capping per-peer windows and reserving idle
+            // peers for frontier failover.
+            self.ibd_mark_connected_all(&block_hash).await;
             return Ok(());
         }
 
@@ -2089,7 +2107,10 @@ impl Node {
                     let chain = self.chain.read().await;
                     Self::is_block_connected(&chain, &frontier_hash)
                 };
-                if !frontier_connected {
+                // Skip failover if frontier block is already cached and waiting
+                // to be drained — it will connect once prior blocks finish.
+                let frontier_cached = self.pending_blocks.contains_key(&frontier);
+                if !frontier_connected && !frontier_cached {
                     let frontier_owner = self
                         .ibd
                         .peer_downloads

@@ -19,7 +19,7 @@ use rbtc_primitives::{
 };
 
 use crate::{
-    message::{GetBlocksMessage, Inventory, InvType, NetworkMessage},
+    message::{GetBlocksMessage, HeadersMessage, Inventory, InvType, NetworkMessage},
     peer::{run_peer, PeerCommand, PeerEvent},
 };
 
@@ -108,6 +108,8 @@ struct ConnectedPeer {
     wtxid_relay: bool,
     /// BIP155: peer prefers addrv2 messages
     prefers_addrv2: bool,
+    /// BIP130: peer prefers headers over inv for new block announcements
+    prefers_headers: bool,
 }
 
 /// Registration message: associates a peer_id with its command sender channel.
@@ -389,6 +391,30 @@ impl PeerManager {
         }
     }
 
+    /// BIP130: announce a new block to all peers.
+    /// Sends `headers` to peers that signalled `sendheaders`, `inv(block)` to others.
+    /// Skips `from_peer` (the peer that sent us the block).
+    pub fn broadcast_new_block(&self, header: BlockHeader, hash: BlockHash, from_peer: u64) {
+        let inv_msg = NetworkMessage::Inv(vec![Inventory {
+            inv_type: InvType::Block,
+            hash,
+        }]);
+        let headers_msg = NetworkMessage::Headers(HeadersMessage {
+            headers: vec![header],
+        });
+        for (&pid, peer) in &self.peers {
+            if pid == from_peer {
+                continue;
+            }
+            let msg = if peer.prefers_headers {
+                headers_msg.clone()
+            } else {
+                inv_msg.clone()
+            };
+            let _ = peer.cmd_tx.send(PeerCommand::Send(msg));
+        }
+    }
+
     /// Request headers from all peers using block locator
     pub fn request_headers(&self, locator: Vec<BlockHash>) {
         let msg = NetworkMessage::GetHeaders(GetBlocksMessage::new(locator));
@@ -500,6 +526,7 @@ impl PeerManager {
                                 inbound,
                                 wtxid_relay,
                                 prefers_addrv2,
+                                prefers_headers: false,
                             },
                         );
                         stored_addr
@@ -583,7 +610,10 @@ impl PeerManager {
                 let _ = self.node_event_tx.send(NodeEvent::InvReceived { peer_id, items });
             }
             NetworkMessage::SendHeaders => {
-                // Peer prefers headers over inv for new block announcements – noted
+                // BIP130: peer prefers headers over inv for new block announcements
+                if let Some(peer) = self.peers.get_mut(&peer_id) {
+                    peer.prefers_headers = true;
+                }
             }
             NetworkMessage::FeeFilter(rate) => {
                 // Store the fee filter so we can skip this peer when relaying cheap txs

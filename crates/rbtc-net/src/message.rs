@@ -13,6 +13,33 @@ use crate::error::{NetError, Result};
 /// Maximum message payload size (32 MB)
 const MAX_MESSAGE_SIZE: u32 = 32 * 1024 * 1024;
 
+// ── Service flag constants (Bitcoin Core `protocol.h`) ──────────────────────
+
+/// Full node — can serve full blocks.
+pub const NODE_NETWORK: u64         = 1 << 0;
+/// BIP111 — supports bloom filtering (deprecated since Core v0.19, NOT set).
+pub const NODE_BLOOM: u64           = 1 << 2;
+/// BIP144 — supports segregated witness.
+pub const NODE_WITNESS: u64         = 1 << 3;
+/// BIP157 — can serve compact block filters.
+pub const NODE_COMPACT_FILTERS: u64 = 1 << 6;
+/// BIP159 — limited node (pruned, only recent blocks).
+pub const NODE_NETWORK_LIMITED: u64 = 1 << 10;
+
+/// Our default service flags: full node + segwit.
+pub const LOCAL_SERVICES: u64 = NODE_NETWORK | NODE_WITNESS;
+
+/// Format service flags as a human-readable string for logging.
+pub fn service_flags_to_string(flags: u64) -> String {
+    let mut names = Vec::new();
+    if flags & NODE_NETWORK != 0         { names.push("NODE_NETWORK"); }
+    if flags & NODE_BLOOM != 0           { names.push("NODE_BLOOM"); }
+    if flags & NODE_WITNESS != 0         { names.push("NODE_WITNESS"); }
+    if flags & NODE_COMPACT_FILTERS != 0 { names.push("NODE_COMPACT_FILTERS"); }
+    if flags & NODE_NETWORK_LIMITED != 0 { names.push("NODE_NETWORK_LIMITED"); }
+    if names.is_empty() { "NONE".to_string() } else { names.join("|") }
+}
+
 /// Bitcoin P2P message
 #[derive(Debug, Clone)]
 pub struct Message {
@@ -177,7 +204,7 @@ impl VersionMessage {
     pub fn new(best_height: i32, nonce: u64) -> Self {
         Self {
             version: 70016,
-            services: 0x0000000000000401, // NODE_NETWORK | NODE_WITNESS
+            services: LOCAL_SERVICES, // NODE_NETWORK | NODE_WITNESS
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -185,7 +212,7 @@ impl VersionMessage {
             recv_services: 0,
             recv_addr: [0u8; 16],
             recv_port: 0,
-            from_services: 0x0000000000000401,
+            from_services: LOCAL_SERVICES,
             from_addr: [0u8; 16],
             from_port: 0,
             nonce,
@@ -429,6 +456,181 @@ impl Addrv2Message {
     }
 }
 
+// ── BIP157: Compact Block Filters ─────────────────────────────────────────
+
+/// BIP157 getcfilters / getcfheaders request (same wire layout).
+#[derive(Debug, Clone)]
+pub struct GetCFiltersMessage {
+    pub filter_type: u8,
+    pub start_height: u32,
+    pub stop_hash: Hash256,
+}
+
+impl GetCFiltersMessage {
+    fn encode_payload(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(37);
+        buf.push(self.filter_type);
+        buf.extend_from_slice(&self.start_height.to_le_bytes());
+        buf.extend_from_slice(&self.stop_hash.0);
+        buf
+    }
+
+    fn decode_payload(data: &[u8]) -> Result<Self> {
+        if data.len() < 37 {
+            return Err(NetError::Decode("getcfilters too short".into()));
+        }
+        let filter_type = data[0];
+        let start_height = u32::from_le_bytes(data[1..5].try_into().unwrap());
+        let mut stop_hash = [0u8; 32];
+        stop_hash.copy_from_slice(&data[5..37]);
+        Ok(Self { filter_type, start_height, stop_hash: Hash256(stop_hash) })
+    }
+}
+
+/// BIP157 cfilter response.
+#[derive(Debug, Clone)]
+pub struct CFilterMessage {
+    pub filter_type: u8,
+    pub block_hash: Hash256,
+    pub filter: Vec<u8>,
+}
+
+impl CFilterMessage {
+    fn encode_payload(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(33 + self.filter.len());
+        buf.push(self.filter_type);
+        buf.extend_from_slice(&self.block_hash.0);
+        buf.extend_from_slice(&self.filter);
+        buf
+    }
+
+    fn decode_payload(data: &[u8]) -> Result<Self> {
+        if data.len() < 33 {
+            return Err(NetError::Decode("cfilter too short".into()));
+        }
+        let filter_type = data[0];
+        let mut block_hash = [0u8; 32];
+        block_hash.copy_from_slice(&data[1..33]);
+        let filter = data[33..].to_vec();
+        Ok(Self { filter_type, block_hash: Hash256(block_hash), filter })
+    }
+}
+
+/// BIP157 cfheaders response.
+#[derive(Debug, Clone)]
+pub struct CFHeadersMessage {
+    pub filter_type: u8,
+    pub stop_hash: Hash256,
+    pub prev_filter_header: Hash256,
+    pub filter_hashes: Vec<Hash256>,
+}
+
+impl CFHeadersMessage {
+    fn encode_payload(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(65 + self.filter_hashes.len() * 32 + 3);
+        buf.push(self.filter_type);
+        buf.extend_from_slice(&self.stop_hash.0);
+        buf.extend_from_slice(&self.prev_filter_header.0);
+        VarInt(self.filter_hashes.len() as u64).encode(&mut buf).ok();
+        for h in &self.filter_hashes {
+            buf.extend_from_slice(&h.0);
+        }
+        buf
+    }
+
+    fn decode_payload(data: &[u8]) -> Result<Self> {
+        if data.len() < 65 {
+            return Err(NetError::Decode("cfheaders too short".into()));
+        }
+        let filter_type = data[0];
+        let mut stop_hash = [0u8; 32];
+        stop_hash.copy_from_slice(&data[1..33]);
+        let mut prev_filter_header = [0u8; 32];
+        prev_filter_header.copy_from_slice(&data[33..65]);
+        let mut cur = std::io::Cursor::new(&data[65..]);
+        let VarInt(count) = VarInt::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
+        let mut filter_hashes = Vec::with_capacity(count.min(2000) as usize);
+        for _ in 0..count {
+            let h = <[u8; 32]>::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
+            filter_hashes.push(Hash256(h));
+        }
+        Ok(Self {
+            filter_type,
+            stop_hash: Hash256(stop_hash),
+            prev_filter_header: Hash256(prev_filter_header),
+            filter_hashes,
+        })
+    }
+}
+
+/// BIP157 getcfcheckpt request.
+#[derive(Debug, Clone)]
+pub struct GetCFCheckptMessage {
+    pub filter_type: u8,
+    pub stop_hash: Hash256,
+}
+
+impl GetCFCheckptMessage {
+    fn encode_payload(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(33);
+        buf.push(self.filter_type);
+        buf.extend_from_slice(&self.stop_hash.0);
+        buf
+    }
+
+    fn decode_payload(data: &[u8]) -> Result<Self> {
+        if data.len() < 33 {
+            return Err(NetError::Decode("getcfcheckpt too short".into()));
+        }
+        let filter_type = data[0];
+        let mut stop_hash = [0u8; 32];
+        stop_hash.copy_from_slice(&data[1..33]);
+        Ok(Self { filter_type, stop_hash: Hash256(stop_hash) })
+    }
+}
+
+/// BIP157 cfcheckpt response.
+#[derive(Debug, Clone)]
+pub struct CFCheckptMessage {
+    pub filter_type: u8,
+    pub stop_hash: Hash256,
+    pub filter_headers: Vec<Hash256>,
+}
+
+impl CFCheckptMessage {
+    fn encode_payload(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(33 + self.filter_headers.len() * 32 + 3);
+        buf.push(self.filter_type);
+        buf.extend_from_slice(&self.stop_hash.0);
+        VarInt(self.filter_headers.len() as u64).encode(&mut buf).ok();
+        for h in &self.filter_headers {
+            buf.extend_from_slice(&h.0);
+        }
+        buf
+    }
+
+    fn decode_payload(data: &[u8]) -> Result<Self> {
+        if data.len() < 33 {
+            return Err(NetError::Decode("cfcheckpt too short".into()));
+        }
+        let filter_type = data[0];
+        let mut stop_hash = [0u8; 32];
+        stop_hash.copy_from_slice(&data[1..33]);
+        let mut cur = std::io::Cursor::new(&data[33..]);
+        let VarInt(count) = VarInt::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
+        let mut filter_headers = Vec::with_capacity(count.min(2000) as usize);
+        for _ in 0..count {
+            let h = <[u8; 32]>::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
+            filter_headers.push(Hash256(h));
+        }
+        Ok(Self {
+            filter_type,
+            stop_hash: Hash256(stop_hash),
+            filter_headers,
+        })
+    }
+}
+
 /// All supported network message types
 #[derive(Debug, Clone)]
 pub enum NetworkMessage {
@@ -464,6 +666,18 @@ pub enum NetworkMessage {
     Addrv2(Addrv2Message),
     /// Request peer to send inv for all txids in its mempool
     Mempool,
+    /// BIP157: request compact block filters for a range of blocks
+    GetCFilters(GetCFiltersMessage),
+    /// BIP157: compact block filter for a single block
+    CFilter(CFilterMessage),
+    /// BIP157: request compact filter headers for a range of blocks
+    GetCFHeaders(GetCFiltersMessage),
+    /// BIP157: compact filter headers response
+    CFHeaders(CFHeadersMessage),
+    /// BIP157: request compact filter header checkpoints
+    GetCFCheckpt(GetCFCheckptMessage),
+    /// BIP157: compact filter header checkpoints response
+    CFCheckpt(CFCheckptMessage),
     Unknown { command: String, data: Vec<u8> },
 }
 
@@ -495,6 +709,12 @@ impl NetworkMessage {
             Self::SendAddrv2 => "sendaddrv2",
             Self::Addrv2(_) => "addrv2",
             Self::Mempool => "mempool",
+            Self::GetCFilters(_) => "getcfilters",
+            Self::CFilter(_) => "cfilter",
+            Self::GetCFHeaders(_) => "getcfheaders",
+            Self::CFHeaders(_) => "cfheaders",
+            Self::GetCFCheckpt(_) => "getcfcheckpt",
+            Self::CFCheckpt(_) => "cfcheckpt",
             Self::Unknown { .. } => "unknown",
         }
     }
@@ -530,6 +750,11 @@ impl NetworkMessage {
             Self::SendAddrv2 => Vec::new(),
             Self::Addrv2(m) => m.encode_payload(),
             Self::Mempool => Vec::new(),
+            Self::GetCFilters(m) | Self::GetCFHeaders(m) => m.encode_payload(),
+            Self::CFilter(m) => m.encode_payload(),
+            Self::CFHeaders(m) => m.encode_payload(),
+            Self::GetCFCheckpt(m) => m.encode_payload(),
+            Self::CFCheckpt(m) => m.encode_payload(),
             Self::FeeFilter(rate) => rate.to_le_bytes().to_vec(),
             Self::SendCmpct(announce, version) => {
                 let mut buf = vec![if *announce { 1u8 } else { 0u8 }];
@@ -606,6 +831,12 @@ impl NetworkMessage {
             "sendaddrv2" => Self::SendAddrv2,
             "addrv2" => Self::Addrv2(Addrv2Message::decode_payload(data)?),
             "mempool" => Self::Mempool,
+            "getcfilters" => Self::GetCFilters(GetCFiltersMessage::decode_payload(data)?),
+            "cfilter" => Self::CFilter(CFilterMessage::decode_payload(data)?),
+            "getcfheaders" => Self::GetCFHeaders(GetCFiltersMessage::decode_payload(data)?),
+            "cfheaders" => Self::CFHeaders(CFHeadersMessage::decode_payload(data)?),
+            "getcfcheckpt" => Self::GetCFCheckpt(GetCFCheckptMessage::decode_payload(data)?),
+            "cfcheckpt" => Self::CFCheckpt(CFCheckptMessage::decode_payload(data)?),
             "feefilter" if data.len() >= 8 => {
                 Self::FeeFilter(u64::from_le_bytes(data[..8].try_into().unwrap()))
             }
@@ -708,7 +939,7 @@ mod tests {
             addrs: vec![
                 Addrv2Entry {
                     timestamp: 1700000000,
-                    services: 1033, // NODE_NETWORK | NODE_WITNESS
+                    services: LOCAL_SERVICES,
                     net_id: 1,      // IPv4
                     addr: vec![127, 0, 0, 1],
                     port: 8333,
@@ -744,5 +975,103 @@ mod tests {
         assert_eq!(Addrv2NetId::from_u8(4), Some(Addrv2NetId::TorV3));
         assert_eq!(Addrv2NetId::TorV3.addr_len(), Some(32));
         assert_eq!(Addrv2NetId::from_u8(99), None);
+    }
+
+    #[test]
+    fn service_flags_constants() {
+        assert_eq!(LOCAL_SERVICES, NODE_NETWORK | NODE_WITNESS);
+        assert_eq!(LOCAL_SERVICES, 0x09); // 1 | 8
+        assert_eq!(NODE_BLOOM, 4);
+        assert_eq!(NODE_COMPACT_FILTERS, 64);
+        assert_eq!(NODE_NETWORK_LIMITED, 1024);
+    }
+
+    #[test]
+    fn service_flags_to_string_display() {
+        assert_eq!(service_flags_to_string(LOCAL_SERVICES), "NODE_NETWORK|NODE_WITNESS");
+        assert_eq!(service_flags_to_string(0), "NONE");
+        assert_eq!(
+            service_flags_to_string(NODE_NETWORK | NODE_WITNESS | NODE_COMPACT_FILTERS),
+            "NODE_NETWORK|NODE_WITNESS|NODE_COMPACT_FILTERS"
+        );
+    }
+
+    #[test]
+    fn bip157_getcfilters_roundtrip() {
+        let msg = GetCFiltersMessage {
+            filter_type: 0,
+            start_height: 100,
+            stop_hash: Hash256([0xab; 32]),
+        };
+        let payload = msg.encode_payload();
+        let decoded = GetCFiltersMessage::decode_payload(&payload).unwrap();
+        assert_eq!(decoded.filter_type, 0);
+        assert_eq!(decoded.start_height, 100);
+        assert_eq!(decoded.stop_hash, Hash256([0xab; 32]));
+        // Via NetworkMessage
+        let nm = NetworkMessage::GetCFilters(msg);
+        assert_eq!(nm.command(), "getcfilters");
+        let enc = nm.encode_payload();
+        let dec = NetworkMessage::decode_payload("getcfilters", &enc).unwrap();
+        assert!(matches!(dec, NetworkMessage::GetCFilters(_)));
+    }
+
+    #[test]
+    fn bip157_cfilter_roundtrip() {
+        let msg = CFilterMessage {
+            filter_type: 0,
+            block_hash: Hash256([0xcd; 32]),
+            filter: vec![0x01, 0x02, 0x03, 0x04],
+        };
+        let payload = msg.encode_payload();
+        let decoded = CFilterMessage::decode_payload(&payload).unwrap();
+        assert_eq!(decoded.filter_type, 0);
+        assert_eq!(decoded.block_hash, Hash256([0xcd; 32]));
+        assert_eq!(decoded.filter, vec![0x01, 0x02, 0x03, 0x04]);
+    }
+
+    #[test]
+    fn bip157_cfheaders_roundtrip() {
+        let msg = CFHeadersMessage {
+            filter_type: 0,
+            stop_hash: Hash256([0x11; 32]),
+            prev_filter_header: Hash256([0x22; 32]),
+            filter_hashes: vec![Hash256([0x33; 32]), Hash256([0x44; 32])],
+        };
+        let payload = msg.encode_payload();
+        let decoded = CFHeadersMessage::decode_payload(&payload).unwrap();
+        assert_eq!(decoded.filter_type, 0);
+        assert_eq!(decoded.stop_hash, Hash256([0x11; 32]));
+        assert_eq!(decoded.prev_filter_header, Hash256([0x22; 32]));
+        assert_eq!(decoded.filter_hashes.len(), 2);
+        assert_eq!(decoded.filter_hashes[1], Hash256([0x44; 32]));
+    }
+
+    #[test]
+    fn bip157_cfcheckpt_roundtrip() {
+        let msg = CFCheckptMessage {
+            filter_type: 0,
+            stop_hash: Hash256([0x55; 32]),
+            filter_headers: vec![Hash256([0x66; 32])],
+        };
+        let payload = msg.encode_payload();
+        let decoded = CFCheckptMessage::decode_payload(&payload).unwrap();
+        assert_eq!(decoded.filter_type, 0);
+        assert_eq!(decoded.stop_hash, Hash256([0x55; 32]));
+        assert_eq!(decoded.filter_headers.len(), 1);
+    }
+
+    #[test]
+    fn bip157_getcfcheckpt_roundtrip() {
+        let msg = GetCFCheckptMessage {
+            filter_type: 0,
+            stop_hash: Hash256([0x77; 32]),
+        };
+        let payload = msg.encode_payload();
+        let decoded = GetCFCheckptMessage::decode_payload(&payload).unwrap();
+        assert_eq!(decoded.filter_type, 0);
+        assert_eq!(decoded.stop_hash, Hash256([0x77; 32]));
+        let nm = NetworkMessage::GetCFCheckpt(msg);
+        assert_eq!(nm.command(), "getcfcheckpt");
     }
 }

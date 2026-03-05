@@ -14,7 +14,7 @@ use tracing::{debug, info, warn};
 use crate::{
     entry::MempoolEntry,
     error::MempoolError,
-    policy::{is_standard_tx, V3PolicyError, MAX_V3_TX_VSIZE},
+    policy::{is_standard_tx, count_tx_sigops, V3PolicyError, MAX_V3_TX_VSIZE, MAX_STANDARD_TX_SIGOPS_COST},
 };
 
 /// Default maximum total vsize (~300 MB).
@@ -68,6 +68,19 @@ impl Mempool {
         chain_utxos: &impl UtxoLookup,
         chain_height: u32,
     ) -> Result<TxId, MempoolError> {
+        self.accept_tx_inner(tx, chain_utxos, chain_height, false)
+    }
+
+    /// Inner accept with optional fee-rate bypass for package context.
+    /// When `package_bypass_fee` is true, the individual min-relay-fee check is
+    /// skipped (the caller — `accept_package` — enforces it at the package level).
+    fn accept_tx_inner(
+        &mut self,
+        tx: Transaction,
+        chain_utxos: &impl UtxoLookup,
+        chain_height: u32,
+        package_bypass_fee: bool,
+    ) -> Result<TxId, MempoolError> {
         // Compute txid (legacy serialisation for the witness-stripped hash)
         let txid = {
             let mut buf = Vec::new();
@@ -83,9 +96,17 @@ impl Mempool {
             return Err(MempoolError::AlreadyKnown);
         }
 
-        // ── Standardness checks (E4) ────────────────────────────────────
+        // ── Standardness checks ────────────────────────────────────────
         if let Err(reason) = is_standard_tx(&tx) {
             return Err(MempoolError::NonStandard(reason.to_string()));
+        }
+
+        // ── Sigops limit ──────────────────────────────────────────────
+        let sigops = count_tx_sigops(&tx);
+        if sigops > MAX_STANDARD_TX_SIGOPS_COST {
+            return Err(MempoolError::NonStandard(
+                format!("too many sigops: {sigops} > {MAX_STANDARD_TX_SIGOPS_COST}"),
+            ));
         }
 
         let new_signals_rbf = signals_rbf(&tx);
@@ -132,7 +153,7 @@ impl Mempool {
         let vsize = tx.vsize();
         let fee_rate = fee / vsize.max(1);
 
-        if fee_rate < self.min_relay_fee_rate {
+        if !package_bypass_fee && fee_rate < self.min_relay_fee_rate {
             return Err(MempoolError::FeeTooLow(fee_rate, self.min_relay_fee_rate));
         }
 
@@ -146,6 +167,14 @@ impl Mempool {
             let required = max_conflict_rate.saturating_add(self.min_relay_fee_rate);
             if fee_rate < required {
                 return Err(MempoolError::RbfInsufficientFee(fee_rate, max_conflict_rate, self.min_relay_fee_rate));
+            }
+
+            // BIP125 Rule 3: replacement absolute fee must exceed sum of replaced fees
+            let total_conflict_fees: u64 = conflicting.iter()
+                .map(|cid| self.entries[cid].fee)
+                .sum();
+            if fee < total_conflict_fees {
+                return Err(MempoolError::RbfAbsoluteFeeTooLow(fee, total_conflict_fees));
             }
 
             // Remove all conflicting transactions
@@ -186,16 +215,33 @@ impl Mempool {
                 ));
             }
             // If there's one unconfirmed parent, check it doesn't already have an
-            // in-mempool child
+            // in-mempool child.  If it does, attempt sibling eviction: replace the
+            // existing child if the new one pays a strictly higher fee rate AND
+            // higher absolute fee (BIP431 sibling eviction).
             if let Some(parent_txid) = unconfirmed_parents.first() {
-                let has_existing_child = self.entries.values().any(|e| {
-                    e.txid != txid
-                        && e.tx.inputs.iter().any(|i| i.previous_output.txid == *parent_txid)
-                });
-                if has_existing_child {
-                    return Err(MempoolError::V3Policy(
-                        V3PolicyError::ParentAlreadyHasChild.to_string(),
-                    ));
+                let existing_child: Option<(TxId, u64, u64)> = self.entries.values()
+                    .find(|e| {
+                        e.txid != txid
+                            && e.tx.inputs.iter().any(|i| i.previous_output.txid == *parent_txid)
+                    })
+                    .map(|e| (e.txid, e.fee_rate, e.fee));
+
+                if let Some((child_txid, child_fee_rate, child_fee)) = existing_child {
+                    let required_rate = child_fee_rate.saturating_add(self.min_relay_fee_rate);
+                    if fee_rate >= required_rate && fee >= child_fee {
+                        // Evict the existing sibling
+                        info!(
+                            "mempool: v3 sibling eviction — replacing {} with {}",
+                            child_txid.to_hex(),
+                            txid.to_hex()
+                        );
+                        self.entries.remove(&child_txid);
+                        self.rebuild_mempool_utxos();
+                    } else {
+                        return Err(MempoolError::V3Policy(
+                            V3PolicyError::ParentAlreadyHasChild.to_string(),
+                        ));
+                    }
                 }
             }
         }
@@ -411,30 +457,56 @@ impl Mempool {
 
     // ── Eviction ──────────────────────────────────────────────────────────────
 
-    /// Evict lowest-ancestor-fee-rate transactions until `total_vsize ≤ max_vsize`.
-    /// Uses ancestor fee rate for eviction priority (matching Bitcoin Core).
-    /// If the just-inserted transaction has the lowest rate, it is rejected.
+    /// Evict lowest-mining-score transactions until `total_vsize ≤ max_vsize`.
+    ///
+    /// Mining score = `min(ancestor_fee_rate, individual_fee_rate)`, matching
+    /// Bitcoin Core's eviction priority.  When evicting a transaction, all its
+    /// in-mempool descendants are removed as well to avoid orphans.
     fn evict_below_fee_rate(&mut self, new_fee_rate: u64) -> Result<(), MempoolError> {
-        // Sort ascending by ancestor_fee_rate → evict cheapest first (E5)
-        let mut by_rate: Vec<(TxId, u64)> = self.entries.values()
-            .map(|e| (e.txid, e.ancestor_fee_rate))
+        // Sort ascending by mining_score → evict cheapest first
+        let mut by_score: Vec<(TxId, u64)> = self.entries.values()
+            .map(|e| (e.txid, e.ancestor_fee_rate.min(e.fee_rate)))
             .collect();
-        by_rate.sort_unstable_by_key(|&(_, r)| r);
+        by_score.sort_unstable_by_key(|&(_, s)| s);
 
-        for (evict_id, evict_rate) in &by_rate {
+        for (evict_id, evict_score) in &by_score {
             if self.total_vsize() <= self.max_vsize {
                 break;
             }
-            if *evict_rate >= new_fee_rate {
-                self.entries.remove(evict_id);
+            if *evict_score >= new_fee_rate {
+                // New tx would be the cheapest — reject it instead
+                self.remove_with_descendants(evict_id);
                 self.rebuild_mempool_utxos();
                 return Err(MempoolError::MempoolFull);
             }
-            warn!("mempool: evicting {} (ancestor_fee_rate={evict_rate}) due to size limit", evict_id.to_hex());
-            self.entries.remove(evict_id);
+            warn!("mempool: evicting {} (mining_score={evict_score}) due to size limit", evict_id.to_hex());
+            self.remove_with_descendants(evict_id);
         }
         self.rebuild_mempool_utxos();
         Ok(())
+    }
+
+    /// Remove a transaction and all its in-mempool descendants.
+    fn remove_with_descendants(&mut self, txid: &TxId) {
+        let mut to_remove = vec![*txid];
+        let mut i = 0;
+        while i < to_remove.len() {
+            let current = to_remove[i];
+            // Find all entries that spend an output of `current`
+            let children: Vec<TxId> = self.entries.values()
+                .filter(|e| e.tx.inputs.iter().any(|inp| inp.previous_output.txid == current))
+                .map(|e| e.txid)
+                .collect();
+            for child in children {
+                if !to_remove.contains(&child) {
+                    to_remove.push(child);
+                }
+            }
+            i += 1;
+        }
+        for id in &to_remove {
+            self.entries.remove(id);
+        }
     }
 
     // ── Ancestor/descendant helpers ─────────────────────────────────────
@@ -496,10 +568,11 @@ impl Mempool {
         }
     }
 
-    /// Accept a package of transactions (parent + children) together (E1).
+    /// Accept a package of transactions (parent + children) together (BIP331).
     ///
     /// This allows child-pays-for-parent where the child's fee compensates
     /// for a low-fee parent that would not be accepted individually.
+    /// The aggregate package fee rate must meet `min_relay_fee_rate`.
     pub fn accept_package(
         &mut self,
         txs: Vec<Transaction>,
@@ -545,10 +618,44 @@ impl Mempool {
             }
         }
 
+        // Compute aggregate package fee rate to decide if we can bypass
+        // individual fee checks (CPFP: low-fee parent + high-fee child).
+        let mut total_pkg_fee = 0u64;
+        let mut total_pkg_vsize = 0u64;
+        for tx in &sorted {
+            // Build input view to compute fee
+            let mut input_view = UtxoSet::new();
+            for input in &tx.inputs {
+                let op = &input.previous_output;
+                if let Some(u) = chain_utxos.get_utxo(op) {
+                    input_view.insert(op.clone(), u);
+                } else if let Some(u) = self.mempool_utxos.get(op) {
+                    input_view.insert(op.clone(), u.clone());
+                }
+            }
+            if let Ok(fee) = verify_transaction(tx, &input_view, chain_height, ScriptFlags::standard()) {
+                total_pkg_fee += fee;
+                total_pkg_vsize += tx.vsize();
+            }
+        }
+        let pkg_fee_rate = total_pkg_fee / total_pkg_vsize.max(1);
+        let bypass_fee = pkg_fee_rate >= self.min_relay_fee_rate;
+
+        // Take a snapshot so we can roll back on failure
+        let snapshot_entries = self.entries.clone();
+        let snapshot_utxos = self.mempool_utxos.clone();
+
         let mut result = Vec::new();
         for tx in sorted {
-            let txid = self.accept_tx(tx, chain_utxos, chain_height)?;
-            result.push(txid);
+            match self.accept_tx_inner(tx, chain_utxos, chain_height, bypass_fee) {
+                Ok(txid) => result.push(txid),
+                Err(e) => {
+                    // Atomic rollback: undo all insertions from this package
+                    self.entries = snapshot_entries;
+                    self.mempool_utxos = snapshot_utxos;
+                    return Err(e);
+                }
+            }
         }
         Ok(result)
     }
@@ -667,5 +774,119 @@ mod tests {
         mp.accept_tx(tx.clone(), &chain, 200).unwrap();
         let err = mp.accept_tx(tx, &chain, 200).unwrap_err();
         assert!(matches!(err, MempoolError::AlreadyKnown));
+    }
+
+    /// Create a spending tx that signals RBF (nSequence < 0xFFFFFFFE).
+    fn spend_tx_rbf(prev_txid: TxId, value_out: u64) -> Transaction {
+        let mut spk = vec![0x00, 0x14];
+        spk.extend_from_slice(&[0u8; 20]);
+        Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: prev_txid, vout: 0 },
+                script_sig: Script::new(),
+                sequence: 0xfffffffd, // signals RBF
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: value_out, script_pubkey: Script::from_bytes(spk) }],
+            lock_time: 0,
+        }
+    }
+
+    /// Create a larger spending tx with multiple outputs that signals RBF.
+    fn spend_tx_rbf_large(prev_txid: TxId, value_out: u64) -> Transaction {
+        let mut spk = vec![0x00, 0x14];
+        spk.extend_from_slice(&[0u8; 20]);
+        Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: prev_txid, vout: 0 },
+                script_sig: Script::new(),
+                sequence: 0xfffffffd,
+                witness: vec![],
+            }],
+            outputs: vec![
+                TxOut { value: value_out / 3, script_pubkey: Script::from_bytes(spk.clone()) },
+                TxOut { value: value_out / 3, script_pubkey: Script::from_bytes(spk.clone()) },
+                TxOut { value: value_out / 3, script_pubkey: Script::from_bytes(spk) },
+            ],
+            lock_time: 0,
+        }
+    }
+
+    #[test]
+    fn rbf_absolute_fee_too_low_rejected() {
+        // Use two UTXOs so we can make the original tx spend 2 inputs (big tx, big fee)
+        // and the replacement spend 1 input (small tx, higher rate, lower absolute fee).
+        let mut mp = Mempool::new();
+        let prev_txid_a = Hash256([50; 32]);
+        let prev_txid_b = Hash256([51; 32]);
+        let outpoint_a = OutPoint { txid: prev_txid_a, vout: 0 };
+        let outpoint_b = OutPoint { txid: prev_txid_b, vout: 0 };
+
+        let mut chain = UtxoSet::new();
+        chain.insert(outpoint_a.clone(), Utxo {
+            txout: TxOut { value: 10_0000, script_pubkey: Script::from_bytes(vec![0x51]) },
+            is_coinbase: false, height: 100,
+        });
+        chain.insert(outpoint_b.clone(), Utxo {
+            txout: TxOut { value: 10_0000, script_pubkey: Script::from_bytes(vec![0x51]) },
+            is_coinbase: false, height: 100,
+        });
+
+        // P2WPKH scriptPubKey
+        let mut spk = vec![0x00, 0x14];
+        spk.extend_from_slice(&[0u8; 20]);
+
+        // Original: 2 inputs, fee = 20_0000 - 10_0000 = 10_0000 sat
+        let original = Transaction {
+            version: 1,
+            inputs: vec![
+                TxIn { previous_output: outpoint_a.clone(), script_sig: Script::new(),
+                        sequence: 0xfffffffd, witness: vec![] },
+                TxIn { previous_output: outpoint_b.clone(), script_sig: Script::new(),
+                        sequence: 0xfffffffd, witness: vec![] },
+            ],
+            outputs: vec![TxOut { value: 10_0000, script_pubkey: Script::from_bytes(spk.clone()) }],
+            lock_time: 0,
+        };
+        let orig_fee = 10_0000u64; // 100000 sat
+        mp.accept_tx(original, &chain, 200).unwrap();
+
+        // Replacement: 1 input (spends outpoint_a, conflicts with original),
+        // fee = 10_0000 - 1_0000 = 9_0000 sat
+        // Fee rate is 9_0000/~60 ≈ 1500 sat/vB vs original 10_0000/~100 ≈ 1000 sat/vB
+        // So rate is higher, but absolute fee 90000 < 100000 → reject
+        let replacement = Transaction {
+            version: 1,
+            inputs: vec![
+                TxIn { previous_output: outpoint_a, script_sig: Script::new(),
+                        sequence: 0xfffffffd, witness: vec![] },
+            ],
+            outputs: vec![TxOut { value: 1_0000, script_pubkey: Script::from_bytes(spk) }],
+            lock_time: 0,
+        };
+        let _repl_fee = 9_0000u64; // 90000 sat < 100000 sat
+        let err = mp.accept_tx(replacement, &chain, 200).unwrap_err();
+        assert!(
+            matches!(err, MempoolError::RbfAbsoluteFeeTooLow(_, _)),
+            "expected RbfAbsoluteFeeTooLow (repl_fee={_repl_fee} < orig_fee={orig_fee}), got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn rbf_absolute_fee_sufficient_accepted() {
+        let mut mp = Mempool::new();
+        let prev_txid = Hash256([51; 32]);
+        let outpoint = OutPoint { txid: prev_txid, vout: 0 };
+        let chain = utxo_set_with(outpoint, 50_0000_0000);
+
+        let original = spend_tx_rbf(prev_txid, 49_9999_0000); // fee = 10000 sat
+        mp.accept_tx(original, &chain, 200).unwrap();
+
+        // Replacement: higher absolute fee (20000 > 10000)
+        let replacement = spend_tx_rbf(prev_txid, 49_9998_0000); // fee = 20000 sat
+        let result = mp.accept_tx(replacement, &chain, 200);
+        assert!(result.is_ok());
     }
 }

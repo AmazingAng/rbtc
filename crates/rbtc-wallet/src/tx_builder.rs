@@ -31,6 +31,13 @@ const CHANGE_COST: u64 = 99;
 /// Maximum BnB search iterations to prevent combinatorial explosion.
 const BNB_MAX_TRIES: u32 = 100_000;
 
+/// Long-term fee rate (sat/vbyte) for waste metric calculation.
+/// Bitcoin Core uses 10 sat/vbyte as the default long-term estimate.
+const LONG_TERM_FEE_RATE: f64 = 10.0;
+
+/// Estimated input weight in vbytes (P2WPKH: ~68 vbytes).
+const INPUT_VBYTES: f64 = 68.0;
+
 impl CoinSelector {
     /// Select UTXOs to cover `target_sat` plus a fee estimated at `fee_rate`
     /// sat/vbyte. Returns `(selected, estimated_fee)`.
@@ -105,7 +112,7 @@ impl CoinSelector {
             return None; // Not enough funds even with all UTXOs
         }
 
-        let mut best: Option<(Vec<usize>, u64)> = None;
+        let mut best: Option<(Vec<usize>, f64)> = None;
         let mut current_selection: Vec<bool> = vec![false; sorted.len()];
         let mut current_value = 0u64;
         let mut tries = 0u32;
@@ -159,10 +166,17 @@ impl CoinSelector {
 
             if current_value >= target_with_fee {
                 if current_value <= target_with_fee + cost_of_change {
-                    // Found an acceptable solution
+                    // Found an acceptable solution — compute waste metric
+                    // waste = Σ(input_fee - long_term_fee) + excess
+                    let n_selected = current_selection.iter().filter(|&&s| s).count() as f64;
+                    let input_fees = n_selected * INPUT_VBYTES * fee_rate;
+                    let long_term_fees = n_selected * INPUT_VBYTES * LONG_TERM_FEE_RATE;
+                    let excess = (current_value - target_with_fee) as f64;
+                    let waste = (input_fees - long_term_fees) + excess;
+
                     let is_better = match &best {
                         None => true,
-                        Some((_, prev_total)) => current_value < *prev_total,
+                        Some((_, prev_waste)) => waste < *prev_waste,
                     };
                     if is_better {
                         let indices: Vec<usize> = current_selection
@@ -171,7 +185,7 @@ impl CoinSelector {
                             .filter(|(_, &s)| s)
                             .map(|(i, _)| i)
                             .collect();
-                        best = Some((indices, current_value));
+                        best = Some((indices, waste));
                     }
                 }
                 // Backtrack (we exceeded or found a match)
@@ -193,7 +207,7 @@ impl CoinSelector {
             depth += 1;
         }
 
-        best.map(|(indices, _total)| {
+        best.map(|(indices, _waste)| {
             let fee = {
                 let vbytes = 10 + indices.len() as u64 * 68 + 31;
                 (vbytes as f64 * fee_rate).ceil() as u64

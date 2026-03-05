@@ -37,6 +37,62 @@ pub const MAX_OP_RETURN_RELAY: usize = 83;
 /// Maximum number of inputs + outputs (sanity).
 pub const MAX_STANDARD_TX_INS_OUTS: usize = 3_000;
 
+// ── Sigops counting ─────────────────────────────────────────────────────────
+
+/// Count the "legacy" sigops in a script (output or input).
+///
+/// - `OP_CHECKSIG` / `OP_CHECKSIGVERIFY` → 1 sigop each
+/// - `OP_CHECKMULTISIG` / `OP_CHECKMULTISIGVERIFY` → 20 sigops (worst case)
+///
+/// This mirrors Bitcoin Core's `GetSigOpCount(false)` (non-accurate mode).
+fn count_script_sigops(script: &[u8]) -> u32 {
+    let mut count = 0u32;
+    let mut i = 0;
+    while i < script.len() {
+        let op = script[i];
+        match op {
+            // Push data opcodes: skip their payload
+            0x01..=0x4b => { i += 1 + op as usize; continue; }
+            0x4c => { // OP_PUSHDATA1
+                if i + 1 < script.len() { i += 2 + script[i + 1] as usize; } else { break; }
+                continue;
+            }
+            0x4d => { // OP_PUSHDATA2
+                if i + 2 < script.len() {
+                    let len = u16::from_le_bytes([script[i + 1], script[i + 2]]) as usize;
+                    i += 3 + len;
+                } else { break; }
+                continue;
+            }
+            0x4e => { // OP_PUSHDATA4
+                if i + 4 < script.len() {
+                    let len = u32::from_le_bytes([script[i+1], script[i+2], script[i+3], script[i+4]]) as usize;
+                    i += 5 + len;
+                } else { break; }
+                continue;
+            }
+            0xac | 0xad => count += 1,                // OP_CHECKSIG, OP_CHECKSIGVERIFY
+            0xae | 0xaf => count += 20,               // OP_CHECKMULTISIG, OP_CHECKMULTISIGVERIFY
+            _ => {}
+        }
+        i += 1;
+    }
+    count
+}
+
+/// Count total legacy sigops for a transaction (inputs + outputs).
+/// Witness sigops are not counted here (they use a separate weight-based budget).
+pub fn count_tx_sigops(tx: &Transaction) -> u32 {
+    let mut total = 0u32;
+    for input in &tx.inputs {
+        total += count_script_sigops(&input.script_sig.0);
+    }
+    for output in &tx.outputs {
+        total += count_script_sigops(&output.script_pubkey.0);
+    }
+    total
+}
+
 // ── Dust threshold ──────────────────────────────────────────────────────────
 
 /// Compute the dust threshold for a given scriptPubKey.
@@ -366,5 +422,29 @@ mod tests {
             is_standard_tx(&tx),
             Err(NonStandardReason::NonStandardOutput(1))
         ));
+    }
+
+    // ── Sigops counting tests ───────────────────────────────────────────
+
+    #[test]
+    fn count_sigops_checksig() {
+        // OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG = 1 sigop
+        let mut s = vec![0x76, 0xa9, 0x14];
+        s.extend_from_slice(&[0u8; 20]);
+        s.extend_from_slice(&[0x88, 0xac]);
+        assert_eq!(count_script_sigops(&s), 1);
+    }
+
+    #[test]
+    fn count_sigops_checkmultisig() {
+        // OP_CHECKMULTISIG = 20 sigops (worst case)
+        assert_eq!(count_script_sigops(&[0xae]), 20);
+    }
+
+    #[test]
+    fn count_tx_sigops_basic() {
+        let tx = simple_tx(1, vec![p2wpkh_output(1_000_000)]);
+        // P2WPKH output has no legacy sigops, input has empty scriptSig
+        assert_eq!(count_tx_sigops(&tx), 0);
     }
 }

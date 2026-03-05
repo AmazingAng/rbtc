@@ -7,6 +7,7 @@ pub mod tx_verify;
 pub mod block_verify;
 pub mod utxo;
 pub mod versionbits;
+pub mod blockfilter;
 
 pub use chain::{ChainState, BlockIndex};
 pub use error::ConsensusError;
@@ -15,3 +16,4 @@ pub use tx_verify::verify_transaction;
 pub use block_verify::{verify_block, verify_signet_block_solution};
 pub use utxo::{Utxo, UtxoLookup, UtxoSet};
 pub use versionbits::{Bip9Deployment, ThresholdState, deployment_state, deployments};
+pub use blockfilter::{build_basic_filter, compute_filter_header, BASIC_FILTER_TYPE};

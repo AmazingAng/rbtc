@@ -3,7 +3,7 @@ use std::time::Instant;
 use rbtc_primitives::{hash::TxId, transaction::Transaction};
 
 /// A validated, unconfirmed transaction held in the mempool
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MempoolEntry {
     pub tx: Transaction,
     pub txid: TxId,

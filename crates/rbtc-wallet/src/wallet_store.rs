@@ -26,6 +26,9 @@ pub struct StoredAddressInfo {
     pub derivation_path: String,
     /// Compressed public key bytes (hex)
     pub pubkey_hex: String,
+    /// Unix timestamp when this address was created (0 for legacy entries)
+    #[serde(default)]
+    pub created_at: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

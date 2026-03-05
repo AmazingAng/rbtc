@@ -1,0 +1,33 @@
+version: "3.8"
+
+services:
+  rbtc:
+    build: .
+    command: ["--network", "regtest", "--rpc-bind", "0.0.0.0:8332", "--connect", "bitcoind:18444"]
+    ports:
+      - "18444:18444"
+      - "8332:8332"
+    volumes:
+      - rbtc-data:/data
+    depends_on:
+      - bitcoind
+
+  bitcoind:
+    image: kylemanna/bitcoind:latest
+    command:
+      - -regtest
+      - -server
+      - -rpcuser=rbtc
+      - -rpcpassword=rbtc
+      - -rpcallowip=0.0.0.0/0
+      - -rpcbind=0.0.0.0
+      - -listen=1
+      - -txindex=1
+    ports:
+      - "18443:18443"
+    volumes:
+      - bitcoind-data:/bitcoin/.bitcoin
+
+volumes:
+  rbtc-data:
+  bitcoind-data:

@@ -1,0 +1,33 @@
+[package]
+name = "rbtc-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rbtc-primitives = { path = "../crates/rbtc-primitives" }
+rbtc-script = { path = "../crates/rbtc-script" }
+rbtc-consensus = { path = "../crates/rbtc-consensus" }
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_tx_decode"
+path = "fuzz_targets/fuzz_tx_decode.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_block_header"
+path = "fuzz_targets/fuzz_block_header.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_script_eval"
+path = "fuzz_targets/fuzz_script_eval.rs"
+doc = false

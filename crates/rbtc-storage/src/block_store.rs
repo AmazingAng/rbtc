@@ -5,7 +5,7 @@ use rbtc_primitives::{
 };
 
 use crate::{
-    db::{Database, CF_BLOCK_DATA, CF_BLOCK_INDEX, CF_HEIGHT_INDEX, CF_UNDO},
+    db::{Database, CF_BLOCK_DATA, CF_BLOCK_INDEX, CF_BLOCK_FILTERS, CF_FILTER_HEADERS, CF_HEIGHT_INDEX, CF_UNDO},
     error::{Result, StorageError},
 };
 
@@ -166,6 +166,51 @@ impl<'db> BlockStore<'db> {
 
     pub fn get_undo(&self, hash: &BlockHash) -> Result<Option<Vec<u8>>> {
         self.db.get_cf(CF_UNDO, &hash.0)
+    }
+
+    // ── Pruning ───────────────────────────────────────────────────────────────
+
+    // ── BIP157 compact block filters ────────────────────────────────────────
+
+    /// Store a BIP157 compact block filter.
+    /// Key layout: `filter_type(1) || block_hash(32)`.
+    pub fn put_filter(&self, filter_type: u8, hash: &BlockHash, filter: &[u8]) -> Result<()> {
+        let mut key = Vec::with_capacity(33);
+        key.push(filter_type);
+        key.extend_from_slice(&hash.0);
+        self.db.put_cf(CF_BLOCK_FILTERS, &key, filter)
+    }
+
+    /// Retrieve a BIP157 compact block filter.
+    pub fn get_filter(&self, filter_type: u8, hash: &BlockHash) -> Result<Option<Vec<u8>>> {
+        let mut key = Vec::with_capacity(33);
+        key.push(filter_type);
+        key.extend_from_slice(&hash.0);
+        self.db.get_cf(CF_BLOCK_FILTERS, &key)
+    }
+
+    /// Store a BIP157 filter header (32-byte hash).
+    pub fn put_filter_header(&self, filter_type: u8, hash: &BlockHash, header: &[u8; 32]) -> Result<()> {
+        let mut key = Vec::with_capacity(33);
+        key.push(filter_type);
+        key.extend_from_slice(&hash.0);
+        self.db.put_cf(CF_FILTER_HEADERS, &key, header)
+    }
+
+    /// Retrieve a BIP157 filter header.
+    pub fn get_filter_header(&self, filter_type: u8, hash: &BlockHash) -> Result<Option<[u8; 32]>> {
+        let mut key = Vec::with_capacity(33);
+        key.push(filter_type);
+        key.extend_from_slice(&hash.0);
+        match self.db.get_cf(CF_FILTER_HEADERS, &key)? {
+            Some(bytes) if bytes.len() == 32 => {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&bytes);
+                Ok(Some(arr))
+            }
+            Some(_) => Err(StorageError::Corruption("invalid filter header length".into())),
+            None => Ok(None),
+        }
     }
 
     // ── Pruning ───────────────────────────────────────────────────────────────

@@ -2,6 +2,7 @@
 //! and transaction building/signing.
 
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use aes_gcm::{
     aead::{Aead, KeyInit},
@@ -154,6 +155,7 @@ impl Wallet {
             addr_type: "segwit".into(),
             derivation_path: format!("imported:{label}"),
             pubkey_hex: hex::encode(pk.serialize()),
+            created_at: unix_now(),
         })?;
 
         // Persist the WIF key so it survives restarts
@@ -192,6 +194,7 @@ impl Wallet {
             addr_type: type_key_str(addr_type).to_string(),
             derivation_path: path_str,
             pubkey_hex: hex::encode(&pubkey_bytes),
+            created_at: unix_now(),
         })?;
         store.save_address_index(index + 1)?;
 
@@ -238,6 +241,53 @@ impl Wallet {
     pub fn dump_privkey(&self, address: &str) -> Result<String, WalletError> {
         let sk = self.privkey_for_address(address)?;
         Ok(to_wif(&sk, self.network))
+    }
+
+    /// Dump all wallet addresses and their private keys in Bitcoin Core
+    /// `dumpwallet` format. Each line: `{wif} {timestamp} # addr={address}`.
+    pub fn dump_wallet(&self) -> Vec<String> {
+        let store = WalletStore::new(&self.db);
+        let stored = store.iter_addresses();
+        let mut lines = Vec::new();
+        for info in &stored {
+            let wif = match self.privkey_for_address(&info.address) {
+                Ok(sk) => to_wif(&sk, self.network),
+                Err(_) => continue,
+            };
+            lines.push(format!(
+                "{} {} # addr={}",
+                wif, info.created_at, info.address
+            ));
+        }
+        lines
+    }
+
+    /// Import wallet entries from `dumpwallet` format lines.
+    /// Each line: `{wif} ...`. Lines starting with `#` are skipped.
+    /// Returns the number of keys successfully imported.
+    pub fn import_wallet(&mut self, lines: &[String]) -> Result<usize, WalletError> {
+        let mut count = 0;
+        for line in lines {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let wif = match line.split_whitespace().next() {
+                Some(w) => w,
+                None => continue,
+            };
+            // Extract optional label from "# addr=..." suffix
+            let label = line
+                .find("# addr=")
+                .map(|pos| &line[pos + 7..])
+                .unwrap_or("")
+                .to_string();
+            match self.import_wif(wif, &label) {
+                Ok(_) => count += 1,
+                Err(_) => { /* skip invalid or duplicate keys */ }
+            }
+        }
+        Ok(count)
     }
 
     // ── Block scanning ────────────────────────────────────────────────────────
@@ -664,6 +714,13 @@ pub fn decrypt_data(passphrase: &str, data: &[u8]) -> Result<Vec<u8>, WalletErro
 
 fn type_key(addr_type: AddressType) -> String {
     type_key_str(addr_type).to_string()
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn type_key_str(addr_type: AddressType) -> &'static str {

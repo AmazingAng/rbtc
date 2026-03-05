@@ -28,7 +28,7 @@ pub struct Utxo {
 }
 
 /// In-memory UTXO set (backed by storage layer in production)
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct UtxoSet {
     coins: HashMap<OutPoint, Utxo>,
 }

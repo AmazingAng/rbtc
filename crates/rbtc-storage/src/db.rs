@@ -18,6 +18,10 @@ pub const CF_PEER_BANS: &str = "peer_bans";
 pub const CF_PEER_ADDRS: &str = "peer_addrs";
 /// Height-to-hash index: key = height (4 bytes LE), value = block hash (32 bytes)
 pub const CF_HEIGHT_INDEX: &str = "height_index";
+/// BIP157 compact block filters: key = filter_type(1) || block_hash(32), value = filter bytes
+pub const CF_BLOCK_FILTERS: &str = "block_filters";
+/// BIP157 filter headers: key = filter_type(1) || block_hash(32), value = filter header (32 bytes)
+pub const CF_FILTER_HEADERS: &str = "filter_headers";
 
 /// Wrapper around RocksDB with Bitcoin-specific column families
 pub struct Database {
@@ -43,6 +47,8 @@ impl Database {
             ColumnFamilyDescriptor::new(CF_PEER_BANS, Options::default()),
             ColumnFamilyDescriptor::new(CF_PEER_ADDRS, Options::default()),
             ColumnFamilyDescriptor::new(CF_HEIGHT_INDEX, Options::default()),
+            ColumnFamilyDescriptor::new(CF_BLOCK_FILTERS, Options::default()),
+            ColumnFamilyDescriptor::new(CF_FILTER_HEADERS, Options::default()),
         ];
 
         let db = DB::open_cf_descriptors(&opts, path, cfs)?;

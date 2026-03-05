@@ -40,6 +40,9 @@ pub enum MempoolError {
     #[error("RBF replacement would evict too many transactions ({0} > 100)")]
     TooManyReplacements(usize),
 
+    #[error("RBF replacement absolute fee {0} sat too low (must exceed {1} sat total of replaced txs)")]
+    RbfAbsoluteFeeTooLow(u64, u64),
+
     #[error("conflicting transaction in mempool (no RBF)")]
     ConflictingTx,
 
