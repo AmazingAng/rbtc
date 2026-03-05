@@ -2546,4 +2546,117 @@ mod tests {
         assert!(Network::Mainnet.signet_challenge().is_none());
         assert!(Network::Regtest.signet_challenge().is_none());
     }
+
+    // ── C1: Assumevalid / skip_script_verification tests ─────────────────
+
+    /// A block with an INVALID scriptSig (spends OP_CHECKSIG output with empty sig)
+    /// passes when skip_script_verification is true (assumevalid mode).
+    #[test]
+    fn skip_script_verification_accepts_bad_script() {
+        // Create a funding UTXO locked to OP_CHECKSIG (requires a real signature)
+        let funding_txid = Hash256([0xaa; 32]);
+        let mut utxos = UtxoSet::new();
+        utxos.insert(
+            OutPoint { txid: funding_txid, vout: 0 },
+            Utxo {
+                txout: TxOut {
+                    value: 5_000,
+                    // OP_CHECKSIG — requires a valid DER sig + pubkey on stack
+                    script_pubkey: Script::from_bytes(vec![0xac]),
+                },
+                is_coinbase: false,
+                height: 0,
+            },
+        );
+
+        // Transaction with empty scriptSig (invalid for OP_CHECKSIG)
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: Script::from_bytes(vec![1, 1]),
+                sequence: 0xffff_ffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            lock_time: 0,
+        };
+        let bad_tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: funding_txid, vout: 0 },
+                script_sig: Script::new(), // empty — invalid for OP_CHECKSIG
+                sequence: 0xffff_ffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 4_000, script_pubkey: Script::new() }],
+            lock_time: 0,
+        };
+
+        let txids = vec![compute_txid(&coinbase), compute_txid(&bad_tx)];
+        let merkle = rbtc_crypto::merkle_root(&txids).unwrap();
+        let mut h = header_with_bits(0x207fffff);
+        h.merkle_root = merkle;
+        for nonce in 0..=0x10000u32 {
+            h.nonce = nonce;
+            let enc = encode_block_header(&h);
+            let hash = sha256d(&enc);
+            if h.meets_target(&hash) { break; }
+        }
+        let block = Block { header: h, transactions: vec![coinbase, bad_tx] };
+        let ctx = BlockValidationContext {
+            block: &block,
+            height: 1,
+            median_time_past: 0,
+            network_time: 200000,
+            expected_bits: 0x207fffff,
+            flags: ScriptFlags::default(),
+            network: Network::Regtest,
+            mtp_provider: &TestMtpProvider,
+            signet_challenge: None,
+        };
+
+        // Without skip: should FAIL script verification
+        let result_normal = verify_block_with_options(&ctx, &utxos, false);
+        assert!(result_normal.is_err(), "should fail without skip_script_verification");
+
+        // With skip (assumevalid): should PASS
+        let fees = verify_block_with_options(&ctx, &utxos, true).unwrap();
+        assert_eq!(fees, 1_000); // 5000 - 4000
+    }
+
+    /// Structural checks (merkle root, coinbase, weight) still apply even with
+    /// skip_script_verification=true.
+    #[test]
+    fn skip_script_verification_still_checks_merkle_root() {
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: Script::from_bytes(vec![2, 0, 0]),
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            lock_time: 0,
+        };
+        // Deliberately wrong merkle root
+        let mut h = header_with_valid_pow(0x207fffff);
+        h.merkle_root = Hash256([0xff; 32]);
+        let block = Block { header: h, transactions: vec![coinbase] };
+        let ctx = BlockValidationContext {
+            block: &block,
+            height: 0,
+            median_time_past: 99999,
+            network_time: 110000,
+            expected_bits: 0x207fffff,
+            flags: ScriptFlags::default(),
+            network: Network::Regtest,
+            mtp_provider: &TestMtpProvider,
+            signet_challenge: None,
+        };
+        let result = verify_block_with_options(&ctx, &UtxoSet::new(), true);
+        assert!(result.is_err(), "bad merkle root should still be rejected with skip_script");
+        assert!(matches!(result.unwrap_err(), ConsensusError::BadMerkleRoot));
+    }
 }

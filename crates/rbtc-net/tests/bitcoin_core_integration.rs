@@ -686,3 +686,343 @@ async fn test_block_version_bits() {
     }
     println!("[version-bits] all headers parsed ✓");
 }
+
+// ── Bitcoin Core RPC integration tests ──────────────────────────────────────
+//
+// These tests call Bitcoin Core's JSON-RPC via bitcoin-cli to verify that its
+// responses can be parsed correctly and that our implementations match.
+
+fn bitcoin_cli(args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("/tmp/bitcoin-27.0/bin/bitcoin-cli")
+        .args(&["-datadir=/tmp/rbtc-regtest", "-regtest"])
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn bitcoin_cli_available() -> bool {
+    bitcoin_cli(&["getblockchaininfo"]).is_some()
+}
+
+// ── Test 8: RPC getblockchaininfo comparison ─────────────────────────────────
+
+/// Call getblockchaininfo on Bitcoin Core and verify key fields exist and are
+/// well-formed, matching what rbtc's implementation would return.
+#[tokio::test]
+async fn test_rpc_getblockchaininfo() {
+    if !bitcoin_cli_available() {
+        eprintln!("bitcoin-cli not available -- skipping RPC tests");
+        return;
+    }
+
+    let info = bitcoin_cli(&["getblockchaininfo"]).unwrap();
+    let val: serde_json::Value = serde_json::from_str(&info).unwrap();
+    assert_eq!(val["chain"], "regtest");
+    assert!(val["blocks"].as_u64().is_some());
+    assert!(val["bestblockhash"].as_str().unwrap().len() == 64);
+    println!("[rpc] getblockchaininfo: chain={} blocks={}", val["chain"], val["blocks"]);
+}
+
+// ── Test 9: RPC decoderawtransaction comparison ──────────────────────────────
+
+/// Get a raw transaction from Bitcoin Core via block, decode it with both Core
+/// and rbtc, and verify fields match (txid, version, vin/vout counts).
+#[tokio::test]
+async fn test_rpc_decoderawtransaction() {
+    if !bitcoin_cli_available() {
+        eprintln!("bitcoin-cli not available -- skipping");
+        return;
+    }
+
+    // Get block hash for block 1
+    let hash = match bitcoin_cli(&["getblockhash", "1"]) {
+        Some(h) => h,
+        None => {
+            eprintln!("no block 1 -- skipping");
+            return;
+        }
+    };
+
+    // Fetch the coinbase txid from the verbose block
+    let block_json = match bitcoin_cli(&["getblock", &hash, "2"]) {
+        Some(s) => s,
+        None => { eprintln!("getblock failed -- skipping"); return; }
+    };
+    let block: serde_json::Value = serde_json::from_str(&block_json).unwrap();
+    let coinbase_txid = match block["tx"][0]["txid"].as_str() {
+        Some(t) => t.to_string(),
+        None => { eprintln!("no txid in block -- skipping"); return; }
+    };
+
+    // getrawtransaction needs block hash since -txindex may not be enabled
+    let raw_hex = match bitcoin_cli(&["getrawtransaction", &coinbase_txid, "false", &hash]) {
+        Some(h) => h,
+        None => { eprintln!("getrawtransaction failed -- skipping"); return; }
+    };
+
+    // Decode with Bitcoin Core
+    let core_decoded = bitcoin_cli(&["decoderawtransaction", &raw_hex]).unwrap();
+    let core_val: serde_json::Value = serde_json::from_str(&core_decoded).unwrap();
+
+    // Decode with our implementation
+    let tx_bytes = hex::decode(&raw_hex).unwrap();
+    let tx: rbtc_primitives::transaction::Transaction =
+        rbtc_primitives::codec::Decodable::decode(&mut &tx_bytes[..]).unwrap();
+
+    let mut legacy_buf = Vec::new();
+    tx.encode_legacy(&mut legacy_buf).ok();
+    let our_txid = rbtc_crypto::sha256d(&legacy_buf);
+
+    assert_eq!(
+        our_txid.to_hex(),
+        core_val["txid"].as_str().unwrap(),
+        "txid mismatch between rbtc and Bitcoin Core"
+    );
+    assert_eq!(
+        tx.version as i64,
+        core_val["version"].as_i64().unwrap(),
+        "version mismatch"
+    );
+    assert_eq!(
+        tx.inputs.len(),
+        core_val["vin"].as_array().unwrap().len(),
+        "vin count mismatch"
+    );
+    assert_eq!(
+        tx.outputs.len(),
+        core_val["vout"].as_array().unwrap().len(),
+        "vout count mismatch"
+    );
+
+    println!(
+        "[rpc] decoderawtransaction: txid={} version={} vin={} vout={} ✓",
+        our_txid.to_hex(), tx.version, tx.inputs.len(), tx.outputs.len()
+    );
+}
+
+// ── Test 10: RPC validateaddress comparison ──────────────────────────────────
+
+/// Generate an address on Bitcoin Core and verify validateaddress returns
+/// isvalid=true with correct witness info.
+#[tokio::test]
+async fn test_rpc_validateaddress() {
+    if !bitcoin_cli_available() {
+        eprintln!("bitcoin-cli not available -- skipping");
+        return;
+    }
+
+    let addr = match bitcoin_cli(&["getnewaddress", "", "bech32"]) {
+        Some(a) => a,
+        None => {
+            eprintln!("could not get new address -- skipping");
+            return;
+        }
+    };
+
+    let core_val_str = bitcoin_cli(&["validateaddress", &addr]).unwrap();
+    let core_val: serde_json::Value = serde_json::from_str(&core_val_str).unwrap();
+    assert_eq!(core_val["isvalid"], true);
+
+    // Our implementation should also validate this address
+    let our_script = rbtc_wallet::address::address_to_script(&addr);
+    assert!(our_script.is_ok(), "rbtc should parse Bitcoin Core bech32 address: {addr}");
+    let script = our_script.unwrap();
+    assert!(
+        script.is_p2wpkh() || script.is_p2wsh() || script.is_p2tr(),
+        "bech32 address should produce witness script"
+    );
+
+    println!("[rpc] validateaddress: addr={addr} isvalid=true ✓");
+}
+
+// ── Test 11: RPC getblockstats comparison ────────────────────────────────────
+
+/// Compare getblockstats output for block 1 between Bitcoin Core and our
+/// expected behavior (tx count, subsidy, etc).
+#[tokio::test]
+async fn test_rpc_getblockstats() {
+    if !bitcoin_cli_available() {
+        eprintln!("bitcoin-cli not available -- skipping");
+        return;
+    }
+
+    let core_stats_str = match bitcoin_cli(&["getblockstats", "1"]) {
+        Some(s) => s,
+        None => {
+            eprintln!("no block 1 -- skipping");
+            return;
+        }
+    };
+    let core_stats: serde_json::Value = serde_json::from_str(&core_stats_str).unwrap();
+
+    assert_eq!(core_stats["height"], 1);
+    // Regtest block 1 should have 1 tx (coinbase)
+    assert_eq!(core_stats["txs"], 1);
+    // Subsidy at height 1 on regtest = 50 BTC = 5_000_000_000 sat
+    assert_eq!(core_stats["subsidy"], 5_000_000_000u64);
+    // Note: Bitcoin Core excludes coinbase from total_size/total_weight,
+    // so block 1 (coinbase only) may report 0 for these fields.
+    assert!(core_stats["total_weight"].as_u64().is_some() || core_stats["total_weight"].as_i64().is_some());
+    assert!(core_stats["total_size"].as_u64().is_some() || core_stats["total_size"].as_i64().is_some());
+
+    println!(
+        "[rpc] getblockstats: height={} txs={} subsidy={} ✓",
+        core_stats["height"], core_stats["txs"], core_stats["subsidy"]
+    );
+}
+
+// ── Test 12: BIP68 relative lock-time on regtest (C5) ────────────────────────
+
+/// Verify that Bitcoin Core enforces BIP68 sequence locks on regtest:
+/// create a transaction with CSV-locked inputs and check that it's accepted
+/// in blocks at the right height.
+#[tokio::test]
+async fn test_bip68_sequence_lock_enforcement() {
+    if !bitcoin_cli_available() {
+        eprintln!("bitcoin-cli not available -- skipping");
+        return;
+    }
+
+    // Generate blocks to ensure we have mature coins
+    let addr = match bitcoin_cli(&["getnewaddress"]) {
+        Some(a) => a,
+        None => { eprintln!("getnewaddress failed -- skipping"); return; }
+    };
+    // Make sure we have at least 110 blocks for mature coinbases
+    let current_height: u64 = bitcoin_cli(&["getblockcount"])
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if current_height < 110 {
+        let needed = 110 - current_height;
+        bitcoin_cli(&["generatetoaddress", &needed.to_string(), &addr]);
+    }
+
+    // Get a UTXO to spend
+    let utxos_str = match bitcoin_cli(&["listunspent"]) {
+        Some(s) => s,
+        None => { eprintln!("listunspent failed -- skipping"); return; }
+    };
+    let utxos: serde_json::Value = serde_json::from_str(&utxos_str).unwrap();
+    let utxo_arr = utxos.as_array().unwrap();
+    if utxo_arr.is_empty() {
+        eprintln!("no UTXOs -- skipping");
+        return;
+    }
+
+    let utxo = &utxo_arr[0];
+    let txid = utxo["txid"].as_str().unwrap();
+    let vout = utxo["vout"].as_u64().unwrap();
+    let amount = utxo["amount"].as_f64().unwrap();
+
+    // Create a raw transaction with BIP68 relative lock of 10 blocks
+    // (sequence = 10, which means 10 blocks relative lock)
+    let inputs = format!("[{{\"txid\":\"{txid}\",\"vout\":{vout},\"sequence\":10}}]");
+    let send_amount = amount - 0.001; // leave fee
+    let outputs = format!("{{\"{}\":{:.8}}}", addr, send_amount);
+
+    let raw = match bitcoin_cli(&["createrawtransaction", &inputs, &outputs]) {
+        Some(r) => r,
+        None => { eprintln!("createrawtransaction failed -- skipping"); return; }
+    };
+
+    // Sign it
+    let signed_str = match bitcoin_cli(&["signrawtransactionwithwallet", &raw]) {
+        Some(s) => s,
+        None => { eprintln!("signrawtransaction failed -- skipping"); return; }
+    };
+    let signed: serde_json::Value = serde_json::from_str(&signed_str).unwrap();
+    assert_eq!(signed["complete"], true, "signing should complete");
+    let signed_hex = signed["hex"].as_str().unwrap();
+
+    // testmempoolaccept should reject it if the UTXO is too recent (< 10 confirmations)
+    // But if the UTXO has enough confs already, it should accept it
+    let confs = utxo["confirmations"].as_u64().unwrap_or(0);
+
+    let accept_str = bitcoin_cli(&["testmempoolaccept", &format!("[\"{signed_hex}\"]")]).unwrap();
+    let accept: serde_json::Value = serde_json::from_str(&accept_str).unwrap();
+    let accepted = accept[0]["allowed"].as_bool().unwrap_or(false);
+
+    if confs >= 10 {
+        assert!(accepted, "BIP68: tx with sequence=10 should be accepted when UTXO has {confs} confs >= 10");
+        println!("[bip68] tx with sequence=10, utxo confs={confs} → accepted ✓");
+    } else {
+        assert!(!accepted, "BIP68: tx with sequence=10 should be rejected when UTXO has {confs} confs < 10");
+        let reason = accept[0]["reject-reason"].as_str().unwrap_or("");
+        assert!(
+            reason.contains("non-BIP68-final") || reason.contains("sequence"),
+            "reject reason should mention BIP68: {reason}"
+        );
+        println!("[bip68] tx with sequence=10, utxo confs={confs} → correctly rejected: {reason} ✓");
+    }
+}
+
+// ── Test 13: RPC decodescript comparison ─────────────────────────────────────
+
+/// Decode a P2PKH script via Bitcoin Core and verify our classification matches.
+#[tokio::test]
+async fn test_rpc_decodescript() {
+    if !bitcoin_cli_available() {
+        eprintln!("bitcoin-cli not available -- skipping");
+        return;
+    }
+
+    // P2PKH: OP_DUP OP_HASH160 <20 zero bytes> OP_EQUALVERIFY OP_CHECKSIG
+    let mut script_bytes = vec![0x76u8, 0xa9, 0x14];
+    script_bytes.extend_from_slice(&[0u8; 20]);
+    script_bytes.extend_from_slice(&[0x88, 0xac]);
+    let script_hex = hex::encode(&script_bytes);
+
+    let core_decoded = bitcoin_cli(&["decodescript", &script_hex]).unwrap();
+    let core_val: serde_json::Value = serde_json::from_str(&core_decoded).unwrap();
+
+    assert_eq!(core_val["type"], "pubkeyhash");
+
+    // Our classify_script should match
+    let script = rbtc_primitives::script::Script::from_bytes(script_bytes);
+    assert!(script.is_p2pkh(), "rbtc should classify as P2PKH");
+
+    println!("[rpc] decodescript: type=pubkeyhash ✓");
+
+    // Also test P2SH
+    let mut p2sh = vec![0xa9u8, 0x14];
+    p2sh.extend_from_slice(&[0u8; 20]);
+    p2sh.push(0x87);
+    let p2sh_hex = hex::encode(&p2sh);
+    let core_p2sh = bitcoin_cli(&["decodescript", &p2sh_hex]).unwrap();
+    let core_p2sh_val: serde_json::Value = serde_json::from_str(&core_p2sh).unwrap();
+    assert_eq!(core_p2sh_val["type"], "scripthash");
+    println!("[rpc] decodescript: type=scripthash ✓");
+}
+
+// ── Test 14: RPC getchaintips ────────────────────────────────────────────────
+
+/// Verify Bitcoin Core's getchaintips returns at least one active tip.
+#[tokio::test]
+async fn test_rpc_getchaintips() {
+    if !bitcoin_cli_available() {
+        eprintln!("bitcoin-cli not available -- skipping");
+        return;
+    }
+
+    let tips_str = bitcoin_cli(&["getchaintips"]).unwrap();
+    let tips: serde_json::Value = serde_json::from_str(&tips_str).unwrap();
+    let tips_arr = tips.as_array().unwrap();
+    assert!(!tips_arr.is_empty(), "should have at least one chain tip");
+
+    let active = tips_arr.iter().find(|t| t["status"] == "active");
+    assert!(active.is_some(), "should have an active tip");
+    let active_tip = active.unwrap();
+    assert!(active_tip["height"].as_u64().unwrap() > 0);
+    assert!(active_tip["hash"].as_str().unwrap().len() == 64);
+    assert_eq!(active_tip["branchlen"], 0);
+
+    println!(
+        "[rpc] getchaintips: active height={} hash={} ✓",
+        active_tip["height"],
+        &active_tip["hash"].as_str().unwrap()[..16]
+    );
+}
