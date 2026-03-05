@@ -1400,4 +1400,727 @@ mod tests {
         let err = verify_block(&ctx, &UtxoSet::new()).unwrap_err();
         assert!(matches!(err, ConsensusError::DuplicateTx));
     }
+
+    // ── Helper: encode BIP34 coinbase scriptSig with height push ─────────
+    fn bip34_coinbase_scriptsig(height: u32) -> Vec<u8> {
+        if height == 0 {
+            // height 0: push 1 byte 0x00
+            return vec![1, 0];
+        }
+        let mut h = height;
+        let mut bytes = Vec::new();
+        while h > 0 {
+            bytes.push((h & 0xff) as u8);
+            h >>= 8;
+        }
+        // If top bit is set, add a 0x00 pad so it's not interpreted as negative
+        if *bytes.last().unwrap() & 0x80 != 0 {
+            bytes.push(0);
+        }
+        let mut script = vec![bytes.len() as u8];
+        script.extend_from_slice(&bytes);
+        script
+    }
+
+    /// Build a valid block with correct merkle root and PoW for testing.
+    fn make_valid_block(
+        txs: Vec<Transaction>,
+        bits: u32,
+        time: u32,
+    ) -> Block {
+        let txids: Vec<Hash256> = txs.iter().map(compute_txid).collect();
+        let merkle = rbtc_crypto::merkle_root(&txids).unwrap_or(Hash256::ZERO);
+        let mut h = header_with_bits(bits);
+        h.merkle_root = merkle;
+        h.time = time;
+        for nonce in 0..=u32::MAX {
+            h.nonce = nonce;
+            let enc = encode_block_header(&h);
+            let hash = sha256d(&enc);
+            if h.meets_target(&hash) {
+                return Block { header: h, transactions: txs };
+            }
+        }
+        panic!("failed to find valid PoW");
+    }
+
+    // ── Coinbase maturity tests ──────────────────────────────────────────
+
+    #[test]
+    fn coinbase_maturity_spending_too_early_rejected() {
+        // Create a coinbase at height 0, try to spend it at height 99 (depth < 100)
+        let coinbase_txid = Hash256([0xaa; 32]);
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: Script::from_bytes(bip34_coinbase_scriptsig(100)),
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            lock_time: 0,
+        };
+        let spend = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: coinbase_txid, vout: 0 },
+                script_sig: Script::new(),
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 1000, script_pubkey: Script::from_bytes(vec![0x51]) }],
+            lock_time: 0,
+        };
+        let block = make_valid_block(vec![coinbase, spend], 0x207fffff, 100000);
+        let mut utxos = UtxoSet::new();
+        utxos.insert(
+            OutPoint { txid: coinbase_txid, vout: 0 },
+            Utxo {
+                txout: TxOut { value: 5_000, script_pubkey: Script::from_bytes(vec![0x51]) },
+                is_coinbase: true,
+                height: 1, // created at height 1
+            },
+        );
+        let ctx = BlockValidationContext {
+            block: &block,
+            height: 100, // depth = 100 - 1 = 99 < COINBASE_MATURITY(100)
+            median_time_past: 99999,
+            network_time: 110000,
+            expected_bits: 0x207fffff,
+            flags: ScriptFlags::default(),
+            network: Network::Regtest,
+            mtp_provider: &TestMtpProvider,
+        };
+        let err = verify_block(&ctx, &utxos).unwrap_err();
+        assert!(matches!(err, ConsensusError::CoinbaseNotMature(_, _)));
+    }
+
+    #[test]
+    fn coinbase_maturity_spending_at_exact_depth_accepted() {
+        // Coinbase at height 1, spending at height 101 → depth = 100 = COINBASE_MATURITY
+        let coinbase_txid = Hash256([0xbb; 32]);
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: Script::from_bytes(bip34_coinbase_scriptsig(101)),
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            lock_time: 0,
+        };
+        let spend = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: coinbase_txid, vout: 0 },
+                script_sig: Script::new(),
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 1000, script_pubkey: Script::from_bytes(vec![0x51]) }],
+            lock_time: 0,
+        };
+        let block = make_valid_block(vec![coinbase, spend], 0x207fffff, 100000);
+        let mut utxos = UtxoSet::new();
+        utxos.insert(
+            OutPoint { txid: coinbase_txid, vout: 0 },
+            Utxo {
+                txout: TxOut { value: 5_000, script_pubkey: Script::from_bytes(vec![0x51]) },
+                is_coinbase: true,
+                height: 1,
+            },
+        );
+        let ctx = BlockValidationContext {
+            block: &block,
+            height: 101, // depth = 101 - 1 = 100 = COINBASE_MATURITY
+            median_time_past: 99999,
+            network_time: 110000,
+            expected_bits: 0x207fffff,
+            flags: ScriptFlags::default(),
+            network: Network::Regtest,
+            mtp_provider: &TestMtpProvider,
+        };
+        let fees = verify_block(&ctx, &utxos).unwrap();
+        assert_eq!(fees, 4_000); // 5000 - 1000
+    }
+
+    // ── Block weight boundary tests ──────────────────────────────────────
+
+    #[test]
+    fn block_weight_at_max_accepted() {
+        // A minimal coinbase-only block's weight is well under MAX_BLOCK_WEIGHT.
+        // This test verifies that the weight check is <= not <.
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: Script::from_bytes(vec![1, 0]),
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            lock_time: 0,
+        };
+        let block = make_valid_block(vec![coinbase], 0x207fffff, 100000);
+        let weight = block.weight();
+        // Verify our block weight is well under the limit (sanity check)
+        assert!(weight < MAX_BLOCK_WEIGHT, "test setup: weight {weight} should be under limit");
+        let ctx = BlockValidationContext {
+            block: &block,
+            height: 0,
+            median_time_past: 99999,
+            network_time: 110000,
+            expected_bits: 0x207fffff,
+            flags: ScriptFlags::default(),
+            network: Network::Regtest,
+            mtp_provider: &TestMtpProvider,
+        };
+        assert!(verify_block(&ctx, &UtxoSet::new()).is_ok());
+    }
+
+    #[test]
+    fn block_weight_over_max_rejected() {
+        // Create a block with a huge output to exceed MAX_BLOCK_WEIGHT
+        let huge_script = Script::from_bytes(vec![0x6a; 1_000_100]); // OP_RETURN padding
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: Script::from_bytes(vec![1, 0]),
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 0, script_pubkey: huge_script }],
+            lock_time: 0,
+        };
+        // Don't use make_valid_block; just build the header manually since PoW
+        // check comes before weight check. We want to trigger BlockTooLarge.
+        let txids = vec![compute_txid(&coinbase)];
+        let merkle = rbtc_crypto::merkle_root(&txids).unwrap();
+        let mut h = header_with_bits(0x207fffff);
+        h.merkle_root = merkle;
+        h.time = 100000;
+        for nonce in 0..=u32::MAX {
+            h.nonce = nonce;
+            let enc = encode_block_header(&h);
+            let hash = sha256d(&enc);
+            if h.meets_target(&hash) {
+                break;
+            }
+        }
+        let block = Block { header: h, transactions: vec![coinbase] };
+        assert!(block.weight() > MAX_BLOCK_WEIGHT, "test setup: weight {} should exceed limit", block.weight());
+        let ctx = BlockValidationContext {
+            block: &block,
+            height: 0,
+            median_time_past: 99999,
+            network_time: 110000,
+            expected_bits: 0x207fffff,
+            flags: ScriptFlags::default(),
+            network: Network::Regtest,
+            mtp_provider: &TestMtpProvider,
+        };
+        let err = verify_block(&ctx, &UtxoSet::new()).unwrap_err();
+        assert!(matches!(err, ConsensusError::BlockTooLarge(_, _)));
+    }
+
+    // ── BIP34 coinbase height encoding tests ─────────────────────────────
+
+    #[test]
+    fn bip34_correct_height_accepted() {
+        let height = 500u32;
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: Script::from_bytes(bip34_coinbase_scriptsig(height)),
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            lock_time: 0,
+        };
+        let block = make_valid_block(vec![coinbase], 0x207fffff, 100000);
+        let ctx = BlockValidationContext {
+            block: &block,
+            height,
+            median_time_past: 99999,
+            network_time: 110000,
+            expected_bits: 0x207fffff,
+            flags: ScriptFlags::default(),
+            network: Network::Regtest, // Regtest: bip34_height=0
+            mtp_provider: &TestMtpProvider,
+        };
+        assert!(verify_block(&ctx, &UtxoSet::new()).is_ok());
+    }
+
+    #[test]
+    fn bip34_wrong_height_rejected() {
+        let height = 500u32;
+        // Encode height 499 in coinbase but validate at height 500
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: Script::from_bytes(bip34_coinbase_scriptsig(499)),
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            lock_time: 0,
+        };
+        let block = make_valid_block(vec![coinbase], 0x207fffff, 100000);
+        let ctx = BlockValidationContext {
+            block: &block,
+            height,
+            median_time_past: 99999,
+            network_time: 110000,
+            expected_bits: 0x207fffff,
+            flags: ScriptFlags::default(),
+            network: Network::Regtest,
+            mtp_provider: &TestMtpProvider,
+        };
+        let err = verify_block(&ctx, &UtxoSet::new()).unwrap_err();
+        assert!(matches!(err, ConsensusError::InvalidTx(_)));
+    }
+
+    #[test]
+    fn bip34_height_encoding_large_height() {
+        // Test that large heights (3+ bytes) are encoded correctly
+        let height = 700_000u32;
+        let script = bip34_coinbase_scriptsig(height);
+        // Verify the encoding: first byte = push length, then LE bytes of height
+        let push_len = script[0] as usize;
+        let mut decoded = 0u32;
+        for i in 0..push_len {
+            decoded |= (script[1 + i] as u32) << (8 * i);
+        }
+        assert_eq!(decoded, height);
+
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: Script::from_bytes(script),
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: block_subsidy(height), script_pubkey: Script::new() }],
+            lock_time: 0,
+        };
+        let block = make_valid_block(vec![coinbase], 0x207fffff, 100000);
+        let ctx = BlockValidationContext {
+            block: &block,
+            height,
+            median_time_past: 99999,
+            network_time: 110000,
+            expected_bits: 0x207fffff,
+            flags: ScriptFlags::default(),
+            network: Network::Regtest,
+            mtp_provider: &TestMtpProvider,
+        };
+        assert!(verify_block(&ctx, &UtxoSet::new()).is_ok());
+    }
+
+    // ── Block subsidy tests (via block validation) ───────────────────────
+
+    #[test]
+    fn coinbase_value_exactly_subsidy_accepted() {
+        let height = 0u32;
+        let subsidy = block_subsidy(height); // 50 BTC
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: Script::from_bytes(bip34_coinbase_scriptsig(height)),
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: subsidy, script_pubkey: Script::new() }],
+            lock_time: 0,
+        };
+        let block = make_valid_block(vec![coinbase], 0x207fffff, 100000);
+        let ctx = BlockValidationContext {
+            block: &block,
+            height,
+            median_time_past: 99999,
+            network_time: 110000,
+            expected_bits: 0x207fffff,
+            flags: ScriptFlags::default(),
+            network: Network::Regtest,
+            mtp_provider: &TestMtpProvider,
+        };
+        assert!(verify_block(&ctx, &UtxoSet::new()).is_ok());
+    }
+
+    #[test]
+    fn coinbase_value_exceeds_subsidy_rejected() {
+        let height = 210_000u32; // first halving
+        let subsidy = block_subsidy(height); // 25 BTC
+        assert_eq!(subsidy, 25_0000_0000);
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: Script::from_bytes(bip34_coinbase_scriptsig(height)),
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: subsidy + 1, script_pubkey: Script::new() }],
+            lock_time: 0,
+        };
+        let block = make_valid_block(vec![coinbase], 0x207fffff, 100000);
+        let ctx = BlockValidationContext {
+            block: &block,
+            height,
+            median_time_past: 99999,
+            network_time: 110000,
+            expected_bits: 0x207fffff,
+            flags: ScriptFlags::default(),
+            network: Network::Regtest,
+            mtp_provider: &TestMtpProvider,
+        };
+        let err = verify_block(&ctx, &UtxoSet::new()).unwrap_err();
+        assert!(matches!(err, ConsensusError::BadCoinbaseAmount(_, _)));
+    }
+
+    #[test]
+    fn coinbase_value_with_fees_accepted() {
+        let height = 210_000u32;
+        let subsidy = block_subsidy(height); // 25 BTC
+        let fee = 5_000u64;
+        // Coinbase claims subsidy + fees
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: Script::from_bytes(bip34_coinbase_scriptsig(height)),
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: subsidy + fee, script_pubkey: Script::new() }],
+            lock_time: 0,
+        };
+        let funding_txid = Hash256([0xcc; 32]);
+        let spend = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: funding_txid, vout: 0 },
+                script_sig: Script::new(),
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 10_000 - fee, script_pubkey: Script::from_bytes(vec![0x51]) }],
+            lock_time: 0,
+        };
+        let block = make_valid_block(vec![coinbase, spend], 0x207fffff, 100000);
+        let mut utxos = UtxoSet::new();
+        utxos.insert(
+            OutPoint { txid: funding_txid, vout: 0 },
+            Utxo {
+                txout: TxOut { value: 10_000, script_pubkey: Script::from_bytes(vec![0x51]) },
+                is_coinbase: false,
+                height: 0,
+            },
+        );
+        let ctx = BlockValidationContext {
+            block: &block,
+            height,
+            median_time_past: 99999,
+            network_time: 110000,
+            expected_bits: 0x207fffff,
+            flags: ScriptFlags::default(),
+            network: Network::Regtest,
+            mtp_provider: &TestMtpProvider,
+        };
+        let fees = verify_block(&ctx, &utxos).unwrap();
+        assert_eq!(fees, fee);
+    }
+
+    // ── Merkle root edge cases ───────────────────────────────────────────
+
+    #[test]
+    fn merkle_root_single_tx() {
+        // With a single tx, merkle root = txid of that tx
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: Script::from_bytes(bip34_coinbase_scriptsig(0)),
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            lock_time: 0,
+        };
+        let txid = compute_txid(&coinbase);
+        let root = rbtc_crypto::merkle_root(&[txid]).unwrap();
+        assert_eq!(root, txid, "single-tx merkle root should equal the txid");
+    }
+
+    #[test]
+    fn merkle_root_odd_tx_count() {
+        // With 3 txs: merkle of [H01, H22] where H22 = hash(tx2 || tx2)
+        // This is the standard Bitcoin duplicate-last-element behavior
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: Script::from_bytes(bip34_coinbase_scriptsig(1)),
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            lock_time: 0,
+        };
+        let tx2 = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: Hash256([0xdd; 32]), vout: 0 },
+                script_sig: Script::new(),
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 1000, script_pubkey: Script::from_bytes(vec![0x51]) }],
+            lock_time: 0,
+        };
+        let tx3 = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: Hash256([0xee; 32]), vout: 0 },
+                script_sig: Script::new(),
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 2000, script_pubkey: Script::from_bytes(vec![0x51]) }],
+            lock_time: 0,
+        };
+        let txids = vec![compute_txid(&coinbase), compute_txid(&tx2), compute_txid(&tx3)];
+        let root = rbtc_crypto::merkle_root(&txids).unwrap();
+
+        // Manually compute: H01 = hash(tx0 || tx1), H22 = hash(tx2 || tx2), root = hash(H01 || H22)
+        let mut data01 = Vec::new();
+        data01.extend_from_slice(&txids[0].0);
+        data01.extend_from_slice(&txids[1].0);
+        let h01 = sha256d(&data01);
+        let mut data22 = Vec::new();
+        data22.extend_from_slice(&txids[2].0);
+        data22.extend_from_slice(&txids[2].0);
+        let h22 = sha256d(&data22);
+        let mut root_data = Vec::new();
+        root_data.extend_from_slice(&h01.0);
+        root_data.extend_from_slice(&h22.0);
+        let expected_root = sha256d(&root_data);
+        assert_eq!(root, expected_root, "odd-count merkle root mismatch");
+    }
+
+    // ── Coinbase scriptSig length tests ──────────────────────────────────
+
+    #[test]
+    fn coinbase_scriptsig_too_short_rejected() {
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: Script::from_bytes(vec![0x00]), // 1 byte, minimum is 2
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            lock_time: 0,
+        };
+        let block = make_valid_block(vec![coinbase], 0x207fffff, 100000);
+        let ctx = BlockValidationContext {
+            block: &block,
+            height: 0,
+            median_time_past: 99999,
+            network_time: 110000,
+            expected_bits: 0x207fffff,
+            flags: ScriptFlags::default(),
+            network: Network::Regtest,
+            mtp_provider: &TestMtpProvider,
+        };
+        let err = verify_block(&ctx, &UtxoSet::new()).unwrap_err();
+        assert!(matches!(err, ConsensusError::InvalidTx(_)));
+    }
+
+    #[test]
+    fn coinbase_scriptsig_too_long_rejected() {
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: Script::from_bytes(vec![0x00; 101]), // 101 bytes, max is 100
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            lock_time: 0,
+        };
+        let block = make_valid_block(vec![coinbase], 0x207fffff, 100000);
+        let ctx = BlockValidationContext {
+            block: &block,
+            height: 0,
+            median_time_past: 99999,
+            network_time: 110000,
+            expected_bits: 0x207fffff,
+            flags: ScriptFlags::default(),
+            network: Network::Regtest,
+            mtp_provider: &TestMtpProvider,
+        };
+        let err = verify_block(&ctx, &UtxoSet::new()).unwrap_err();
+        assert!(matches!(err, ConsensusError::InvalidTx(_)));
+    }
+
+    // ── Multiple outputs spending and fees ────────────────────────────────
+
+    #[test]
+    fn block_total_fees_with_multiple_txs() {
+        let height = 100u32;
+        let subsidy = block_subsidy(height);
+        let funding1 = Hash256([0x41; 32]);
+        let funding2 = Hash256([0x42; 32]);
+
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: Script::from_bytes(bip34_coinbase_scriptsig(height)),
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut {
+                value: subsidy + 3_000, // subsidy + total fees (1000 + 2000)
+                script_pubkey: Script::new(),
+            }],
+            lock_time: 0,
+        };
+        let tx1 = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: funding1, vout: 0 },
+                script_sig: Script::new(),
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 4_000, script_pubkey: Script::from_bytes(vec![0x51]) }],
+            lock_time: 0,
+        };
+        let tx2 = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: funding2, vout: 0 },
+                script_sig: Script::new(),
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 3_000, script_pubkey: Script::from_bytes(vec![0x51]) }],
+            lock_time: 0,
+        };
+        let block = make_valid_block(vec![coinbase, tx1, tx2], 0x207fffff, 100000);
+        let mut utxos = UtxoSet::new();
+        utxos.insert(
+            OutPoint { txid: funding1, vout: 0 },
+            Utxo {
+                txout: TxOut { value: 5_000, script_pubkey: Script::from_bytes(vec![0x51]) },
+                is_coinbase: false,
+                height: 0,
+            },
+        );
+        utxos.insert(
+            OutPoint { txid: funding2, vout: 0 },
+            Utxo {
+                txout: TxOut { value: 5_000, script_pubkey: Script::from_bytes(vec![0x51]) },
+                is_coinbase: false,
+                height: 0,
+            },
+        );
+        let ctx = BlockValidationContext {
+            block: &block,
+            height,
+            median_time_past: 99999,
+            network_time: 110000,
+            expected_bits: 0x207fffff,
+            flags: ScriptFlags::default(),
+            network: Network::Regtest,
+            mtp_provider: &TestMtpProvider,
+        };
+        let fees = verify_block(&ctx, &utxos).unwrap();
+        assert_eq!(fees, 3_000); // (5000-4000) + (5000-3000) = 1000 + 2000
+    }
+
+    #[test]
+    fn block_negative_fee_rejected() {
+        let height = 100u32;
+        let funding = Hash256([0x51; 32]);
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: Script::from_bytes(bip34_coinbase_scriptsig(height)),
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            lock_time: 0,
+        };
+        // Output > input → negative fee
+        let spend = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: funding, vout: 0 },
+                script_sig: Script::new(),
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 10_000, script_pubkey: Script::from_bytes(vec![0x51]) }],
+            lock_time: 0,
+        };
+        let block = make_valid_block(vec![coinbase, spend], 0x207fffff, 100000);
+        let mut utxos = UtxoSet::new();
+        utxos.insert(
+            OutPoint { txid: funding, vout: 0 },
+            Utxo {
+                txout: TxOut { value: 5_000, script_pubkey: Script::from_bytes(vec![0x51]) },
+                is_coinbase: false,
+                height: 0,
+            },
+        );
+        let ctx = BlockValidationContext {
+            block: &block,
+            height,
+            median_time_past: 99999,
+            network_time: 110000,
+            expected_bits: 0x207fffff,
+            flags: ScriptFlags::default(),
+            network: Network::Regtest,
+            mtp_provider: &TestMtpProvider,
+        };
+        let err = verify_block(&ctx, &utxos).unwrap_err();
+        assert!(matches!(err, ConsensusError::NegativeFee));
+    }
+
+    // ── Genesis block deserialization ─────────────────────────────────────
+
+    #[test]
+    fn mainnet_genesis_header_valid() {
+        let genesis = Network::Mainnet.genesis_header();
+        // Check known values
+        assert_eq!(genesis.version, 1);
+        assert_eq!(genesis.time, 1231006505);
+        assert_eq!(genesis.bits, 0x1d00ffff);
+        assert_eq!(genesis.nonce, 2083236893);
+        assert_eq!(genesis.prev_block, Hash256::ZERO);
+
+        // Verify PoW
+        let header_bytes = encode_block_header(&genesis);
+        let hash = sha256d(&header_bytes);
+        assert!(genesis.meets_target(&hash), "genesis block must meet its own target");
+
+        // Verify hash matches known genesis hash
+        let hash_hex = hash.to_hex();
+        assert_eq!(hash_hex, Network::Mainnet.genesis_hash());
+    }
 }

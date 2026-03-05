@@ -166,7 +166,11 @@ pub fn p2wpkh_script_code(pubkey: &PublicKey) -> Script {
 pub fn address_to_script(address: &str) -> Result<Script, WalletError> {
     // Try bech32 / bech32m first
     if let Ok((hrp, version, program)) = segwit::decode(address) {
-        let _ = hrp;
+        // Validate HRP against known Bitcoin networks
+        let hrp_str = hrp.as_str();
+        if hrp_str != "bc" && hrp_str != "tb" && hrp_str != "bcrt" {
+            return Err(WalletError::InvalidAddress(address.to_string()));
+        }
         let v = version.to_u8();
         let mut s = Vec::with_capacity(2 + program.len());
         s.push(if v == 0 { 0x00 } else { 0x50 + v }); // OP_0 or OP_N
@@ -177,7 +181,7 @@ pub fn address_to_script(address: &str) -> Result<Script, WalletError> {
 
     // Try Base58Check (P2PKH / P2SH)
     if let Ok(decoded) = bs58::decode(address).with_check(None).into_vec() {
-        if decoded.len() < 21 {
+        if decoded.len() != 21 {
             return Err(WalletError::InvalidAddress(address.to_string()));
         }
         let version = decoded[0];

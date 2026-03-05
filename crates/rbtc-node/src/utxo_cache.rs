@@ -51,6 +51,13 @@ pub struct CachedUtxoSet {
     hot_bytes: u64,
 }
 
+/// Staged dirty-layer changes prepared for a RocksDB batch commit.
+/// Apply with `commit_flush_plan` only after the batch is written successfully.
+pub struct DirtyFlushPlan {
+    to_add: Vec<(OutPoint, Utxo)>,
+    to_remove: Vec<OutPoint>,
+}
+
 impl CachedUtxoSet {
     /// Create a new cache backed by `db`.  Pass `None` for unlimited memory.
     pub fn new(db: Arc<Database>, max_bytes: Option<u64>) -> Self {
@@ -179,35 +186,60 @@ impl CachedUtxoSet {
         }
     }
 
-    /// Write all dirty entries into `batch` (which the caller will atomically commit)
-    /// and promote live entries to the hot cache.  Clears the dirty layer.
+    /// Stage dirty entries into `batch` (caller commits atomically later).
+    /// Does NOT mutate cache state; call `commit_flush_plan` after successful DB write.
+    pub fn prepare_flush_dirty(
+        &self,
+        batch: &mut WriteBatch,
+    ) -> std::result::Result<DirtyFlushPlan, rbtc_storage::StorageError> {
+        let store = UtxoStore::new(&self.db);
+        let mut to_add_stored: Vec<(OutPoint, StoredUtxo)> = Vec::new();
+        let mut to_add_live: Vec<(OutPoint, Utxo)> = Vec::new();
+        let mut to_remove: Vec<OutPoint> = Vec::new();
+
+        for (op, maybe_utxo) in &self.dirty {
+            match maybe_utxo {
+                Some(utxo) => {
+                    to_add_stored.push((op.clone(), utxo_to_stored(utxo)));
+                    to_add_live.push((op.clone(), utxo.clone()));
+                }
+                None => to_remove.push(op.clone()),
+            }
+        }
+
+        store.fill_batch(batch, &to_add_stored, &to_remove)?;
+        Ok(DirtyFlushPlan {
+            to_add: to_add_live,
+            to_remove,
+        })
+    }
+
+    /// Apply a previously prepared flush plan after DB batch write succeeded.
+    pub fn commit_flush_plan(&mut self, plan: DirtyFlushPlan) {
+        for op in plan.to_remove {
+            self.dirty.remove(&op);
+            if self.hot.remove(&op).is_some() {
+                self.hot_bytes = self.hot_bytes.saturating_sub(BYTES_PER_UTXO);
+            }
+        }
+
+        for (op, utxo) in plan.to_add {
+            self.dirty.remove(&op);
+            if !self.hot.contains_key(&op) {
+                self.hot_bytes += BYTES_PER_UTXO;
+            }
+            self.hot.insert(op, utxo);
+        }
+    }
+
+    /// Legacy helper used by unit tests: stage + immediately commit in-memory.
+    /// Production block connection should use prepare/commit around DB write.
     pub fn flush_dirty(
         &mut self,
         batch: &mut WriteBatch,
     ) -> std::result::Result<(), rbtc_storage::StorageError> {
-        let store = UtxoStore::new(&self.db);
-        let mut to_add: Vec<(OutPoint, StoredUtxo)> = Vec::new();
-        let mut to_remove: Vec<OutPoint> = Vec::new();
-
-        for (op, maybe_utxo) in self.dirty.drain() {
-            match maybe_utxo {
-                Some(utxo) => {
-                    if !self.hot.contains_key(&op) {
-                        self.hot_bytes += BYTES_PER_UTXO;
-                    }
-                    self.hot.insert(op.clone(), utxo.clone());
-                    to_add.push((op, utxo_to_stored(&utxo)));
-                }
-                None => {
-                    if self.hot.remove(&op).is_some() {
-                        self.hot_bytes = self.hot_bytes.saturating_sub(BYTES_PER_UTXO);
-                    }
-                    to_remove.push(op);
-                }
-            }
-        }
-
-        store.fill_batch(batch, &to_add, &to_remove)?;
+        let plan = self.prepare_flush_dirty(batch)?;
+        self.commit_flush_plan(plan);
         Ok(())
     }
 

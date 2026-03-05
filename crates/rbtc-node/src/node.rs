@@ -19,7 +19,6 @@ use rbtc_net::{
 };
 use rbtc_primitives::hash::Hash256;
 use rbtc_primitives::codec::Encodable;
-use rbtc_primitives::transaction::OutPoint;
 use rbtc_storage::{
     encode_block_undo, decode_block_undo, AddrIndexStore, BlockStore, ChainStore, Database,
     PeerStore, StoredBlockIndex, StoredUtxo, TxIndexStore, UtxoStore,
@@ -1566,13 +1565,14 @@ impl Node {
                         &encode_block_undo(&undo_stored),
                     )?;
 
-                    // Write dirty UTXO changes and promote them to the hot cache.
-                    self.utxo_cache.flush_dirty(&mut batch)?;
+                    // Stage dirty UTXO changes into the same atomic batch.
+                    let utxo_flush_plan = self.utxo_cache.prepare_flush_dirty(&mut batch)?;
 
                     let chain_store = ChainStore::new(&self.db);
                     chain_store.update_tip_batch(&mut batch, &block_hash, height, chainwork)?;
 
                     self.db.write_batch(batch)?;
+                    self.utxo_cache.commit_flush_plan(utxo_flush_plan);
 
                     // Evicting every block can be expensive at high heights; throttle it.
                     self.blocks_since_utxo_evict = self.blocks_since_utxo_evict.saturating_add(1);
@@ -1646,32 +1646,6 @@ impl Node {
                 );
             }
             Err(e) => {
-                // Core-style fail-fast: if validation reports MissingUtxo but the
-                // coin is actually present in chainstate DB, this is an internal
-                // consistency bug (view/cache mismatch), not a bad peer block.
-                if let rbtc_consensus::ConsensusError::MissingUtxo(txid_hex, vout) = &e {
-                    let txid = Hash256::from_hex(txid_hex)
-                        .map_err(|_| anyhow!("invalid txid in MissingUtxo error: {txid_hex}"))?;
-                    let outpoint = OutPoint { txid, vout: *vout };
-                    match UtxoStore::new(&self.db).get(&outpoint) {
-                        Ok(Some(_)) => {
-                            return Err(anyhow!(
-                                "fatal chainstate inconsistency: validator reported missing {}:{}, but RocksDB has it; refusing to continue",
-                                txid_hex,
-                                vout
-                            ));
-                        }
-                        Ok(None) => {}
-                        Err(db_err) => {
-                            return Err(anyhow!(
-                                "fatal UTXO DB read error while checking MissingUtxo {}:{}: {}",
-                                txid_hex,
-                                vout,
-                                db_err
-                            ));
-                        }
-                    }
-                }
                 warn!("block {} rejected from peer {peer_id}: {e}", block_hash.to_hex());
             }
         }
@@ -1974,7 +1948,7 @@ impl Node {
             }
 
             let mut batch = self.db.new_batch();
-            self.utxo_cache.flush_dirty(&mut batch)?;
+            let utxo_flush_plan = self.utxo_cache.prepare_flush_dirty(&mut batch)?;
             for (offset, (tx, txid)) in block.transactions.iter().zip(txids.iter()).enumerate() {
                 tx_idx.batch_remove(&mut batch, txid)?;
                 for output in &tx.outputs {
@@ -1988,6 +1962,7 @@ impl Node {
             }
             chain_store.update_tip_batch(&mut batch, &new_best_tip, new_best_height, new_best_work)?;
             self.db.write_batch(batch)?;
+            self.utxo_cache.commit_flush_plan(utxo_flush_plan);
         }
 
         // Connect new chain (forward order)
