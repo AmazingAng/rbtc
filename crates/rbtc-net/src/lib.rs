@@ -4,7 +4,7 @@ pub mod peer_manager;
 pub mod compact;
 pub mod error;
 
-pub use message::{Message, NetworkMessage, Inventory, InvType};
+pub use message::{Message, NetworkMessage, Inventory, InvType, Addrv2Message, Addrv2Entry, Addrv2NetId};
 pub use peer::{Peer, PeerState};
 pub use peer_manager::{PeerManager, PeerManagerConfig};
 pub use compact::{CompactBlock, GetBlockTxn, BlockTxn, short_txid, reconstruct_block};

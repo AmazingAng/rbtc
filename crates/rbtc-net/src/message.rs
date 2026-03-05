@@ -337,6 +337,98 @@ pub struct AddrMessage {
     pub addrs: Vec<(u32, u64, [u8; 16], u16)>, // (timestamp, services, ip, port)
 }
 
+// ── BIP155: addrv2 ──────────────────────────────────────────────────────────
+
+/// BIP155 network ID for addrv2
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Addrv2NetId {
+    Ipv4 = 1,
+    Ipv6 = 2,
+    TorV2 = 3,   // deprecated
+    TorV3 = 4,
+    I2p   = 5,
+    Cjdns = 6,
+}
+
+impl Addrv2NetId {
+    pub fn from_u8(n: u8) -> Option<Self> {
+        match n {
+            1 => Some(Self::Ipv4),
+            2 => Some(Self::Ipv6),
+            3 => Some(Self::TorV2),
+            4 => Some(Self::TorV3),
+            5 => Some(Self::I2p),
+            6 => Some(Self::Cjdns),
+            _ => None,
+        }
+    }
+
+    /// Expected address length for this network type.
+    pub fn addr_len(&self) -> Option<usize> {
+        match self {
+            Self::Ipv4  => Some(4),
+            Self::Ipv6  => Some(16),
+            Self::TorV2 => Some(10),
+            Self::TorV3 => Some(32),
+            Self::I2p   => Some(32),
+            Self::Cjdns => Some(16),
+        }
+    }
+}
+
+/// A single address entry in a BIP155 addrv2 message.
+#[derive(Debug, Clone)]
+pub struct Addrv2Entry {
+    pub timestamp: u32,
+    pub services: u64,  // CompactSize-encoded in wire format
+    pub net_id: u8,
+    pub addr: Vec<u8>,
+    pub port: u16,
+}
+
+/// BIP155 addrv2 message
+#[derive(Debug, Clone)]
+pub struct Addrv2Message {
+    pub addrs: Vec<Addrv2Entry>,
+}
+
+impl Addrv2Message {
+    fn encode_payload(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        VarInt(self.addrs.len() as u64).encode(&mut buf).ok();
+        for entry in &self.addrs {
+            entry.timestamp.encode(&mut buf).ok();
+            VarInt(entry.services).encode(&mut buf).ok();
+            buf.push(entry.net_id);
+            VarInt(entry.addr.len() as u64).encode(&mut buf).ok();
+            buf.extend_from_slice(&entry.addr);
+            buf.extend_from_slice(&entry.port.to_be_bytes());
+        }
+        buf
+    }
+
+    fn decode_payload(data: &[u8]) -> Result<Self> {
+        let mut cur = std::io::Cursor::new(data);
+        let VarInt(count) = VarInt::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
+        let count = count.min(1000) as usize; // BIP155: max 1000 entries
+        let mut addrs = Vec::with_capacity(count);
+        for _ in 0..count {
+            let timestamp = u32::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
+            let VarInt(services) = VarInt::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
+            let net_id = u8::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
+            let VarInt(addr_len) = VarInt::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
+            let mut addr = vec![0u8; addr_len as usize];
+            std::io::Read::read_exact(&mut cur, &mut addr).map_err(|e| NetError::Decode(e.to_string()))?;
+            let mut port_bytes = [0u8; 2];
+            std::io::Read::read_exact(&mut cur, &mut port_bytes).map_err(|e| NetError::Decode(e.to_string()))?;
+            let port = u16::from_be_bytes(port_bytes);
+            addrs.push(Addrv2Entry { timestamp, services, net_id, addr, port });
+        }
+        Ok(Self { addrs })
+    }
+}
+
 /// All supported network message types
 #[derive(Debug, Clone)]
 pub enum NetworkMessage {
@@ -364,6 +456,14 @@ pub enum NetworkMessage {
     BlockTxn(crate::compact::BlockTxn),
     GetAddr,
     Reject { message: String, code: u8, reason: String },
+    /// BIP339: signal wtxid-based tx relay (sent before verack)
+    WtxidRelay,
+    /// BIP155: signal preference for addrv2 messages (sent before verack)
+    SendAddrv2,
+    /// BIP155: extended address message with variable-length network addresses
+    Addrv2(Addrv2Message),
+    /// Request peer to send inv for all txids in its mempool
+    Mempool,
     Unknown { command: String, data: Vec<u8> },
 }
 
@@ -391,6 +491,10 @@ impl NetworkMessage {
             Self::BlockTxn(_) => "blocktxn",
             Self::GetAddr => "getaddr",
             Self::Reject { .. } => "reject",
+            Self::WtxidRelay => "wtxidrelay",
+            Self::SendAddrv2 => "sendaddrv2",
+            Self::Addrv2(_) => "addrv2",
+            Self::Mempool => "mempool",
             Self::Unknown { .. } => "unknown",
         }
     }
@@ -422,6 +526,10 @@ impl NetworkMessage {
             }
             Self::SendHeaders => Vec::new(),
             Self::GetAddr => Vec::new(),
+            Self::WtxidRelay => Vec::new(),
+            Self::SendAddrv2 => Vec::new(),
+            Self::Addrv2(m) => m.encode_payload(),
+            Self::Mempool => Vec::new(),
             Self::FeeFilter(rate) => rate.to_le_bytes().to_vec(),
             Self::SendCmpct(announce, version) => {
                 let mut buf = vec![if *announce { 1u8 } else { 0u8 }];
@@ -494,6 +602,10 @@ impl NetworkMessage {
             }
             "sendheaders" => Self::SendHeaders,
             "getaddr" => Self::GetAddr,
+            "wtxidrelay" => Self::WtxidRelay,
+            "sendaddrv2" => Self::SendAddrv2,
+            "addrv2" => Self::Addrv2(Addrv2Message::decode_payload(data)?),
+            "mempool" => Self::Mempool,
             "feefilter" if data.len() >= 8 => {
                 Self::FeeFilter(u64::from_le_bytes(data[..8].try_into().unwrap()))
             }
@@ -561,5 +673,76 @@ mod tests {
     fn network_message_command() {
         assert_eq!(NetworkMessage::Verack.command(), "verack");
         assert_eq!(NetworkMessage::SendHeaders.command(), "sendheaders");
+        assert_eq!(NetworkMessage::WtxidRelay.command(), "wtxidrelay");
+        assert_eq!(NetworkMessage::SendAddrv2.command(), "sendaddrv2");
+        assert_eq!(NetworkMessage::Mempool.command(), "mempool");
+    }
+
+    #[test]
+    fn wtxidrelay_empty_payload() {
+        let payload = NetworkMessage::WtxidRelay.encode_payload();
+        assert!(payload.is_empty());
+        let decoded = NetworkMessage::decode_payload("wtxidrelay", &[]).unwrap();
+        assert!(matches!(decoded, NetworkMessage::WtxidRelay));
+    }
+
+    #[test]
+    fn sendaddrv2_empty_payload() {
+        let payload = NetworkMessage::SendAddrv2.encode_payload();
+        assert!(payload.is_empty());
+        let decoded = NetworkMessage::decode_payload("sendaddrv2", &[]).unwrap();
+        assert!(matches!(decoded, NetworkMessage::SendAddrv2));
+    }
+
+    #[test]
+    fn mempool_empty_payload() {
+        let payload = NetworkMessage::Mempool.encode_payload();
+        assert!(payload.is_empty());
+        let decoded = NetworkMessage::decode_payload("mempool", &[]).unwrap();
+        assert!(matches!(decoded, NetworkMessage::Mempool));
+    }
+
+    #[test]
+    fn addrv2_roundtrip() {
+        let msg = Addrv2Message {
+            addrs: vec![
+                Addrv2Entry {
+                    timestamp: 1700000000,
+                    services: 1033, // NODE_NETWORK | NODE_WITNESS
+                    net_id: 1,      // IPv4
+                    addr: vec![127, 0, 0, 1],
+                    port: 8333,
+                },
+                Addrv2Entry {
+                    timestamp: 1700000000,
+                    services: 1,
+                    net_id: 4, // TorV3
+                    addr: vec![0xab; 32],
+                    port: 9050,
+                },
+            ],
+        };
+        let payload = msg.encode_payload();
+        let decoded_msg = NetworkMessage::decode_payload("addrv2", &payload).unwrap();
+        match decoded_msg {
+            NetworkMessage::Addrv2(m) => {
+                assert_eq!(m.addrs.len(), 2);
+                assert_eq!(m.addrs[0].net_id, 1);
+                assert_eq!(m.addrs[0].addr, vec![127, 0, 0, 1]);
+                assert_eq!(m.addrs[0].port, 8333);
+                assert_eq!(m.addrs[1].net_id, 4);
+                assert_eq!(m.addrs[1].addr.len(), 32);
+            }
+            _ => panic!("expected Addrv2"),
+        }
+    }
+
+    #[test]
+    fn addrv2_net_id() {
+        assert_eq!(Addrv2NetId::from_u8(1), Some(Addrv2NetId::Ipv4));
+        assert_eq!(Addrv2NetId::Ipv4.addr_len(), Some(4));
+        assert_eq!(Addrv2NetId::from_u8(4), Some(Addrv2NetId::TorV3));
+        assert_eq!(Addrv2NetId::TorV3.addr_len(), Some(32));
+        assert_eq!(Addrv2NetId::from_u8(99), None);
     }
 }

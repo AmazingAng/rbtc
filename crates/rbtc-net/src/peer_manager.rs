@@ -87,6 +87,10 @@ pub enum NodeEvent {
     BanPeer { ip: IpAddr },
     /// Peer replied notfound for one or more requested items (e.g. pruned node)
     NotFound { peer_id: u64, items: Vec<Inventory> },
+    /// Peer requested our mempool contents (BIP35)
+    MempoolRequested { peer_id: u64 },
+    /// BIP155: peer sent addrv2 addresses
+    Addrv2Received { peer_id: u64, msg: crate::message::Addrv2Message },
 }
 
 /// Connected peer metadata
@@ -100,6 +104,10 @@ struct ConnectedPeer {
     misbehavior: u32,
     /// true if this is an inbound connection
     inbound: bool,
+    /// BIP339: peer supports wtxid-based tx relay
+    wtxid_relay: bool,
+    /// BIP155: peer prefers addrv2 messages
+    prefers_addrv2: bool,
 }
 
 /// Registration message: associates a peer_id with its command sender channel.
@@ -454,7 +462,7 @@ impl PeerManager {
 
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
-                PeerEvent::Ready { peer_id, addr, best_height, user_agent } => {
+                PeerEvent::Ready { peer_id, addr, best_height, user_agent, wtxid_relay, prefers_addrv2 } => {
                     info!("peer {peer_id} ready: height={best_height} ua={user_agent}");
 
                     // Retrieve the cmd_tx stored during connect / accept
@@ -490,6 +498,8 @@ impl PeerManager {
                                 fee_filter: 0,
                                 misbehavior: 0,
                                 inbound,
+                                wtxid_relay,
+                                prefers_addrv2,
                             },
                         );
                         stored_addr
@@ -597,6 +607,27 @@ impl PeerManager {
             NetworkMessage::NotFound(items) => {
                 let _ = self.node_event_tx.send(NodeEvent::NotFound { peer_id, items });
             }
+            NetworkMessage::WtxidRelay => {
+                debug!("peer {peer_id}: supports wtxid relay (BIP339)");
+                if let Some(peer) = self.peers.get_mut(&peer_id) {
+                    peer.wtxid_relay = true;
+                }
+            }
+            NetworkMessage::SendAddrv2 => {
+                debug!("peer {peer_id}: prefers addrv2 (BIP155)");
+                if let Some(peer) = self.peers.get_mut(&peer_id) {
+                    peer.prefers_addrv2 = true;
+                }
+            }
+            NetworkMessage::Addrv2(msg) => {
+                self.handle_addrv2(peer_id, msg).await;
+            }
+            NetworkMessage::Mempool => {
+                debug!("peer {peer_id}: requested mempool contents");
+                // The node layer should respond by sending inv messages for
+                // all txids in the mempool. Emit as a node event.
+                let _ = self.node_event_tx.send(NodeEvent::MempoolRequested { peer_id });
+            }
             other => {
                 debug!("peer {peer_id}: unhandled message: {}", other.command());
             }
@@ -653,6 +684,44 @@ impl PeerManager {
         for target in relay_targets {
             self.send_to(target, relay_msg.clone());
         }
+    }
+
+    /// Handle BIP155 addrv2 messages. Convert IPv4/IPv6 entries to SocketAddr
+    /// and add them to the candidate pool, similar to handle_addr.
+    async fn handle_addrv2(&mut self, peer_id: u64, msg: crate::message::Addrv2Message) {
+        use crate::message::Addrv2NetId;
+        let now_secs = unix_now() as i64;
+
+        for entry in &msg.addrs {
+            let ts = entry.timestamp as i64;
+            if (ts - now_secs).abs() > ADDR_MAX_DRIFT_SECS {
+                continue;
+            }
+            // Only process IPv4 and IPv6 for now (Tor/I2P/CJDNS require special handling)
+            let ip: IpAddr = match Addrv2NetId::from_u8(entry.net_id) {
+                Some(Addrv2NetId::Ipv4) if entry.addr.len() == 4 => {
+                    let octets: [u8; 4] = entry.addr[..4].try_into().unwrap();
+                    IpAddr::V4(std::net::Ipv4Addr::from(octets))
+                }
+                Some(Addrv2NetId::Ipv6) if entry.addr.len() == 16 => {
+                    let octets: [u8; 16] = entry.addr[..16].try_into().unwrap();
+                    IpAddr::V6(std::net::Ipv6Addr::from(octets))
+                }
+                _ => continue, // Skip Tor/I2P/CJDNS/unknown
+            };
+            let addr = SocketAddr::new(ip, entry.port);
+            if !self.banned_ips.contains(&ip) {
+                self.add_candidate_addr(addr);
+            }
+        }
+
+        // Emit raw addrv2 data to node for persistence
+        let _ = self.node_event_tx.send(NodeEvent::Addrv2Received { peer_id, msg });
+    }
+
+    /// Check if a peer supports wtxid relay (BIP339).
+    pub fn peer_wtxid_relay(&self, peer_id: u64) -> bool {
+        self.peers.get(&peer_id).map(|p| p.wtxid_relay).unwrap_or(false)
     }
 
     /// Main event loop – call this in a tokio task

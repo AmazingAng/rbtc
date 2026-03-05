@@ -636,6 +636,39 @@ impl Node {
                 self.handle_addr_received(addrs);
             }
 
+            NodeEvent::MempoolRequested { peer_id } => {
+                // Send inv for all txids in our mempool
+                let mp = self.mempool.read().await;
+                let inv_items: Vec<Inventory> = mp.txids().iter().map(|txid| {
+                    Inventory { inv_type: InvType::Tx, hash: *txid }
+                }).collect();
+                drop(mp);
+                if !inv_items.is_empty() {
+                    self.peer_manager.send_to(peer_id, NetworkMessage::Inv(inv_items));
+                }
+            }
+
+            NodeEvent::Addrv2Received { peer_id: _, msg } => {
+                // Convert addrv2 IPv4/IPv6 entries to socket addresses for persistence
+                for entry in &msg.addrs {
+                    let ip: Option<std::net::IpAddr> = match entry.net_id {
+                        1 if entry.addr.len() == 4 => {
+                            let octets: [u8; 4] = entry.addr[..4].try_into().unwrap();
+                            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::from(octets)))
+                        }
+                        2 if entry.addr.len() == 16 => {
+                            let octets: [u8; 16] = entry.addr[..16].try_into().unwrap();
+                            Some(std::net::IpAddr::V6(std::net::Ipv6Addr::from(octets)))
+                        }
+                        _ => None,
+                    };
+                    if let Some(ip) = ip {
+                        let addr = std::net::SocketAddr::new(ip, entry.port);
+                        self.peer_manager.add_candidate_addr(addr);
+                    }
+                }
+            }
+
             NodeEvent::InvReceived { peer_id, items } => {
                 let mut to_request: Vec<Inventory> = Vec::new();
                 let mut tx_to_request: Vec<Inventory> = Vec::new();

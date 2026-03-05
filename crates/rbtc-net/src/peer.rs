@@ -28,7 +28,16 @@ pub enum PeerState {
 /// Events sent from peers to the peer manager
 #[derive(Debug)]
 pub enum PeerEvent {
-    Ready { peer_id: u64, addr: SocketAddr, best_height: i32, user_agent: String },
+    Ready {
+        peer_id: u64,
+        addr: SocketAddr,
+        best_height: i32,
+        user_agent: String,
+        /// BIP339: peer signaled wtxidrelay during handshake
+        wtxid_relay: bool,
+        /// BIP155: peer signaled sendaddrv2 during handshake
+        prefers_addrv2: bool,
+    },
     Message { peer_id: u64, message: NetworkMessage },
     Disconnected { peer_id: u64 },
 }
@@ -114,6 +123,8 @@ async fn run_peer_inner(
     let mut peer_height = 0i32;
     let mut peer_ua = String::new();
     let mut peer_services = 0u64;
+    let mut peer_wtxid_relay = false;
+    let mut peer_sendaddrv2 = false;
 
     timeout(HANDSHAKE_TIMEOUT, async {
         while !got_version || !got_verack {
@@ -125,12 +136,24 @@ async fn run_peer_inner(
                     peer_ua = v.user_agent.clone();
                     peer_services = v.services;
                     got_version = true;
+                    // BIP339: send wtxidrelay before verack
+                    let wtxid = Message::new(magic, NetworkMessage::WtxidRelay).encode_to_bytes();
+                    write_half.write_all(&wtxid).await?;
+                    // BIP155: send sendaddrv2 before verack
+                    let addrv2 = Message::new(magic, NetworkMessage::SendAddrv2).encode_to_bytes();
+                    write_half.write_all(&addrv2).await?;
                     // Send verack
                     let verack = Message::new(magic, NetworkMessage::Verack).encode_to_bytes();
                     write_half.write_all(&verack).await?;
                 }
                 NetworkMessage::Verack => {
                     got_verack = true;
+                }
+                NetworkMessage::WtxidRelay => {
+                    peer_wtxid_relay = true;
+                }
+                NetworkMessage::SendAddrv2 => {
+                    peer_sendaddrv2 = true;
                 }
                 _ => {}
             }
@@ -145,6 +168,8 @@ async fn run_peer_inner(
         addr,
         best_height: peer_height,
         user_agent: peer_ua,
+        wtxid_relay: peer_wtxid_relay,
+        prefers_addrv2: peer_sendaddrv2,
     }).map_err(|_| NetError::ChannelError)?;
 
     // Send sendheaders (prefer headers over inv for new blocks)

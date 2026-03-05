@@ -147,7 +147,91 @@ async fn test_handshake_with_bitcoin_core() {
     );
 }
 
-// ── Test 2: ping / pong ───────────────────────────────────────────────────────
+// ── Test 2: BIP339/BIP155 handshake signals ──────────────────────────────────
+
+/// Verify that when we send wtxidrelay + sendaddrv2 before verack, Bitcoin Core
+/// also sends these signals back. Modern Bitcoin Core (v22+) supports both.
+#[tokio::test]
+async fn test_wtxidrelay_and_sendaddrv2_handshake() {
+    let stream = match TcpStream::connect(REGTEST_ADDR).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("bitcoind not reachable at {REGTEST_ADDR}: {e}  -- skipping");
+            return;
+        }
+    };
+
+    let network = Network::Regtest;
+    let magic = network.magic();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // Send version
+    let ver = VersionMessage::new(0, 0xaabbccdd11223344);
+    write_half
+        .write_all(&Message::new(magic, NetworkMessage::Version(ver)).encode_to_bytes())
+        .await
+        .unwrap();
+
+    let mut got_version = false;
+    let mut got_verack = false;
+    let mut peer_wtxidrelay = false;
+    let mut peer_sendaddrv2 = false;
+
+    timeout(TIMEOUT, async {
+        while !got_version || !got_verack {
+            let msg = Message::read_from(&mut reader, &magic).await.unwrap();
+            match msg.payload {
+                NetworkMessage::Version(_v) => {
+                    got_version = true;
+                    // Send BIP339 wtxidrelay before verack
+                    write_half
+                        .write_all(
+                            &Message::new(magic, NetworkMessage::WtxidRelay).encode_to_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                    // Send BIP155 sendaddrv2 before verack
+                    write_half
+                        .write_all(
+                            &Message::new(magic, NetworkMessage::SendAddrv2).encode_to_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                    // Send verack
+                    write_half
+                        .write_all(
+                            &Message::new(magic, NetworkMessage::Verack).encode_to_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                }
+                NetworkMessage::Verack => {
+                    got_verack = true;
+                }
+                NetworkMessage::WtxidRelay => {
+                    peer_wtxidrelay = true;
+                }
+                NetworkMessage::SendAddrv2 => {
+                    peer_sendaddrv2 = true;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("handshake timed out");
+
+    println!(
+        "[bip339/bip155] peer wtxidrelay={peer_wtxidrelay} sendaddrv2={peer_sendaddrv2}"
+    );
+
+    // Modern Bitcoin Core (v22+) sends both signals
+    assert!(peer_wtxidrelay, "peer did not send wtxidrelay");
+    assert!(peer_sendaddrv2, "peer did not send sendaddrv2");
+}
+
+// ── Test 3: ping / pong ───────────────────────────────────────────────────────
 
 /// Send a ping and verify we receive a matching pong with the correct nonce.
 #[tokio::test]
