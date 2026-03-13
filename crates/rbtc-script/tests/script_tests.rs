@@ -6,7 +6,7 @@
 /// followed by the amount in satoshis as the last element.
 /// Otherwise the entry has no witness data and the amount is 0.
 use rbtc_primitives::{
-    hash::{Hash256, TxId},
+    hash::{Hash256, Txid},
     script::Script,
     transaction::{OutPoint, Transaction, TxIn, TxOut},
 };
@@ -306,30 +306,30 @@ fn decode_hex(s: &str) -> Result<Vec<u8>, String> {
 
 /// Build the crediting transaction (prevout holder).
 fn make_crediting_tx(script_pubkey: &[u8], amount: u64) -> Transaction {
-    Transaction {
-        version: 1,
-        inputs: vec![TxIn {
+    Transaction::from_parts(
+        1,
+        vec![TxIn {
             previous_output: OutPoint {
-                txid: Hash256::ZERO,
+                txid: Txid(Hash256::ZERO),
                 vout: 0xffffffff,
             },
             script_sig: Script::from_bytes(vec![0x00, 0x00]), // OP_0 OP_0
             sequence: 0xffffffff,
             witness: vec![],
         }],
-        outputs: vec![TxOut {
-            value: amount,
+        vec![TxOut {
+            value: amount as i64,
             script_pubkey: Script::from_bytes(script_pubkey.to_vec()),
         }],
-        lock_time: 0,
-    }
+        0,
+    )
 }
 
 /// Compute the legacy txid (double-SHA256 of legacy-serialized tx).
-fn txid(tx: &Transaction) -> TxId {
+fn txid(tx: &Transaction) -> Txid {
     let mut buf = Vec::new();
     tx.encode_legacy(&mut buf).unwrap();
-    rbtc_crypto::digest::sha256d(&buf)
+    Txid(rbtc_crypto::digest::sha256d(&buf))
 }
 
 /// Build the spending transaction.
@@ -339,9 +339,9 @@ fn make_spending_tx(
     witness: Vec<Vec<u8>>,
     amount: u64,
 ) -> Transaction {
-    Transaction {
-        version: 1,
-        inputs: vec![TxIn {
+    Transaction::from_parts(
+        1,
+        vec![TxIn {
             previous_output: OutPoint {
                 txid: txid(cred),
                 vout: 0,
@@ -350,12 +350,12 @@ fn make_spending_tx(
             sequence: 0xffffffff,
             witness,
         }],
-        outputs: vec![TxOut {
-            value: amount,
+        vec![TxOut {
+            value: amount as i64,
             script_pubkey: Script::from_bytes(vec![]),
         }],
-        lock_time: 0,
-    }
+        0,
+    )
 }
 
 // ─── Test runner ─────────────────────────────────────────────────────────────

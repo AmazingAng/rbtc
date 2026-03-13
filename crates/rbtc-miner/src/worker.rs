@@ -4,6 +4,7 @@ use rbtc_crypto::sha256d;
 use rbtc_primitives::{
     block::{Block, BlockHeader},
     codec::Encodable,
+    hash::BlockHash,
 };
 
 use crate::template::BlockTemplate;
@@ -56,7 +57,7 @@ pub fn mine_block(template: &BlockTemplate) -> Block {
                 nonce,
             };
 
-            let hash = sha256d(&header_bytes(&header));
+            let hash = BlockHash(sha256d(&header_bytes(&header)));
 
             if header.meets_target(&hash) {
                 // Reconstruct the full block with this winning nonce.
@@ -80,14 +81,15 @@ mod tests {
     use super::*;
     use crate::template::BlockTemplate;
     use rbtc_consensus::chain::header_hash;
-    use rbtc_primitives::{hash::Hash256, script::Script};
+    use rbtc_primitives::{hash::BlockHash, script::Script};
 
     fn regtest_template() -> BlockTemplate {
         BlockTemplate::new(
             0x2000_0000,
-            Hash256::ZERO,
+            BlockHash::ZERO,
             0x207f_ffff, // regtest: trivially easy
             1,
+            150, // regtest halving interval
             0,
             vec![],
             Script::new(),
@@ -119,6 +121,6 @@ mod tests {
     fn mined_block_correct_prev_hash() {
         let template = regtest_template();
         let block = mine_block(&template);
-        assert_eq!(block.header.prev_block, Hash256::ZERO);
+        assert_eq!(block.header.prev_block, BlockHash::ZERO);
     }
 }

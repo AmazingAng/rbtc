@@ -248,6 +248,19 @@ impl ExtendedPubKey {
             public_key: child_pub,
         })
     }
+
+    /// Serialize to a Base58Check-encoded xpub string (BIP32, mainnet version bytes).
+    pub fn to_base58(&self) -> String {
+        let mut data = Vec::with_capacity(78);
+        // Version: 0x0488B21E = xpub
+        data.extend_from_slice(&[0x04, 0x88, 0xB2, 0x1E]);
+        data.push(self.depth);
+        data.extend_from_slice(&self.parent_fingerprint);
+        data.extend_from_slice(&self.child_number.to_be_bytes());
+        data.extend_from_slice(&self.chaincode);
+        data.extend_from_slice(&self.public_key.serialize());
+        bs58::encode(data).with_check().into_string()
+    }
 }
 
 #[cfg(test)]

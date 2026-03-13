@@ -40,6 +40,10 @@ pub struct StoredWalletUtxo {
     pub height: u32,
     pub address: String,
     pub confirmed: bool,
+    #[serde(default)]
+    pub is_own_change: bool,
+    #[serde(default)]
+    pub is_coinbase: bool,
 }
 
 // ── WalletStore ───────────────────────────────────────────────────────────────
@@ -102,7 +106,7 @@ impl<'a> WalletStore<'a> {
         let Ok(iter) = self.db.iter_cf(CF_WALLET) else {
             return vec![];
         };
-        iter.filter_map(|(k, v)| {
+        iter.into_iter().filter_map(|(k, v)| {
             if k.starts_with(b"addr:") {
                 serde_json::from_slice(&v).ok()
             } else {
@@ -161,7 +165,7 @@ impl<'a> WalletStore<'a> {
         let Ok(iter) = self.db.iter_cf(CF_WALLET) else {
             return vec![];
         };
-        iter.filter_map(|(k, v)| {
+        iter.into_iter().filter_map(|(k, v)| {
             if k.starts_with(b"key:") {
                 let addr = String::from_utf8_lossy(&k[4..]).to_string();
                 let wif = String::from_utf8_lossy(&v).to_string();
@@ -173,16 +177,112 @@ impl<'a> WalletStore<'a> {
         .collect()
     }
 
+    // ── Birth time ────────────────────────────────────────────────────────
+
+    /// Persist the wallet birth time (Unix timestamp, seconds since epoch).
+    /// Matches Bitcoin Core's `m_birth_time` used for rescan optimisation.
+    pub fn save_birth_time(&self, ts: u64) -> Result<(), WalletError> {
+        self.db
+            .put_cf(CF_WALLET, b"meta:birth_time", &ts.to_le_bytes())
+            .map_err(|e| WalletError::Storage(e.to_string()))
+    }
+
+    /// Load the wallet birth time. Returns 0 if not set (unknown).
+    pub fn load_birth_time(&self) -> Result<u64, WalletError> {
+        match self
+            .db
+            .get_cf(CF_WALLET, b"meta:birth_time")
+            .map_err(|e| WalletError::Storage(e.to_string()))?
+        {
+            Some(bytes) if bytes.len() >= 8 => {
+                Ok(u64::from_le_bytes(bytes[..8].try_into().unwrap()))
+            }
+            _ => Ok(0),
+        }
+    }
+
+    // ── Labels ────────────────────────────────────────────────────────────
+
+    /// Set a label for the given address.
+    pub fn put_label(&self, address: &str, label: &str) -> Result<(), WalletError> {
+        let key = format!("label:{address}");
+        self.db
+            .put_cf(CF_WALLET, key.as_bytes(), label.as_bytes())
+            .map_err(|e| WalletError::Storage(e.to_string()))
+    }
+
+    /// Get the label for the given address (if any).
+    pub fn get_label(&self, address: &str) -> Result<Option<String>, WalletError> {
+        let key = format!("label:{address}");
+        self.db
+            .get_cf(CF_WALLET, key.as_bytes())
+            .map(|opt| opt.map(|bytes| String::from_utf8_lossy(&bytes).to_string()))
+            .map_err(|e| WalletError::Storage(e.to_string()))
+    }
+
+    /// Remove label for the given address.
+    pub fn delete_label(&self, address: &str) -> Result<(), WalletError> {
+        let key = format!("label:{address}");
+        self.db
+            .delete_cf(CF_WALLET, key.as_bytes())
+            .map_err(|e| WalletError::Storage(e.to_string()))
+    }
+
+    /// Set the purpose for the given address.
+    pub fn put_purpose(&self, address: &str, purpose: &str) -> Result<(), WalletError> {
+        let key = format!("purpose:{address}");
+        self.db
+            .put_cf(CF_WALLET, key.as_bytes(), purpose.as_bytes())
+            .map_err(|e| WalletError::Storage(e.to_string()))
+    }
+
+    /// Get the purpose for the given address (if any).
+    pub fn get_purpose(&self, address: &str) -> Result<Option<String>, WalletError> {
+        let key = format!("purpose:{address}");
+        self.db
+            .get_cf(CF_WALLET, key.as_bytes())
+            .map(|opt| opt.map(|bytes| String::from_utf8_lossy(&bytes).to_string()))
+            .map_err(|e| WalletError::Storage(e.to_string()))
+    }
+
+    /// Remove purpose for the given address.
+    pub fn delete_purpose(&self, address: &str) -> Result<(), WalletError> {
+        let key = format!("purpose:{address}");
+        self.db
+            .delete_cf(CF_WALLET, key.as_bytes())
+            .map_err(|e| WalletError::Storage(e.to_string()))
+    }
+
+    /// Iterate all labels. Returns `(address, label)` pairs.
+    pub fn iter_labels(&self) -> Vec<(String, String)> {
+        let Ok(iter) = self.db.iter_cf(CF_WALLET) else {
+            return vec![];
+        };
+        iter.into_iter()
+            .filter_map(|(k, v)| {
+                if k.starts_with(b"label:") {
+                    let addr = String::from_utf8_lossy(&k[6..]).to_string();
+                    let label = String::from_utf8_lossy(&v).to_string();
+                    Some((addr, label))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    // ── Wallet UTXOs (continued) ─────────────────────────────────────────────
+
     pub fn iter_utxos(&self) -> Vec<(OutPoint, StoredWalletUtxo)> {
         let Ok(iter) = self.db.iter_cf(CF_WALLET) else {
             return vec![];
         };
-        iter.filter_map(|(k, v)| {
+        iter.into_iter().filter_map(|(k, v)| {
             if !k.starts_with(b"utxo:") {
                 return None;
             }
             let utxo: StoredWalletUtxo = serde_json::from_slice(&v).ok()?;
-            let txid = rbtc_primitives::hash::Hash256::from_hex(&utxo.txid).ok()?;
+            let txid = rbtc_primitives::Txid(rbtc_primitives::hash::Hash256::from_hex(&utxo.txid).ok()?);
             let outpoint = OutPoint {
                 txid,
                 vout: utxo.vout,

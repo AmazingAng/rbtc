@@ -16,4 +16,7 @@ pub enum MinerError {
 
     #[error("wallet error: {0}")]
     Wallet(String),
+
+    #[error("template validation failed: {0}")]
+    TemplateInvalid(String),
 }

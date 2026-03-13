@@ -29,6 +29,27 @@ fn push_compact_size(dst: &mut Vec<u8>, n: usize) {
     }
 }
 
+/// Returns the number of bytes a compact-size integer occupies.
+fn compact_size_len(n: usize) -> usize {
+    match n {
+        0..=0xfc => 1,
+        0xfd..=0xffff => 3,
+        0x1_0000..=0xffff_ffff => 5,
+        _ => 9,
+    }
+}
+
+/// Compute the serialized size of a witness stack, matching Bitcoin Core's
+/// `GetSerializeSize(witness.stack)`: compact_size(num_items) + for each item
+/// compact_size(item.len()) + item.len().
+fn witness_serialized_size(witness: &[Vec<u8>]) -> usize {
+    let mut size = compact_size_len(witness.len());
+    for item in witness {
+        size += compact_size_len(item.len()) + item.len();
+    }
+    size
+}
+
 /// Context for script verification
 pub struct ScriptContext<'a> {
     pub tx: &'a Transaction,
@@ -75,6 +96,7 @@ pub fn verify_input(ctx: &ScriptContext<'_>) -> Result<(), ScriptError> {
                 &input.script_sig,
                 SigVersion::Base,
                 None,
+                None,
             )?;
             engine.execute(
                 script_pubkey,
@@ -84,6 +106,7 @@ pub fn verify_input(ctx: &ScriptContext<'_>) -> Result<(), ScriptError> {
                 ctx.prevout.value,
                 script_pubkey,
                 SigVersion::Base,
+                None,
                 None,
             )?;
             check_stack_true(&stack)?;
@@ -103,6 +126,7 @@ pub fn verify_input(ctx: &ScriptContext<'_>) -> Result<(), ScriptError> {
             &input.script_sig,
             SigVersion::Base,
             None,
+            None,
         )?;
         engine.execute(
             script_pubkey,
@@ -112,6 +136,7 @@ pub fn verify_input(ctx: &ScriptContext<'_>) -> Result<(), ScriptError> {
             ctx.prevout.value,
             script_pubkey,
             SigVersion::Base,
+            None,
             None,
         )?;
         check_stack_true(&stack)?;
@@ -265,6 +290,7 @@ fn verify_p2wsh(ctx: &ScriptContext<'_>, script_hash: &[u8; 32]) -> Result<(), S
         &witness_script,
         SigVersion::WitnessV0,
         None,
+        None,
     )?;
 
     check_stack_true(&stack)?;
@@ -316,12 +342,21 @@ fn verify_p2tr(ctx: &ScriptContext<'_>, output_key: &[u8; 32]) -> Result<(), Scr
     }
 
     // Script path spend: witness = [inputs...] [script] [control_block]
+    if witness_without_annex.len() < 2 {
+        return Err(ScriptError::WitnessProgramMismatch);
+    }
     let control_block = witness_without_annex.last().unwrap();
     let script_bytes = &witness_without_annex[witness_without_annex.len() - 2];
     let _inputs = &witness_without_annex[..witness_without_annex.len() - 2];
 
-    if control_block.is_empty() {
-        return Err(ScriptError::Taproot("empty control block".into()));
+    // BIP341: control block must be 33 + 32*k bytes (1 version + 32 internal key + merkle path)
+    if control_block.len() < 33 || (control_block.len() - 33) % 32 != 0 {
+        return Err(ScriptError::TaprootWrongControlSize);
+    }
+    // BIP341: merkle path depth limited to 128
+    let merkle_depth = (control_block.len() - 33) / 32;
+    if merkle_depth > 128 {
+        return Err(ScriptError::Taproot("merkle path too deep".into()));
     }
 
     // Compute leaf hash: tagged_hash("TapLeaf", version || compact_script)
@@ -336,7 +371,7 @@ fn verify_p2tr(ctx: &ScriptContext<'_>, output_key: &[u8; 32]) -> Result<(), Scr
     let path = &control_block[33..];
     for chunk in path.chunks(32) {
         if chunk.len() != 32 {
-            return Err(ScriptError::Taproot("invalid control block length".into()));
+            return Err(ScriptError::TaprootWrongControlSize);
         }
         let chunk_arr: [u8; 32] = chunk.try_into().unwrap();
         let mut branch_data = [0u8; 64];
@@ -377,12 +412,36 @@ fn verify_p2tr(ctx: &ScriptContext<'_>, output_key: &[u8; 32]) -> Result<(), Scr
         return Err(ScriptError::Taproot("output key mismatch".into()));
     }
 
-    // Execute the tapscript
-    let tapscript = Script::from_bytes(script_bytes.clone());
-    let mut stack: Vec<Vec<u8>> = _inputs.to_vec();
+    // BIP341: verify parity bit in control block matches tweaked key parity
+    let expected_parity = control_block[0] & 0x01;
+    let actual_parity = if _parity == secp256k1::Parity::Odd {
+        1u8
+    } else {
+        0u8
+    };
+    if expected_parity != actual_parity {
+        return Err(ScriptError::Taproot("output key parity mismatch".into()));
+    }
 
-    // Tapscript execution uses BIP342 rules
-    execute_tapscript(ctx, &tapscript, &mut stack, &leaf_hash.0, annex)
+    // Only leaf version 0xc0 is defined (BIP342 tapscript).
+    if leaf_version == 0xc0 {
+        let tapscript = Script::from_bytes(script_bytes.clone());
+        let mut stack: Vec<Vec<u8>> = _inputs.to_vec();
+        // BIP342: validate witness stack element sizes
+        if stack
+            .iter()
+            .any(|item| item.len() > MAX_SCRIPT_ELEMENT_SIZE)
+        {
+            return Err(ScriptError::PushSizeExceeded);
+        }
+        execute_tapscript(ctx, &tapscript, &mut stack, &leaf_hash.0, annex)
+    } else {
+        // Unknown leaf version – valid by consensus (future softfork).
+        if ctx.flags.verify_discourage_upgradable_taproot_version {
+            return Err(ScriptError::DiscourageUpgradableTaprootVersion);
+        }
+        Ok(())
+    }
 }
 
 /// Execute a tapscript (BIP342) – simplified, handles OP_CHECKSIGADD
@@ -393,6 +452,12 @@ fn execute_tapscript(
     leaf_hash: &[u8; 32],
     annex: Option<&[u8]>,
 ) -> Result<(), ScriptError> {
+    // Compute initial validation weight budget per BIP342:
+    // budget = GetSerializeSize(witness.stack) + VALIDATION_WEIGHT_OFFSET
+    let witness = &ctx.tx.inputs[ctx.input_index].witness;
+    let validation_weight = witness_serialized_size(witness) as i64
+        + crate::engine::VALIDATION_WEIGHT_OFFSET;
+
     let engine = ScriptEngine::new(ctx.flags);
     engine.execute_tapscript(
         ctx.tx,
@@ -402,6 +467,7 @@ fn execute_tapscript(
         stack,
         leaf_hash,
         annex,
+        validation_weight,
     )
 }
 
@@ -411,13 +477,13 @@ fn parse_taproot_sig_and_hashtype(sig: &[u8]) -> Result<(&[u8], SighashType), Sc
         65 => {
             let hash_type = sig[64] as u32;
             if hash_type == 0 {
-                return Err(ScriptError::TaprootInvalidSighashType);
+                return Err(ScriptError::SchnorrSigHashtype);
             }
             let parsed =
-                SighashType::from_u32(hash_type).ok_or(ScriptError::TaprootInvalidSighashType)?;
+                SighashType::from_u32(hash_type).ok_or(ScriptError::SchnorrSigHashtype)?;
             Ok((&sig[..64], parsed))
         }
-        _ => Err(ScriptError::SigCheckFailed),
+        _ => Err(ScriptError::SchnorrSigSize),
     }
 }
 
@@ -459,6 +525,7 @@ fn verify_p2sh(
         &input.script_sig,
         SigVersion::Base,
         None,
+        None,
     )?;
 
     // Verify the redeem script hash
@@ -493,6 +560,7 @@ fn verify_p2sh(
         ctx.prevout.value,
         &redeem_script,
         SigVersion::Base,
+        None,
         None,
     )?;
 
@@ -575,7 +643,7 @@ fn is_push_only(script: &Script) -> bool {
 mod tests {
     use super::*;
     use rbtc_primitives::codec::Decodable;
-    use rbtc_primitives::hash::Hash256;
+    use rbtc_primitives::hash::{Hash256, Txid};
     use rbtc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
     use secp256k1::{Parity, Scalar, Secp256k1, XOnlyPublicKey};
     use serde::Deserialize;
@@ -603,23 +671,23 @@ mod tests {
 
     #[test]
     fn verify_input_legacy_true() {
-        let tx = rbtc_primitives::transaction::Transaction {
-            version: 1,
-            inputs: vec![TxIn {
+        let tx = Transaction::from_parts(
+            1,
+            vec![TxIn {
                 previous_output: OutPoint {
-                    txid: Hash256::ZERO,
+                    txid: Txid(Hash256::ZERO),
                     vout: 0,
                 },
                 script_sig: Script::from_bytes(vec![0x51]),
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut {
+            vec![TxOut {
                 value: 1000,
                 script_pubkey: Script::from_bytes(vec![0x51]),
             }],
-            lock_time: 0,
-        };
+            0,
+        );
         let prevout = tx.outputs[0].clone();
         let ctx = ScriptContext {
             tx: &tx,
@@ -636,23 +704,23 @@ mod tests {
 
     #[test]
     fn verify_input_cleanstack_fail() {
-        let tx = rbtc_primitives::transaction::Transaction {
-            version: 1,
-            inputs: vec![TxIn {
+        let tx = Transaction::from_parts(
+            1,
+            vec![TxIn {
                 previous_output: OutPoint {
-                    txid: Hash256::ZERO,
+                    txid: Txid(Hash256::ZERO),
                     vout: 0,
                 },
                 script_sig: Script::from_bytes(vec![0x51, 0x51]),
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut {
+            vec![TxOut {
                 value: 1000,
                 script_pubkey: Script::from_bytes(vec![0x51]),
             }],
-            lock_time: 0,
-        };
+            0,
+        );
         let prevout = tx.outputs[0].clone();
         let ctx = ScriptContext {
             tx: &tx,
@@ -729,20 +797,20 @@ mod tests {
 
     #[test]
     fn verify_input_witness_malleated_non_empty_scriptsig() {
-        let tx = Transaction {
-            version: 2,
-            inputs: vec![TxIn {
+        let tx = Transaction::from_parts(
+            2,
+            vec![TxIn {
                 previous_output: OutPoint {
-                    txid: Hash256::ZERO,
+                    txid: Txid(Hash256::ZERO),
                     vout: 0,
                 },
                 script_sig: Script::from_bytes(vec![0x51]),
                 sequence: 0xffff_ffff,
                 witness: vec![vec![1], vec![2]],
             }],
-            outputs: vec![],
-            lock_time: 0,
-        };
+            vec![],
+            0,
+        );
         let prevout = TxOut {
             value: 1000,
             script_pubkey: Script::from_bytes({
@@ -784,20 +852,20 @@ mod tests {
         // scriptSig pushes junk then redeemScript (not exact single push redeemScript).
         let mut sig = vec![0x01, 0x01];
         sig.extend_from_slice(&encode_single_push(redeem.as_bytes()));
-        let tx = Transaction {
-            version: 2,
-            inputs: vec![TxIn {
+        let tx = Transaction::from_parts(
+            2,
+            vec![TxIn {
                 previous_output: OutPoint {
-                    txid: Hash256::ZERO,
+                    txid: Txid(Hash256::ZERO),
                     vout: 0,
                 },
                 script_sig: Script::from_bytes(sig),
                 sequence: 0xffff_ffff,
                 witness: vec![vec![0x01], vec![0x02]],
             }],
-            outputs: vec![],
-            lock_time: 0,
-        };
+            vec![],
+            0,
+        );
         let ctx = ScriptContext {
             tx: &tx,
             input_index: 0,
@@ -817,20 +885,20 @@ mod tests {
 
     #[test]
     fn verify_input_witness_unexpected_for_legacy_spk() {
-        let tx = Transaction {
-            version: 1,
-            inputs: vec![TxIn {
+        let tx = Transaction::from_parts(
+            1,
+            vec![TxIn {
                 previous_output: OutPoint {
-                    txid: Hash256::ZERO,
+                    txid: Txid(Hash256::ZERO),
                     vout: 0,
                 },
                 script_sig: Script::from_bytes(vec![0x51]),
                 sequence: 0xffff_ffff,
                 witness: vec![vec![0x01]],
             }],
-            outputs: vec![],
-            lock_time: 0,
-        };
+            vec![],
+            0,
+        );
         let prevout = TxOut {
             value: 1000,
             script_pubkey: Script::from_bytes(vec![0x51]),
@@ -860,20 +928,20 @@ mod tests {
             value: 1000,
             script_pubkey: Script::from_bytes(spk),
         };
-        let tx = Transaction {
-            version: 2,
-            inputs: vec![TxIn {
+        let tx = Transaction::from_parts(
+            2,
+            vec![TxIn {
                 previous_output: OutPoint {
-                    txid: Hash256::ZERO,
+                    txid: Txid(Hash256::ZERO),
                     vout: 0,
                 },
                 script_sig: Script::new(),
                 sequence: 0xffff_ffff,
                 witness: vec![vec![1, 2, 3]],
             }],
-            outputs: vec![],
-            lock_time: 0,
-        };
+            vec![],
+            0,
+        );
         let ctx = ScriptContext {
             tx: &tx,
             input_index: 0,
@@ -896,20 +964,20 @@ mod tests {
             value: 1000,
             script_pubkey: Script::from_bytes(spk),
         };
-        let tx = Transaction {
-            version: 2,
-            inputs: vec![TxIn {
+        let tx = Transaction::from_parts(
+            2,
+            vec![TxIn {
                 previous_output: OutPoint {
-                    txid: Hash256::ZERO,
+                    txid: Txid(Hash256::ZERO),
                     vout: 0,
                 },
                 script_sig: Script::new(),
                 sequence: 0xffff_ffff,
                 witness: vec![witness_script.clone()],
             }],
-            outputs: vec![],
-            lock_time: 0,
-        };
+            vec![],
+            0,
+        );
         let ctx = ScriptContext {
             tx: &tx,
             input_index: 0,
@@ -932,20 +1000,20 @@ mod tests {
             value: 1000,
             script_pubkey: Script::from_bytes(spk),
         };
-        let tx = Transaction {
-            version: 2,
-            inputs: vec![TxIn {
+        let tx = Transaction::from_parts(
+            2,
+            vec![TxIn {
                 previous_output: OutPoint {
-                    txid: Hash256::ZERO,
+                    txid: Txid(Hash256::ZERO),
                     vout: 0,
                 },
                 script_sig: Script::new(),
                 sequence: 0xffff_ffff,
                 witness: vec![],
             }],
-            outputs: vec![],
-            lock_time: 0,
-        };
+            vec![],
+            0,
+        );
         let ctx = ScriptContext {
             tx: &tx,
             input_index: 0,
@@ -971,11 +1039,11 @@ mod tests {
             value: 1000,
             script_pubkey: Script::from_bytes(spk),
         };
-        let tx = Transaction {
-            version: 2,
-            inputs: vec![TxIn {
+        let tx = Transaction::from_parts(
+            2,
+            vec![TxIn {
                 previous_output: OutPoint {
-                    txid: Hash256::ZERO,
+                    txid: Txid(Hash256::ZERO),
                     vout: 0,
                 },
                 script_sig: Script::new(),
@@ -985,9 +1053,9 @@ mod tests {
                     witness_script.clone(),
                 ],
             }],
-            outputs: vec![],
-            lock_time: 0,
-        };
+            vec![],
+            0,
+        );
         let ctx = ScriptContext {
             tx: &tx,
             input_index: 0,
@@ -1017,20 +1085,20 @@ mod tests {
         }
 
         fn build_tx(script_sig: Script, witness: Vec<Vec<u8>>) -> Transaction {
-            Transaction {
-                version: 2,
-                inputs: vec![TxIn {
+            Transaction::from_parts(
+                2,
+                vec![TxIn {
                     previous_output: OutPoint {
-                        txid: Hash256::ZERO,
+                        txid: Txid(Hash256::ZERO),
                         vout: 0,
                     },
                     script_sig,
                     sequence: 0xffff_ffff,
                     witness,
                 }],
-                outputs: vec![],
-                lock_time: 0,
-            }
+                vec![],
+                0,
+            )
         }
 
         fn expected_from_str(s: &str) -> Option<ScriptError> {
@@ -1057,7 +1125,7 @@ mod tests {
 
         for case in cases {
             let prevout = TxOut {
-                value: case.prevout_value,
+                value: case.prevout_value as i64,
                 script_pubkey: Script::from_bytes(decode_hex(&case.prevout_script_pubkey_hex)),
             };
             let tx = build_tx(
@@ -1191,20 +1259,20 @@ mod tests {
                 other => panic!("unknown mode in fixture: {other}"),
             };
 
-            let tx = Transaction {
-                version: 2,
-                inputs: vec![TxIn {
+            let tx = Transaction::from_parts(
+                2,
+                vec![TxIn {
                     previous_output: OutPoint {
-                        txid: Hash256::ZERO,
+                        txid: Txid(Hash256::ZERO),
                         vout: 0,
                     },
                     script_sig: Script::new(),
                     sequence: 0xffff_ffff,
                     witness,
                 }],
-                outputs: vec![],
-                lock_time: 0,
-            };
+                vec![],
+                0,
+            );
             let all_prevouts = [prevout.clone()];
             let ctx = ScriptContext {
                 tx: &tx,
@@ -1220,7 +1288,7 @@ mod tests {
                     let got = verify_input(&ctx).expect_err(&case.name);
                     assert_eq!(
                         got,
-                        ScriptError::TaprootInvalidSighashType,
+                        ScriptError::SchnorrSigHashtype,
                         "case: {}",
                         case.name
                     );
@@ -1368,6 +1436,51 @@ mod tests {
         let old = tagged_hash(b"TapLeaf", &old_leaf_data);
 
         assert_ne!(good, old);
+    }
+
+    #[test]
+    fn taproot_wrong_control_block_size() {
+        // Build a witness v1 output (OP_1 <32-byte key>)
+        let internal_key = [0x02u8; 32];
+        let mut spk = vec![0x51, 0x20]; // OP_1 PUSH32
+        spk.extend_from_slice(&internal_key);
+        let prevout = TxOut {
+            value: 1000,
+            script_pubkey: Script::from_bytes(spk),
+        };
+
+        // Script path spend: witness = [script, control_block]
+        let script = vec![0x51]; // OP_1 (trivially true)
+        // Control block with invalid size: 34 bytes (not 33 + 32*k)
+        let bad_control = vec![0xc0; 34];
+
+        let tx = Transaction::from_parts(
+            2,
+            vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid(Hash256::ZERO),
+                    vout: 0,
+                },
+                script_sig: Script::from_bytes(vec![]),
+                sequence: 0xffffffff,
+                witness: vec![script, bad_control],
+            }],
+            vec![TxOut {
+                value: 500,
+                script_pubkey: Script::from_bytes(vec![0x51]),
+            }],
+            0,
+        );
+
+        let ctx = ScriptContext {
+            tx: &tx,
+            input_index: 0,
+            prevout: &prevout,
+            flags: ScriptFlags::standard(),
+            all_prevouts: &[prevout.clone()],
+        };
+        let err = verify_input(&ctx).unwrap_err();
+        assert_eq!(err, ScriptError::TaprootWrongControlSize);
     }
 }
 

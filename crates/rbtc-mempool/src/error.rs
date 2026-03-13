@@ -23,6 +23,9 @@ pub enum MempoolError {
     #[error("non-standard transaction: {0}")]
     NonStandard(String),
 
+    #[error("witness non-standard: {0}")]
+    WitnessNonStandard(String),
+
     #[error("dust output #{0}: value {1} below threshold {2}")]
     Dust(usize, u64, u64),
 
@@ -48,6 +51,14 @@ pub enum MempoolError {
     )]
     RbfAbsoluteFeeTooLow(u64, u64),
 
+    #[error(
+        "RBF replacement does not improve feerate diagram: new feerate {0} sat/vB does not exceed max evicted feerate {1} sat/vB"
+    )]
+    RbfFeerateDiagramCheck(u64, u64),
+
+    #[error("RBF replacement does not improve feerate diagram: {0}")]
+    RbfFeerateDiagramRegression(String),
+
     #[error("conflicting transaction in mempool (no RBF)")]
     ConflictingTx,
 
@@ -60,4 +71,46 @@ pub enum MempoolError {
 
     #[error("too many in-mempool descendants: {0} (limit {1})")]
     TooManyDescendants(u64, u64),
+
+    #[error("ancestor package vsize too large: {0} vB (limit {1})")]
+    AncestorVsizeTooLarge(u64, u64),
+
+    #[error("descendant package vsize too large: {0} vB (limit {1})")]
+    DescendantVsizeTooLarge(u64, u64),
+
+    #[error("transaction is non-final: {0}")]
+    NonFinal(String),
+
+    #[error("coinbase spend is immature: {0} confirmations (need {1})")]
+    ImmatureCoinbase(u32, u32),
+
+    #[error("transaction fails nLockTime check at height {0} / time {1}")]
+    NonFinalLockTime(u32, u32),
+
+    #[error("RBF replacement introduces new unconfirmed input: {0}:{1}")]
+    RbfNewUnconfirmedInput(String, u32),
+
+    #[error("RBF replacement spends conflicting transaction {0} (bad-txns-spends-conflicting-tx)")]
+    RbfSpendsConflicting(String),
+
+    #[error("package too large: {0} txs (limit {1})")]
+    PackageTooManyTxs(usize, usize),
+
+    #[error("package weight too large: {0} WU (limit {1})")]
+    PackageWeightTooLarge(u64, u64),
+
+    #[error("cluster limit exceeded: {0}")]
+    ClusterLimitExceeded(String),
+
+    #[error("package not topologically sorted")]
+    PackageNotSorted,
+
+    #[error("package contains conflicting transactions (same input spent twice)")]
+    PackageContainsConflicts,
+
+    #[error("package contains duplicate txid: {0}")]
+    PackageContainsDuplicates(rbtc_primitives::hash::Txid),
+
+    #[error("missing ephemeral dust spends: {0}")]
+    MissingEphemeralSpends(String),
 }

@@ -180,17 +180,14 @@ mod tests {
     #[test]
     fn empty_elements_produces_compact_zero() {
         let hash = [0u8; 32];
-        let block = Block {
-            header: rbtc_primitives::block::BlockHeader {
+        let block = Block::new(rbtc_primitives::block::BlockHeader {
                 version: 1,
-                prev_block: rbtc_primitives::hash::Hash256::ZERO,
+                prev_block: rbtc_primitives::hash::BlockHash::ZERO,
                 merkle_root: rbtc_primitives::hash::Hash256::ZERO,
                 time: 0,
                 bits: 0,
                 nonce: 0,
-            },
-            transactions: vec![],
-        };
+            }, vec![]);
         let filter = build_basic_filter(&hash, &block, &[]);
         assert_eq!(filter, vec![0x00]); // CompactSize(0)
     }

@@ -116,11 +116,157 @@ impl Default for Hash160 {
     }
 }
 
-/// Block hash newtype
-pub type BlockHash = Hash256;
+// ---------------------------------------------------------------------------
+// Type-safe transaction & block identifiers (matching Bitcoin Core's
+// `transaction_identifier<bool>` template and CBlockHeader::GetHash).
+// ---------------------------------------------------------------------------
 
-/// Transaction ID newtype
-pub type TxId = Hash256;
+/// Txid commits to all transaction fields *except* the witness (BIP 141).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+pub struct Txid(pub Hash256);
+
+/// Wtxid commits to all transaction fields *including* the witness.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+pub struct Wtxid(pub Hash256);
+
+/// Block hash (SHA256d of the 80-byte header).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+pub struct BlockHash(pub Hash256);
+
+/// A generic transaction identifier that is either a Txid or a Wtxid
+/// (matches Bitcoin Core's `GenTxid`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GenTxid {
+    Txid(Txid),
+    Wtxid(Wtxid),
+}
+
+impl GenTxid {
+    pub fn is_wtxid(&self) -> bool {
+        matches!(self, GenTxid::Wtxid(_))
+    }
+
+    pub fn hash(&self) -> &Hash256 {
+        match self {
+            GenTxid::Txid(t) => &t.0,
+            GenTxid::Wtxid(w) => &w.0,
+        }
+    }
+}
+
+// --- Convenience impls for Txid ---
+
+impl Txid {
+    pub const ZERO: Self = Self(Hash256::ZERO);
+
+    pub fn from_hash(h: Hash256) -> Self {
+        Self(h)
+    }
+
+    pub fn from_slice(s: &[u8]) -> Result<Self, HashError> {
+        Ok(Self(Hash256::from_slice(s)?))
+    }
+
+    pub fn from_hex(s: &str) -> Result<Self, HashError> {
+        Ok(Self(Hash256::from_hex(s)?))
+    }
+
+    pub fn is_null(&self) -> bool {
+        self.0 == Hash256::ZERO
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        self.0.as_bytes()
+    }
+
+    pub fn to_hex(&self) -> String {
+        self.0.to_hex()
+    }
+}
+
+impl fmt::Debug for Txid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Txid({})", self.0.to_hex())
+    }
+}
+
+impl fmt::Display for Txid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0.to_hex())
+    }
+}
+
+// --- Convenience impls for Wtxid ---
+
+impl Wtxid {
+    pub const ZERO: Self = Self(Hash256::ZERO);
+
+    pub fn from_hash(h: Hash256) -> Self {
+        Self(h)
+    }
+
+    pub fn is_null(&self) -> bool {
+        self.0 == Hash256::ZERO
+    }
+
+    pub fn to_hex(&self) -> String {
+        self.0.to_hex()
+    }
+}
+
+impl fmt::Debug for Wtxid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Wtxid({})", self.0.to_hex())
+    }
+}
+
+impl fmt::Display for Wtxid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0.to_hex())
+    }
+}
+
+// --- Convenience impls for BlockHash ---
+
+impl BlockHash {
+    pub const ZERO: Self = Self(Hash256::ZERO);
+
+    pub fn from_hash(h: Hash256) -> Self {
+        Self(h)
+    }
+
+    pub fn from_slice(s: &[u8]) -> Result<Self, HashError> {
+        Ok(Self(Hash256::from_slice(s)?))
+    }
+
+    pub fn from_hex(s: &str) -> Result<Self, HashError> {
+        Ok(Self(Hash256::from_hex(s)?))
+    }
+
+    pub fn is_null(&self) -> bool {
+        self.0 == Hash256::ZERO
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        self.0.as_bytes()
+    }
+
+    pub fn to_hex(&self) -> String {
+        self.0.to_hex()
+    }
+}
+
+impl fmt::Debug for BlockHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "BlockHash({})", self.0.to_hex())
+    }
+}
+
+impl fmt::Display for BlockHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0.to_hex())
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -197,5 +343,41 @@ mod tests {
         let h = Hash160::ZERO;
         let _ = format!("{}", h);
         let _ = format!("{:?}", h);
+    }
+
+    // --- Newtype identity tests ---
+
+    #[test]
+    fn txid_wtxid_blockhash_are_distinct_types() {
+        let h = Hash256([1; 32]);
+        let txid = Txid::from_hash(h);
+        let wtxid = Wtxid::from_hash(h);
+        let bh = BlockHash::from_hash(h);
+        // Same underlying hash
+        assert_eq!(txid.0, wtxid.0);
+        assert_eq!(txid.0, bh.0);
+        // But they are distinct types (compile-time check)
+        assert_eq!(txid.to_hex(), bh.to_hex());
+    }
+
+    #[test]
+    fn txid_from_hex_roundtrip() {
+        let s = "0000000000000000000000000000000000000000000000000000000000000001";
+        let txid = Txid::from_hex(s).unwrap();
+        assert_eq!(txid.to_hex(), s);
+    }
+
+    #[test]
+    fn blockhash_zero() {
+        assert!(BlockHash::ZERO.is_null());
+        assert!(!BlockHash::from_hash(Hash256([1; 32])).is_null());
+    }
+
+    #[test]
+    fn gentxid_is_wtxid() {
+        let t = GenTxid::Txid(Txid::ZERO);
+        let w = GenTxid::Wtxid(Wtxid::ZERO);
+        assert!(!t.is_wtxid());
+        assert!(w.is_wtxid());
     }
 }

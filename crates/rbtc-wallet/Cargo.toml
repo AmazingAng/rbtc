@@ -8,6 +8,7 @@ license.workspace = true
 rbtc-primitives = { workspace = true }
 rbtc-crypto     = { workspace = true }
 rbtc-storage    = { workspace = true }
+rbtc-psbt       = { workspace = true }
 
 secp256k1  = { workspace = true }
 sha2       = { workspace = true }

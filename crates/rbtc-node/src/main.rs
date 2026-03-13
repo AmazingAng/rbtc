@@ -1,11 +1,14 @@
+mod checkpoints;
 mod config;
+mod headers_sync;
 mod ibd;
 mod node;
 mod rpc;
+mod rpc_auth;
 mod utxo_cache;
+mod validation_interface;
 
 use anyhow::Result;
-use clap::Parser;
 use tracing_subscriber::{fmt, EnvFilter};
 
 use config::Args;
@@ -20,7 +23,7 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let args = Args::parse();
+    let args = Args::parse_with_config();
     if args.script_threads > 0 {
         std::env::set_var("RBTC_SCRIPT_THREADS", args.script_threads.to_string());
     }

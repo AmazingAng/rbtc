@@ -47,6 +47,51 @@ pub enum WalletError {
     #[error("storage error: {0}")]
     Storage(String),
 
+    #[error("watch-only wallet cannot sign transactions")]
+    WatchOnly,
+
+    #[error("transaction does not signal RBF (all input sequences >= 0xfffffffe)")]
+    RbfNotSignaled,
+
+    #[error("transaction has descendants in the wallet")]
+    HasWalletDescendants,
+
+    #[error("transaction has already been bumped by {0}")]
+    AlreadyBumped(String),
+
+    #[error("inputs exceed maximum transaction weight")]
+    MaxWeightExceeded,
+
+    #[error("wallet is locked (encrypted and not unlocked)")]
+    WalletLocked,
+
+    #[error("wallet is not encrypted")]
+    WalletNotEncrypted,
+
     #[error("secp256k1 error: {0}")]
     Secp256k1(#[from] secp256k1::Error),
+
+    #[error("external signer error: {0}")]
+    ExternalSigner(String),
+
+    #[error("external signer fingerprint mismatch: signer {signer} does not match any input")]
+    SignerFingerprintMismatch { signer: String },
+
+    #[error("external signer process failed: {0}")]
+    SignerProcess(String),
+
+    #[error("gap limit exceeded: {0} consecutive unused addresses")]
+    GapLimitExceeded(u32),
+
+    #[error("keypool exhausted — call top_up()")]
+    KeypoolExhausted,
+
+    #[error("wallet is already encrypted")]
+    AlreadyEncrypted,
+
+    #[error("unlock timeout must be positive")]
+    InvalidTimeout,
+
+    #[error("{0}")]
+    Other(String),
 }

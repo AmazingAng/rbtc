@@ -10,8 +10,16 @@ use rbtc_primitives::{
 
 use crate::error::{NetError, Result};
 
-/// Maximum message payload size (32 MB)
-const MAX_MESSAGE_SIZE: u32 = 32 * 1024 * 1024;
+/// Maximum message payload size (4 MB, matching Bitcoin Core's MAX_SIZE)
+const MAX_MESSAGE_SIZE: u32 = 4 * 1000 * 1000;
+
+/// Protocol version we speak (BIP324 / wtxid relay / compact blocks v2).
+pub const PROTOCOL_VERSION: i32 = 70016;
+
+/// Minimum protocol version we accept from peers.
+/// 31800 is the oldest version that supports the modern message format.
+/// In practice we enforce 70015 during handshake (see peer.rs).
+pub const MIN_PEER_PROTO_VERSION: i32 = 31800;
 
 // ── Service flag constants (Bitcoin Core `protocol.h`) ──────────────────────
 
@@ -25,9 +33,11 @@ pub const NODE_WITNESS: u64 = 1 << 3;
 pub const NODE_COMPACT_FILTERS: u64 = 1 << 6;
 /// BIP159 — limited node (pruned, only recent blocks).
 pub const NODE_NETWORK_LIMITED: u64 = 1 << 10;
+/// BIP324 — supports v2 encrypted P2P transport.
+pub const NODE_P2P_V2: u64 = 1 << 11;
 
-/// Our default service flags: full node + segwit.
-pub const LOCAL_SERVICES: u64 = NODE_NETWORK | NODE_WITNESS;
+/// Our default service flags: full node + segwit + v2 transport.
+pub const LOCAL_SERVICES: u64 = NODE_NETWORK | NODE_WITNESS | NODE_P2P_V2;
 
 /// Format service flags as a human-readable string for logging.
 pub fn service_flags_to_string(flags: u64) -> String {
@@ -47,11 +57,33 @@ pub fn service_flags_to_string(flags: u64) -> String {
     if flags & NODE_NETWORK_LIMITED != 0 {
         names.push("NODE_NETWORK_LIMITED");
     }
+    if flags & NODE_P2P_V2 != 0 {
+        names.push("NODE_P2P_V2");
+    }
     if names.is_empty() {
         "NONE".to_string()
     } else {
         names.join("|")
     }
+}
+
+/// Check whether a peer's advertised service flags include all services we
+/// consider desirable for outbound connections.
+///
+/// Matches Bitcoin Core's `HasAllDesirableServiceFlags`:
+/// - Must have `NODE_WITNESS` (segwit)
+/// - Must have either `NODE_NETWORK` (full chain) or `NODE_NETWORK_LIMITED`
+///   (pruned but recent blocks)
+pub fn has_all_desirable_services(services: u64) -> bool {
+    // Must support segwit.
+    if services & NODE_WITNESS == 0 {
+        return false;
+    }
+    // Must serve blocks — either full or limited.
+    if services & NODE_NETWORK == 0 && services & NODE_NETWORK_LIMITED == 0 {
+        return false;
+    }
+    true
 }
 
 /// Bitcoin P2P message
@@ -155,6 +187,8 @@ pub enum InvType {
     Block = 2,
     FilteredBlock = 3,
     CmpctBlock = 4,
+    /// BIP339: wtxid-based transaction relay
+    WTx = 5,
     WitnessTx = 0x40000001,
     WitnessBlock = 0x40000002,
 }
@@ -166,10 +200,22 @@ impl InvType {
             2 => Self::Block,
             3 => Self::FilteredBlock,
             4 => Self::CmpctBlock,
+            5 => Self::WTx,
             0x40000001 => Self::WitnessTx,
             0x40000002 => Self::WitnessBlock,
             _ => Self::Error,
         }
+    }
+
+    /// Returns true if this inventory type refers to a transaction
+    /// (MSG_TX, MSG_WTX, or MSG_WITNESS_TX).
+    pub fn is_tx(&self) -> bool {
+        matches!(self, Self::Tx | Self::WTx | Self::WitnessTx)
+    }
+
+    /// Returns true if this inventory type uses wtxid (BIP339).
+    pub fn is_wtxid(&self) -> bool {
+        matches!(self, Self::WTx)
     }
 }
 
@@ -220,7 +266,7 @@ pub struct VersionMessage {
 impl VersionMessage {
     pub fn new(best_height: i32, nonce: u64) -> Self {
         Self {
-            version: 70016,
+            version: PROTOCOL_VERSION,
             services: LOCAL_SERVICES, // NODE_NETWORK | NODE_WITNESS
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -321,9 +367,9 @@ pub struct GetBlocksMessage {
 impl GetBlocksMessage {
     pub fn new(locator: Vec<BlockHash>) -> Self {
         Self {
-            version: 70016,
+            version: PROTOCOL_VERSION as u32,
             locator_hashes: locator,
-            stop_hash: Hash256::ZERO,
+            stop_hash: BlockHash(Hash256::ZERO),
         }
     }
 
@@ -334,9 +380,9 @@ impl GetBlocksMessage {
             .encode(&mut buf)
             .ok();
         for h in &self.locator_hashes {
-            h.0.encode(&mut buf).ok();
+            h.0.0.encode(&mut buf).ok();
         }
-        self.stop_hash.0.encode(&mut buf).ok();
+        self.stop_hash.0.0.encode(&mut buf).ok();
         buf
     }
 
@@ -348,13 +394,13 @@ impl GetBlocksMessage {
         let mut locator_hashes = Vec::with_capacity(count as usize);
         for _ in 0..count {
             let h = <[u8; 32]>::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
-            locator_hashes.push(Hash256(h));
+            locator_hashes.push(BlockHash(Hash256(h)));
         }
         let stop = <[u8; 32]>::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
         Ok(Self {
             version,
             locator_hashes,
-            stop_hash: Hash256(stop),
+            stop_hash: BlockHash(Hash256(stop)),
         })
     }
 }
@@ -401,6 +447,43 @@ pub struct PingMessage {
 #[derive(Debug, Clone)]
 pub struct AddrMessage {
     pub addrs: Vec<(u32, u64, [u8; 16], u16)>, // (timestamp, services, ip, port)
+}
+
+impl AddrMessage {
+    /// Maximum number of addresses in a single addr message (BIP protocol limit).
+    const MAX_ADDR_COUNT: usize = 1000;
+
+    /// Decode a v1 addr message payload.
+    /// Each entry: timestamp (4) + services (8) + ip (16) + port (2) = 30 bytes.
+    fn decode_payload(data: &[u8]) -> Result<Self> {
+        let mut cur = std::io::Cursor::new(data);
+        let count = VarInt::decode(&mut cur)
+            .map_err(|e| NetError::Decode(e.to_string()))?
+            .0 as usize;
+        if count > Self::MAX_ADDR_COUNT {
+            return Err(NetError::Decode(format!(
+                "addr message count {} exceeds max {}",
+                count,
+                Self::MAX_ADDR_COUNT,
+            )));
+        }
+        let mut addrs = Vec::with_capacity(count);
+        for _ in 0..count {
+            let timestamp =
+                u32::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
+            let services =
+                u64::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
+            let mut ip = [0u8; 16];
+            std::io::Read::read_exact(&mut cur, &mut ip)
+                .map_err(|e| NetError::Decode(e.to_string()))?;
+            let mut port_bytes = [0u8; 2];
+            std::io::Read::read_exact(&mut cur, &mut port_bytes)
+                .map_err(|e| NetError::Decode(e.to_string()))?;
+            let port = u16::from_be_bytes(port_bytes);
+            addrs.push((timestamp, services, ip, port));
+        }
+        Ok(Self { addrs })
+    }
 }
 
 // ── BIP155: addrv2 ──────────────────────────────────────────────────────────
@@ -698,6 +781,149 @@ impl CFCheckptMessage {
     }
 }
 
+// ── BIP37: Bloom filter messages ──────────────────────────────────────────
+
+/// BIP37 filterload message: instruct peer to load a bloom filter.
+///
+/// We parse and serialize these so we can properly handle SPV clients,
+/// but we do not implement bloom filter matching ourselves (deprecated
+/// since Bitcoin Core v0.19).
+#[derive(Debug, Clone)]
+pub struct FilterLoadMessage {
+    /// Serialized bloom filter data.
+    pub filter: Vec<u8>,
+    /// Number of hash functions.
+    pub n_hash_funcs: u32,
+    /// Tweak for the hash functions.
+    pub n_tweak: u32,
+    /// Filter update flags (BLOOM_UPDATE_NONE=0, BLOOM_UPDATE_ALL=1, etc.).
+    pub n_flags: u8,
+}
+
+impl FilterLoadMessage {
+    fn encode_payload(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(self.filter.len() + 13);
+        VarInt(self.filter.len() as u64).encode(&mut buf).ok();
+        buf.extend_from_slice(&self.filter);
+        buf.extend_from_slice(&self.n_hash_funcs.to_le_bytes());
+        buf.extend_from_slice(&self.n_tweak.to_le_bytes());
+        buf.push(self.n_flags);
+        buf
+    }
+
+    fn decode_payload(data: &[u8]) -> Result<Self> {
+        let mut cur = std::io::Cursor::new(data);
+        let VarInt(filter_len) =
+            VarInt::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
+        // BIP37: max filter size is 36000 bytes
+        if filter_len > 36000 {
+            return Err(NetError::Decode("filterload: filter too large".into()));
+        }
+        let mut filter = vec![0u8; filter_len as usize];
+        std::io::Read::read_exact(&mut cur, &mut filter)
+            .map_err(|e| NetError::Decode(e.to_string()))?;
+        let n_hash_funcs =
+            u32::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
+        // BIP37: max 50 hash functions
+        if n_hash_funcs > 50 {
+            return Err(NetError::Decode("filterload: too many hash funcs".into()));
+        }
+        let n_tweak = u32::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
+        let n_flags = u8::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
+        Ok(Self {
+            filter,
+            n_hash_funcs,
+            n_tweak,
+            n_flags,
+        })
+    }
+}
+
+/// BIP37 filteradd message: add a single element to the loaded bloom filter.
+#[derive(Debug, Clone)]
+pub struct FilterAddMessage {
+    /// Element to add to the filter (max 520 bytes).
+    pub element: Vec<u8>,
+}
+
+impl FilterAddMessage {
+    fn encode_payload(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(self.element.len() + 3);
+        VarInt(self.element.len() as u64).encode(&mut buf).ok();
+        buf.extend_from_slice(&self.element);
+        buf
+    }
+
+    fn decode_payload(data: &[u8]) -> Result<Self> {
+        let mut cur = std::io::Cursor::new(data);
+        let VarInt(elem_len) =
+            VarInt::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
+        // BIP37: max element size is 520 bytes (MAX_SCRIPT_ELEMENT_SIZE)
+        if elem_len > 520 {
+            return Err(NetError::Decode("filteradd: element too large".into()));
+        }
+        let mut element = vec![0u8; elem_len as usize];
+        std::io::Read::read_exact(&mut cur, &mut element)
+            .map_err(|e| NetError::Decode(e.to_string()))?;
+        Ok(Self { element })
+    }
+}
+
+/// BIP37 merkleblock message: block header with partial merkle tree for SPV.
+#[derive(Debug, Clone)]
+pub struct MerkleBlockMessage {
+    /// Block header.
+    pub header: BlockHeader,
+    /// Number of transactions in the block.
+    pub total_transactions: u32,
+    /// Hashes in the partial merkle tree (depth-first).
+    pub hashes: Vec<Hash256>,
+    /// Flag bits indicating the path through the tree.
+    pub flags: Vec<u8>,
+}
+
+impl MerkleBlockMessage {
+    fn encode_payload(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        self.header.encode(&mut buf).ok();
+        buf.extend_from_slice(&self.total_transactions.to_le_bytes());
+        VarInt(self.hashes.len() as u64).encode(&mut buf).ok();
+        for h in &self.hashes {
+            buf.extend_from_slice(&h.0);
+        }
+        VarInt(self.flags.len() as u64).encode(&mut buf).ok();
+        buf.extend_from_slice(&self.flags);
+        buf
+    }
+
+    fn decode_payload(data: &[u8]) -> Result<Self> {
+        let mut cur = std::io::Cursor::new(data);
+        let header =
+            BlockHeader::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
+        let total_transactions =
+            u32::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
+        let VarInt(hash_count) =
+            VarInt::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
+        let mut hashes = Vec::with_capacity(hash_count.min(4096) as usize);
+        for _ in 0..hash_count {
+            let h = <[u8; 32]>::decode(&mut cur)
+                .map_err(|e| NetError::Decode(e.to_string()))?;
+            hashes.push(Hash256(h));
+        }
+        let VarInt(flags_len) =
+            VarInt::decode(&mut cur).map_err(|e| NetError::Decode(e.to_string()))?;
+        let mut flags = vec![0u8; flags_len.min(4096) as usize];
+        std::io::Read::read_exact(&mut cur, &mut flags)
+            .map_err(|e| NetError::Decode(e.to_string()))?;
+        Ok(Self {
+            header,
+            total_transactions,
+            hashes,
+            flags,
+        })
+    }
+}
+
 /// All supported network message types
 #[derive(Debug, Clone)]
 pub enum NetworkMessage {
@@ -749,6 +975,20 @@ pub enum NetworkMessage {
     GetCFCheckpt(GetCFCheckptMessage),
     /// BIP157: compact filter header checkpoints response
     CFCheckpt(CFCheckptMessage),
+    /// BIP330: signal support for transaction reconciliation (Erlay).
+    /// Payload: version (u32) + salt (u64).
+    SendTxRcncl {
+        version: u32,
+        salt: u64,
+    },
+    /// BIP37: load a bloom filter for SPV clients.
+    FilterLoad(FilterLoadMessage),
+    /// BIP37: add an element to the loaded bloom filter.
+    FilterAdd(FilterAddMessage),
+    /// BIP37: clear the loaded bloom filter.
+    FilterClear,
+    /// BIP37: merkle block with partial merkle tree for SPV proofs.
+    MerkleBlock(MerkleBlockMessage),
     Unknown {
         command: String,
         data: Vec<u8>,
@@ -789,6 +1029,11 @@ impl NetworkMessage {
             Self::CFHeaders(_) => "cfheaders",
             Self::GetCFCheckpt(_) => "getcfcheckpt",
             Self::CFCheckpt(_) => "cfcheckpt",
+            Self::SendTxRcncl { .. } => "sendtxrcncl",
+            Self::FilterLoad(_) => "filterload",
+            Self::FilterAdd(_) => "filteradd",
+            Self::FilterClear => "filterclear",
+            Self::MerkleBlock(_) => "merkleblock",
             Self::Unknown { .. } => "unknown",
         }
     }
@@ -851,6 +1096,16 @@ impl NetworkMessage {
                 buf.extend_from_slice(reason.as_bytes());
                 buf
             }
+            Self::SendTxRcncl { version, salt } => {
+                let mut buf = Vec::with_capacity(12);
+                buf.extend_from_slice(&version.to_le_bytes());
+                buf.extend_from_slice(&salt.to_le_bytes());
+                buf
+            }
+            Self::FilterLoad(m) => m.encode_payload(),
+            Self::FilterAdd(m) => m.encode_payload(),
+            Self::FilterClear => Vec::new(),
+            Self::MerkleBlock(m) => m.encode_payload(),
             Self::Unknown { data, .. } => data.clone(),
         }
     }
@@ -905,6 +1160,7 @@ impl NetworkMessage {
             "getaddr" => Self::GetAddr,
             "wtxidrelay" => Self::WtxidRelay,
             "sendaddrv2" => Self::SendAddrv2,
+            "addr" => Self::Addr(AddrMessage::decode_payload(data)?),
             "addrv2" => Self::Addrv2(Addrv2Message::decode_payload(data)?),
             "mempool" => Self::Mempool,
             "getcfilters" => Self::GetCFilters(GetCFiltersMessage::decode_payload(data)?),
@@ -933,6 +1189,15 @@ impl NetworkMessage {
                 let bt = crate::compact::BlockTxn::decode_payload(data)?;
                 Self::BlockTxn(bt)
             }
+            "sendtxrcncl" if data.len() >= 12 => {
+                let version = u32::from_le_bytes(data[..4].try_into().unwrap());
+                let salt = u64::from_le_bytes(data[4..12].try_into().unwrap());
+                Self::SendTxRcncl { version, salt }
+            }
+            "filterload" => Self::FilterLoad(FilterLoadMessage::decode_payload(data)?),
+            "filteradd" => Self::FilterAdd(FilterAddMessage::decode_payload(data)?),
+            "filterclear" => Self::FilterClear,
+            "merkleblock" => Self::MerkleBlock(MerkleBlockMessage::decode_payload(data)?),
             _ => Self::Unknown {
                 command: command.to_string(),
                 data: data.to_vec(),
@@ -961,6 +1226,7 @@ mod tests {
         assert_eq!(InvType::from_u32(1), InvType::Tx);
         assert_eq!(InvType::from_u32(2), InvType::Block);
         assert_eq!(InvType::from_u32(0), InvType::Error);
+        assert_eq!(InvType::from_u32(5), InvType::WTx);
     }
 
     #[test]
@@ -973,7 +1239,7 @@ mod tests {
 
     #[test]
     fn getblocks_message_roundtrip() {
-        let m = GetBlocksMessage::new(vec![Hash256::ZERO]);
+        let m = GetBlocksMessage::new(vec![BlockHash(Hash256::ZERO)]);
         let payload = m.encode_payload();
         let decoded = GetBlocksMessage::decode_payload(&payload).unwrap();
         assert_eq!(decoded.locator_hashes.len(), 1);
@@ -1058,8 +1324,8 @@ mod tests {
 
     #[test]
     fn service_flags_constants() {
-        assert_eq!(LOCAL_SERVICES, NODE_NETWORK | NODE_WITNESS);
-        assert_eq!(LOCAL_SERVICES, 0x09); // 1 | 8
+        assert_eq!(LOCAL_SERVICES, NODE_NETWORK | NODE_WITNESS | NODE_P2P_V2);
+        assert_eq!(LOCAL_SERVICES, 0x0809); // 1 | 8 | 2048
         assert_eq!(NODE_BLOOM, 4);
         assert_eq!(NODE_COMPACT_FILTERS, 64);
         assert_eq!(NODE_NETWORK_LIMITED, 1024);
@@ -1069,13 +1335,31 @@ mod tests {
     fn service_flags_to_string_display() {
         assert_eq!(
             service_flags_to_string(LOCAL_SERVICES),
-            "NODE_NETWORK|NODE_WITNESS"
+            "NODE_NETWORK|NODE_WITNESS|NODE_P2P_V2"
         );
         assert_eq!(service_flags_to_string(0), "NONE");
         assert_eq!(
             service_flags_to_string(NODE_NETWORK | NODE_WITNESS | NODE_COMPACT_FILTERS),
             "NODE_NETWORK|NODE_WITNESS|NODE_COMPACT_FILTERS"
         );
+    }
+
+    #[test]
+    fn has_all_desirable_services_checks() {
+        // Full node + witness = desirable
+        assert!(has_all_desirable_services(NODE_NETWORK | NODE_WITNESS));
+        // Limited + witness = desirable
+        assert!(has_all_desirable_services(NODE_NETWORK_LIMITED | NODE_WITNESS));
+        // Witness alone = not desirable (no block serving)
+        assert!(!has_all_desirable_services(NODE_WITNESS));
+        // Network alone = not desirable (no witness)
+        assert!(!has_all_desirable_services(NODE_NETWORK));
+        // Zero = not desirable
+        assert!(!has_all_desirable_services(0));
+        // All flags = desirable
+        assert!(has_all_desirable_services(
+            NODE_NETWORK | NODE_WITNESS | NODE_NETWORK_LIMITED | NODE_P2P_V2
+        ));
     }
 
     #[test]
@@ -1155,5 +1439,262 @@ mod tests {
         assert_eq!(decoded.stop_hash, Hash256([0x77; 32]));
         let nm = NetworkMessage::GetCFCheckpt(msg);
         assert_eq!(nm.command(), "getcfcheckpt");
+    }
+
+    #[test]
+    fn protocol_version_constant() {
+        assert_eq!(PROTOCOL_VERSION, 70016);
+        assert_eq!(MIN_PEER_PROTO_VERSION, 31800);
+    }
+
+    #[test]
+    fn version_message_uses_protocol_constant() {
+        let v = VersionMessage::new(0, 42);
+        assert_eq!(v.version, PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn getblocks_uses_protocol_constant() {
+        let m = GetBlocksMessage::new(vec![]);
+        assert_eq!(m.version, PROTOCOL_VERSION as u32);
+    }
+
+    #[test]
+    fn sendtxrcncl_roundtrip() {
+        let msg = NetworkMessage::SendTxRcncl {
+            version: 1,
+            salt: 0x1234567890abcdef,
+        };
+        assert_eq!(msg.command(), "sendtxrcncl");
+        let payload = msg.encode_payload();
+        assert_eq!(payload.len(), 12);
+        let decoded = NetworkMessage::decode_payload("sendtxrcncl", &payload).unwrap();
+        match decoded {
+            NetworkMessage::SendTxRcncl { version, salt } => {
+                assert_eq!(version, 1);
+                assert_eq!(salt, 0x1234567890abcdef);
+            }
+            _ => panic!("expected SendTxRcncl"),
+        }
+    }
+
+    #[test]
+    fn sendtxrcncl_too_short_is_unknown() {
+        let decoded = NetworkMessage::decode_payload("sendtxrcncl", &[0; 8]).unwrap();
+        assert!(matches!(decoded, NetworkMessage::Unknown { .. }));
+    }
+
+    #[test]
+    fn filterload_roundtrip() {
+        let msg = FilterLoadMessage {
+            filter: vec![0x01, 0x02, 0x03, 0x04, 0x05],
+            n_hash_funcs: 11,
+            n_tweak: 0xdeadbeef,
+            n_flags: 1,
+        };
+        let payload = msg.encode_payload();
+        let decoded = FilterLoadMessage::decode_payload(&payload).unwrap();
+        assert_eq!(decoded.filter, vec![0x01, 0x02, 0x03, 0x04, 0x05]);
+        assert_eq!(decoded.n_hash_funcs, 11);
+        assert_eq!(decoded.n_tweak, 0xdeadbeef);
+        assert_eq!(decoded.n_flags, 1);
+        // Via NetworkMessage
+        let nm = NetworkMessage::FilterLoad(msg);
+        assert_eq!(nm.command(), "filterload");
+        let enc = nm.encode_payload();
+        let dec = NetworkMessage::decode_payload("filterload", &enc).unwrap();
+        assert!(matches!(dec, NetworkMessage::FilterLoad(_)));
+    }
+
+    #[test]
+    fn filterload_rejects_too_large() {
+        let mut data = Vec::new();
+        // varint for 36001 bytes
+        VarInt(36001).encode(&mut data).ok();
+        data.extend(vec![0u8; 36001]);
+        data.extend_from_slice(&0u32.to_le_bytes()); // n_hash_funcs
+        data.extend_from_slice(&0u32.to_le_bytes()); // n_tweak
+        data.push(0); // n_flags
+        assert!(FilterLoadMessage::decode_payload(&data).is_err());
+    }
+
+    #[test]
+    fn filterload_rejects_too_many_hash_funcs() {
+        let mut data = Vec::new();
+        VarInt(1).encode(&mut data).ok();
+        data.push(0); // 1-byte filter
+        data.extend_from_slice(&51u32.to_le_bytes()); // n_hash_funcs > 50
+        data.extend_from_slice(&0u32.to_le_bytes()); // n_tweak
+        data.push(0); // n_flags
+        assert!(FilterLoadMessage::decode_payload(&data).is_err());
+    }
+
+    #[test]
+    fn filteradd_roundtrip() {
+        let msg = FilterAddMessage {
+            element: vec![0xaa, 0xbb, 0xcc],
+        };
+        let payload = msg.encode_payload();
+        let decoded = FilterAddMessage::decode_payload(&payload).unwrap();
+        assert_eq!(decoded.element, vec![0xaa, 0xbb, 0xcc]);
+        let nm = NetworkMessage::FilterAdd(msg);
+        assert_eq!(nm.command(), "filteradd");
+        let enc = nm.encode_payload();
+        let dec = NetworkMessage::decode_payload("filteradd", &enc).unwrap();
+        assert!(matches!(dec, NetworkMessage::FilterAdd(_)));
+    }
+
+    #[test]
+    fn filteradd_rejects_too_large() {
+        let mut data = Vec::new();
+        VarInt(521).encode(&mut data).ok();
+        data.extend(vec![0u8; 521]);
+        assert!(FilterAddMessage::decode_payload(&data).is_err());
+    }
+
+    #[test]
+    fn filterclear_roundtrip() {
+        let nm = NetworkMessage::FilterClear;
+        assert_eq!(nm.command(), "filterclear");
+        let payload = nm.encode_payload();
+        assert!(payload.is_empty());
+        let dec = NetworkMessage::decode_payload("filterclear", &[]).unwrap();
+        assert!(matches!(dec, NetworkMessage::FilterClear));
+    }
+
+    #[test]
+    fn merkleblock_roundtrip() {
+        let header = BlockHeader {
+            version: 1,
+            prev_block: BlockHash(Hash256::ZERO),
+            merkle_root: Hash256::ZERO,
+            time: 1234567890,
+            bits: 0x1d00ffff,
+            nonce: 42,
+        };
+        let msg = MerkleBlockMessage {
+            header: header.clone(),
+            total_transactions: 10,
+            hashes: vec![Hash256([0xaa; 32]), Hash256([0xbb; 32])],
+            flags: vec![0x1d],
+        };
+        let payload = msg.encode_payload();
+        let decoded = MerkleBlockMessage::decode_payload(&payload).unwrap();
+        assert_eq!(decoded.total_transactions, 10);
+        assert_eq!(decoded.hashes.len(), 2);
+        assert_eq!(decoded.hashes[0], Hash256([0xaa; 32]));
+        assert_eq!(decoded.hashes[1], Hash256([0xbb; 32]));
+        assert_eq!(decoded.flags, vec![0x1d]);
+        assert_eq!(decoded.header.time, 1234567890);
+        // Via NetworkMessage
+        let nm = NetworkMessage::MerkleBlock(msg);
+        assert_eq!(nm.command(), "merkleblock");
+        let enc = nm.encode_payload();
+        let dec = NetworkMessage::decode_payload("merkleblock", &enc).unwrap();
+        assert!(matches!(dec, NetworkMessage::MerkleBlock(_)));
+    }
+
+    #[test]
+    fn addr_v1_roundtrip() {
+        // Build an addr v1 message with one IPv4-mapped-IPv6 entry
+        let msg = AddrMessage {
+            addrs: vec![
+                (1700000000, 1, {
+                    // IPv4-mapped IPv6: ::ffff:127.0.0.1
+                    let mut ip = [0u8; 16];
+                    ip[10] = 0xff;
+                    ip[11] = 0xff;
+                    ip[12] = 127;
+                    ip[13] = 0;
+                    ip[14] = 0;
+                    ip[15] = 1;
+                    ip
+                }, 8333),
+            ],
+        };
+        let nm = NetworkMessage::Addr(msg);
+        assert_eq!(nm.command(), "addr");
+        let payload = nm.encode_payload();
+        let decoded = NetworkMessage::decode_payload("addr", &payload).unwrap();
+        match decoded {
+            NetworkMessage::Addr(a) => {
+                assert_eq!(a.addrs.len(), 1);
+                let (ts, svc, ip, port) = &a.addrs[0];
+                assert_eq!(*ts, 1700000000);
+                assert_eq!(*svc, 1);
+                assert_eq!(ip[12], 127);
+                assert_eq!(*port, 8333);
+            }
+            _ => panic!("expected Addr"),
+        }
+    }
+
+    #[test]
+    fn addr_v1_multiple_entries() {
+        let msg = AddrMessage {
+            addrs: vec![
+                (100, 0x0409, [0u8; 16], 18333),
+                (200, 1, [1u8; 16], 8333),
+                (300, 8, [2u8; 16], 38333),
+            ],
+        };
+        let payload = NetworkMessage::Addr(msg).encode_payload();
+        let decoded = NetworkMessage::decode_payload("addr", &payload).unwrap();
+        match decoded {
+            NetworkMessage::Addr(a) => {
+                assert_eq!(a.addrs.len(), 3);
+                assert_eq!(a.addrs[0].0, 100);
+                assert_eq!(a.addrs[0].3, 18333);
+                assert_eq!(a.addrs[1].0, 200);
+                assert_eq!(a.addrs[2].3, 38333);
+            }
+            _ => panic!("expected Addr"),
+        }
+    }
+
+    #[test]
+    fn addr_v1_empty() {
+        // Empty addr message: just a varint 0
+        let payload = vec![0u8];
+        let decoded = NetworkMessage::decode_payload("addr", &payload).unwrap();
+        match decoded {
+            NetworkMessage::Addr(a) => assert!(a.addrs.is_empty()),
+            _ => panic!("expected Addr"),
+        }
+    }
+
+    #[test]
+    fn addr_v1_rejects_too_many() {
+        // Build payload with count = 1001 (exceeds MAX_ADDR_COUNT=1000)
+        let mut payload = Vec::new();
+        VarInt(1001).encode(&mut payload).ok();
+        // Don't need the full body — decode should reject on count alone
+        let result = NetworkMessage::decode_payload("addr", &payload);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn inv_type_wtx() {
+        assert_eq!(InvType::from_u32(5), InvType::WTx);
+        assert_eq!(InvType::WTx as u32, 5);
+        assert!(InvType::WTx.is_tx());
+        assert!(InvType::WTx.is_wtxid());
+        assert!(InvType::Tx.is_tx());
+        assert!(!InvType::Tx.is_wtxid());
+        assert!(!InvType::Block.is_tx());
+    }
+
+    #[test]
+    fn inv_wtx_roundtrip() {
+        // Encode an inventory item with WTx type and decode it back
+        let inv = Inventory {
+            inv_type: InvType::WTx,
+            hash: Hash256([0xab; 32]),
+        };
+        let mut buf = Vec::new();
+        inv.encode(&mut buf).unwrap();
+        let decoded = Inventory::decode(&mut std::io::Cursor::new(&buf)).unwrap();
+        assert_eq!(decoded.inv_type, InvType::WTx);
+        assert_eq!(decoded.hash, Hash256([0xab; 32]));
     }
 }

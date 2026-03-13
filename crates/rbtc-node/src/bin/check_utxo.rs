@@ -1,4 +1,4 @@
-use rbtc_primitives::hash::Hash256;
+use rbtc_primitives::hash::Txid;
 use rbtc_primitives::transaction::OutPoint;
 use rbtc_storage::db::Database;
 use rbtc_storage::UtxoStore;
@@ -21,10 +21,10 @@ fn main() {
     let db = Database::open(&db_path).expect("failed to open DB");
     let store = UtxoStore::new(&db);
 
-    let txid = Hash256::from_hex(&txid_hex).expect("invalid txid hex");
+    let txid = Txid::from_hex(&txid_hex).expect("invalid txid hex");
     let outpoint = OutPoint { txid, vout };
 
-    println!("Internal txid bytes: {}", hex::encode(txid.0));
+    println!("Internal txid bytes: {}", hex::encode(txid.0.0));
 
     match store.get(&outpoint) {
         Ok(Some(utxo)) => {

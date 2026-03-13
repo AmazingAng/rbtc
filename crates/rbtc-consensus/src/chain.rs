@@ -2,57 +2,24 @@ use std::collections::HashMap;
 
 use rbtc_crypto::sha256d;
 use rbtc_primitives::codec::Encodable;
+use rbtc_primitives::uint256::U256;
 use rbtc_primitives::{
     block::{Block, BlockHeader},
+    block_status::BLOCK_VALID_TREE,
     constants::{DIFFICULTY_ADJUSTMENT_INTERVAL, MEDIAN_TIME_SPAN},
-    hash::{BlockHash, Hash256},
+    hash::BlockHash,
     network::Network,
 };
 
 use crate::{
-    difficulty::{bits_to_work, is_adjustment_height, next_bits},
+    difficulty::{bits_to_work, is_adjustment_height, next_bits_bip94},
     error::ConsensusError,
     tx_verify::MedianTimeProvider,
     utxo::UtxoSet,
 };
 
-/// Status of a block in the block index
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BlockStatus {
-    /// Header seen but not validated
-    HeaderOnly,
-    /// Transactions downloaded
-    Valid,
-    /// Fully validated and part of the best chain
-    InChain,
-    /// Invalid block
-    Invalid,
-    /// Block was pruned (CF_BLOCK_DATA deleted to save disk space).
-    /// The block header and UTXO state are still available.
-    Pruned,
-}
-
-impl BlockStatus {
-    pub fn as_u8(self) -> u8 {
-        match self {
-            BlockStatus::HeaderOnly => 0,
-            BlockStatus::Valid => 1,
-            BlockStatus::InChain => 2,
-            BlockStatus::Invalid => 3,
-            BlockStatus::Pruned => 4,
-        }
-    }
-
-    pub fn from_u8(b: u8) -> Self {
-        match b {
-            1 => BlockStatus::Valid,
-            2 => BlockStatus::InChain,
-            3 => BlockStatus::Invalid,
-            4 => BlockStatus::Pruned,
-            _ => BlockStatus::HeaderOnly,
-        }
-    }
-}
+// BlockStatus is now the bitflags struct from rbtc_primitives::block_status.
+pub use rbtc_primitives::block_status::BlockStatus;
 
 /// An entry in the block index (in-memory block tree)
 #[derive(Debug, Clone)]
@@ -61,7 +28,7 @@ pub struct BlockIndex {
     pub header: BlockHeader,
     pub height: u32,
     /// Cumulative chainwork up to and including this block
-    pub chainwork: u128,
+    pub chainwork: U256,
     pub status: BlockStatus,
 }
 
@@ -161,7 +128,8 @@ impl ChainState {
             None => return tip.header.bits,
         };
 
-        next_bits(&period_start.header, &tip.header)
+        let params = self.network.consensus_params();
+        next_bits_bip94(&period_start.header, &tip.header, params.enforce_bip94, params.pow_target_timespan)
     }
 
     /// Add a block header to the index (does not connect it to the chain)
@@ -191,7 +159,7 @@ impl ChainState {
                 header,
                 height,
                 chainwork,
-                status: BlockStatus::HeaderOnly,
+                status: BlockStatus::new().with_validity(BLOCK_VALID_TREE),
             },
         );
 
@@ -217,7 +185,7 @@ impl ChainState {
             .map(|tx| {
                 let mut buf = Vec::new();
                 tx.encode_legacy(&mut buf).ok();
-                sha256d(&buf)
+                rbtc_primitives::hash::Txid(sha256d(&buf))
             })
             .collect();
 
@@ -225,14 +193,9 @@ impl ChainState {
         self.utxos
             .connect_block(&txids, &block.transactions, height);
 
-        // Mark block as in-chain
-        if let Some(bi) = self.block_index.get_mut(&block_hash) {
-            bi.status = BlockStatus::InChain;
-        }
-
         // Update active chain
         if height as usize >= self.active_chain.len() {
-            self.active_chain.resize(height as usize + 1, Hash256::ZERO);
+            self.active_chain.resize(height as usize + 1, BlockHash::ZERO);
         }
         self.active_chain[height as usize] = block_hash;
 
@@ -242,7 +205,7 @@ impl ChainState {
             .best_tip
             .and_then(|h| self.block_index.get(&h))
             .map(|bi| bi.chainwork)
-            .unwrap_or(0);
+            .unwrap_or(U256::ZERO);
 
         if new_work > current_work {
             self.best_tip = Some(block_hash);
@@ -252,24 +215,35 @@ impl ChainState {
     }
 
     /// Directly insert a BlockIndex entry (used when rebuilding from persistent storage).
-    /// Updates active_chain and best_tip if the block is InChain.
-    pub fn insert_block_index(&mut self, hash: BlockHash, index: BlockIndex) {
-        if index.status == BlockStatus::InChain {
+    /// If `in_chain` is true, also updates active_chain and best_tip.
+    pub fn insert_block_index(&mut self, hash: BlockHash, index: BlockIndex, in_chain: bool) {
+        if in_chain {
             let h = index.height as usize;
             if h >= self.active_chain.len() {
-                self.active_chain.resize(h + 1, Hash256::ZERO);
+                self.active_chain.resize(h + 1, BlockHash::ZERO);
             }
             self.active_chain[h] = hash;
             let cur_work = self
                 .best_tip
                 .and_then(|t| self.block_index.get(&t))
                 .map(|bi| bi.chainwork)
-                .unwrap_or(0);
+                .unwrap_or(U256::ZERO);
             if index.chainwork > cur_work {
                 self.best_tip = Some(hash);
             }
         }
         self.block_index.insert(hash, index);
+    }
+
+    /// Check if a block is in the active chain.
+    pub fn is_in_active_chain(&self, hash: &BlockHash) -> bool {
+        self.block_index
+            .get(hash)
+            .map(|bi| {
+                let h = bi.height as usize;
+                h < self.active_chain.len() && self.active_chain[h] == *hash
+            })
+            .unwrap_or(false)
     }
 
     /// Disconnect the tip block (for reorg)
@@ -287,11 +261,6 @@ impl ChainState {
         let prev_hash = tip.header.prev_block;
         let height = tip.height;
 
-        // Mark tip as no longer in chain
-        if let Some(bi) = self.block_index.get_mut(&tip_hash) {
-            bi.status = BlockStatus::Valid;
-        }
-
         // Trim active chain
         self.active_chain.truncate(height as usize);
         self.best_tip = Some(prev_hash);
@@ -306,51 +275,54 @@ impl MedianTimeProvider for ChainState {
     }
 }
 
+impl crate::versionbits::VersionBitsBlockInfo for ChainState {
+    fn median_time_past(&self, height: u32) -> u32 {
+        ChainState::median_time_past(self, height)
+    }
+
+    fn block_version(&self, height: u32) -> i32 {
+        self.active_chain
+            .get(height as usize)
+            .and_then(|hash| self.block_index.get(hash))
+            .map(|bi| bi.header.version)
+            .unwrap_or(1)
+    }
+}
+
 pub fn header_hash(header: &BlockHeader) -> BlockHash {
     let mut buf = Vec::with_capacity(80);
     header.version.encode(&mut buf).ok();
-    header.prev_block.0.encode(&mut buf).ok();
+    header.prev_block.0.0.encode(&mut buf).ok();
     header.merkle_root.0.encode(&mut buf).ok();
     header.time.encode(&mut buf).ok();
     header.bits.encode(&mut buf).ok();
     header.nonce.encode(&mut buf).ok();
-    sha256d(&buf)
+    BlockHash(sha256d(&buf))
 }
 
 fn genesis_hash(network: Network) -> BlockHash {
     let hex = network.genesis_hash();
-    BlockHash::from_hex(hex).unwrap_or(Hash256::ZERO)
+    BlockHash::from_hex(hex).unwrap_or(BlockHash::ZERO)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rbtc_primitives::block_status::*;
+    use rbtc_primitives::hash::Hash256;
+    use rbtc_primitives::uint256::U256;
 
-    #[test]
-    fn block_status_equality() {
-        assert_eq!(BlockStatus::HeaderOnly, BlockStatus::HeaderOnly);
-        assert_ne!(BlockStatus::Valid, BlockStatus::InChain);
-    }
-
-    #[test]
-    fn block_status_as_u8_from_u8() {
-        assert_eq!(BlockStatus::HeaderOnly.as_u8(), 0);
-        assert_eq!(BlockStatus::Valid.as_u8(), 1);
-        assert_eq!(BlockStatus::InChain.as_u8(), 2);
-        assert_eq!(BlockStatus::Invalid.as_u8(), 3);
-        assert_eq!(BlockStatus::Pruned.as_u8(), 4);
-        assert_eq!(BlockStatus::from_u8(0), BlockStatus::HeaderOnly);
-        assert_eq!(BlockStatus::from_u8(1), BlockStatus::Valid);
-        assert_eq!(BlockStatus::from_u8(2), BlockStatus::InChain);
-        assert_eq!(BlockStatus::from_u8(3), BlockStatus::Invalid);
-        assert_eq!(BlockStatus::from_u8(4), BlockStatus::Pruned);
-        assert_eq!(BlockStatus::from_u8(99), BlockStatus::HeaderOnly);
+    fn status_valid_scripts_data() -> BlockStatus {
+        BlockStatus::new()
+            .with_validity(BLOCK_VALID_SCRIPTS)
+            .with_data()
+            .with_undo()
     }
 
     #[test]
     fn insert_block_index_in_chain_updates_active_chain_and_best_tip() {
         let mut chain = ChainState::new(Network::Regtest);
-        let hash = Hash256([1; 32]);
+        let hash = BlockHash(Hash256([1; 32]));
         let index = BlockIndex {
             hash,
             header: BlockHeader {
@@ -362,15 +334,15 @@ mod tests {
                 nonce: 0,
             },
             height: 0,
-            chainwork: 100,
-            status: BlockStatus::InChain,
+            chainwork: U256::from_u64(100),
+            status: status_valid_scripts_data(),
         };
-        chain.insert_block_index(hash, index);
+        chain.insert_block_index(hash, index, true);
         assert_eq!(chain.best_hash(), Some(hash));
         assert_eq!(chain.height(), 0);
         assert_eq!(chain.get_ancestor_hash(0), Some(hash));
 
-        let hash2 = Hash256([2; 32]);
+        let hash2 = BlockHash(Hash256([2; 32]));
         let index2 = BlockIndex {
             hash: hash2,
             header: BlockHeader {
@@ -382,10 +354,10 @@ mod tests {
                 nonce: 0,
             },
             height: 1,
-            chainwork: 200,
-            status: BlockStatus::InChain,
+            chainwork: U256::from_u64(200),
+            status: status_valid_scripts_data(),
         };
-        chain.insert_block_index(hash2, index2);
+        chain.insert_block_index(hash2, index2, true);
         assert_eq!(chain.best_hash(), Some(hash2));
         assert_eq!(chain.get_ancestor_hash(1), Some(hash2));
     }
@@ -393,7 +365,7 @@ mod tests {
     #[test]
     fn insert_block_index_non_in_chain_does_not_update_tip() {
         let mut chain = ChainState::new(Network::Regtest);
-        let hash = Hash256([3; 32]);
+        let hash = BlockHash(Hash256([3; 32]));
         let index = BlockIndex {
             hash,
             header: BlockHeader {
@@ -405,10 +377,10 @@ mod tests {
                 nonce: 0,
             },
             height: 0,
-            chainwork: 100,
-            status: BlockStatus::HeaderOnly,
+            chainwork: U256::from_u64(100),
+            status: BlockStatus::new().with_validity(BLOCK_VALID_TREE),
         };
-        chain.insert_block_index(hash, index);
+        chain.insert_block_index(hash, index, false);
         assert!(chain.best_hash().is_none());
     }
 
@@ -425,8 +397,8 @@ mod tests {
                 nonce: 0,
             },
             height: 10,
-            chainwork: 0,
-            status: BlockStatus::HeaderOnly,
+            chainwork: U256::ZERO,
+            status: BlockStatus::new().with_validity(BLOCK_VALID_TREE),
         };
         let get_ts = |h: u32| Some(100 + h);
         let mtp = bi.median_time_past(&get_ts);
@@ -468,7 +440,7 @@ mod tests {
         let mut chain = ChainState::new(Network::Regtest);
         let header = BlockHeader {
             version: 1,
-            prev_block: Hash256([1; 32]),
+            prev_block: BlockHash(Hash256([1; 32])),
             merkle_root: Hash256::ZERO,
             time: 1231006506,
             bits: 0x1d00ffff,
@@ -490,7 +462,7 @@ mod tests {
             nonce: 0,
         };
         let h = header_hash(&header);
-        assert_eq!(h.0.len(), 32);
+        assert_eq!(h.0.0.len(), 32);
     }
 
     #[test]
@@ -525,8 +497,8 @@ mod tests {
     #[test]
     fn get_ancestor_time_and_median_time_past() {
         let mut chain = ChainState::new(Network::Regtest);
-        let h0 = Hash256([10; 32]);
-        let h1 = Hash256([11; 32]);
+        let h0 = BlockHash(Hash256([10; 32]));
+        let h1 = BlockHash(Hash256([11; 32]));
         chain.insert_block_index(
             h0,
             BlockIndex {
@@ -540,9 +512,10 @@ mod tests {
                     nonce: 0,
                 },
                 height: 0,
-                chainwork: 1,
-                status: BlockStatus::InChain,
+                chainwork: U256::from_u64(1),
+                status: status_valid_scripts_data(),
             },
+            true,
         );
         chain.insert_block_index(
             h1,
@@ -557,9 +530,10 @@ mod tests {
                     nonce: 0,
                 },
                 height: 1,
-                chainwork: 2,
-                status: BlockStatus::InChain,
+                chainwork: U256::from_u64(2),
+                status: status_valid_scripts_data(),
             },
+            true,
         );
         assert_eq!(chain.get_ancestor_time(0), Some(100));
         assert_eq!(chain.get_ancestor_time(1), Some(200));
@@ -569,7 +543,7 @@ mod tests {
     #[test]
     fn next_required_bits_with_tip() {
         let mut chain = ChainState::new(Network::Regtest);
-        let h0 = Hash256([20; 32]);
+        let h0 = BlockHash(Hash256([20; 32]));
         chain.insert_block_index(
             h0,
             BlockIndex {
@@ -583,9 +557,10 @@ mod tests {
                     nonce: 0,
                 },
                 height: 0,
-                chainwork: 1,
-                status: BlockStatus::InChain,
+                chainwork: U256::from_u64(1),
+                status: status_valid_scripts_data(),
             },
+            true,
         );
         assert_eq!(chain.next_required_bits(), 0x1d00ffff);
     }

@@ -332,7 +332,7 @@ fn parse_prevouts(arr: &Value) -> Result<Vec<Prevout>, String> {
 
         result.push(Prevout {
             txout: TxOut {
-                value: amount,
+                value: amount as i64,
                 script_pubkey: Script::from_bytes(spk),
             },
         });
@@ -342,7 +342,7 @@ fn parse_prevouts(arr: &Value) -> Result<Vec<Prevout>, String> {
 
 // ─── Basic CheckTransaction (mirrors Bitcoin Core) ────────────────────────────
 
-const MAX_MONEY: u64 = 21_000_000 * 100_000_000;
+const MAX_MONEY: i64 = 21_000_000 * 100_000_000;
 
 fn check_transaction(tx: &Transaction) -> Result<(), String> {
     if tx.inputs.is_empty() {
@@ -352,8 +352,11 @@ fn check_transaction(tx: &Transaction) -> Result<(), String> {
         return Err("no outputs".into());
     }
 
-    let mut total_out: u64 = 0;
+    let mut total_out: i64 = 0;
     for out in &tx.outputs {
+        if out.value < 0 {
+            return Err(format!("output value {} is negative", out.value));
+        }
         if out.value > MAX_MONEY {
             return Err(format!("output value {} exceeds MAX_MONEY", out.value));
         }
@@ -381,7 +384,7 @@ fn check_transaction(tx: &Transaction) -> Result<(), String> {
     if !tx.is_coinbase() {
         for inp in &tx.inputs {
             let is_null =
-                inp.previous_output.txid.0 == [0u8; 32] && inp.previous_output.vout == u32::MAX;
+                inp.previous_output.txid.0.0 == [0u8; 32] && inp.previous_output.vout == u32::MAX;
             if is_null {
                 return Err(format!("non-coinbase input has null outpoint"));
             }

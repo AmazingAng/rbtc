@@ -4,7 +4,7 @@ use bech32::{segwit, Fe32, Hrp};
 use secp256k1::{Keypair, PublicKey, Scalar, XOnlyPublicKey};
 use sha2::{Digest, Sha256};
 
-use rbtc_crypto::{hash160, tagged_hash};
+use rbtc_crypto::{hash160, sha256, tagged_hash};
 use rbtc_primitives::{network::Network, script::Script};
 
 use crate::error::WalletError;
@@ -15,6 +15,8 @@ use crate::error::WalletError;
 pub enum AddressType {
     /// Legacy P2PKH — BIP44 path m/44'/coin'/account'/change/index
     Legacy,
+    /// P2SH-wrapped SegWit P2WPKH — BIP49 path m/49'/coin'/account'/change/index
+    P2shP2wpkh,
     /// Native SegWit P2WPKH — BIP84 path m/84'/coin'/account'/change/index
     SegWit,
     /// Taproot P2TR — BIP86 path m/86'/coin'/account'/change/index
@@ -25,6 +27,7 @@ impl AddressType {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "legacy" | "p2pkh" => Some(Self::Legacy),
+            "p2sh-p2wpkh" | "p2sh_p2wpkh" | "nested-segwit" => Some(Self::P2shP2wpkh),
             "bech32" | "p2wpkh" | "segwit" => Some(Self::SegWit),
             "bech32m" | "p2tr" | "taproot" => Some(Self::Taproot),
             _ => None,
@@ -37,7 +40,7 @@ impl AddressType {
 fn bech32_hrp(network: Network) -> Hrp {
     let s = match network {
         Network::Mainnet => "bc",
-        Network::Testnet4 => "tb",
+        Network::Testnet3 | Network::Testnet4 => "tb",
         Network::Regtest => "bcrt",
         Network::Signet => "tb",
     };
@@ -52,9 +55,8 @@ fn p2pkh_version(network: Network) -> u8 {
     }
 }
 
-/// Version byte for P2SH addresses (not currently used for derivation but kept for completeness).
-#[allow(dead_code)]
-fn p2sh_version(network: Network) -> u8 {
+/// Version byte for P2SH addresses.
+pub(crate) fn p2sh_version(network: Network) -> u8 {
     match network {
         Network::Mainnet => 0x05,
         _ => 0xc4,
@@ -71,6 +73,53 @@ fn base58check_encode(payload: &[u8]) -> String {
 }
 
 // ── Address construction ──────────────────────────────────────────────────────
+
+/// Construct a P2SH address from a 20-byte script hash (HASH160 of the redeemScript).
+pub fn p2sh_address(script_hash: &[u8; 20], network: Network) -> String {
+    let mut versioned = Vec::with_capacity(21);
+    versioned.push(p2sh_version(network));
+    versioned.extend_from_slice(script_hash);
+    base58check_encode(&versioned)
+}
+
+/// Construct a P2SH-P2WPKH (nested SegWit) address from a 20-byte pubkey hash.
+///
+/// This wraps a P2WPKH witness program (`OP_0 <20-byte-pubkey-hash>`) inside
+/// a P2SH address.  The redeemScript is the 22-byte witness program; the
+/// address is `base58check(0x05 || HASH160(redeemScript))` on mainnet.
+pub fn p2sh_p2wpkh_address(pubkey_hash: &[u8; 20], network: Network) -> String {
+    // redeemScript = OP_0 PUSH20 <pubkey_hash>  (22 bytes)
+    let mut redeem_script = Vec::with_capacity(22);
+    redeem_script.push(0x00); // OP_0
+    redeem_script.push(0x14); // push 20 bytes
+    redeem_script.extend_from_slice(pubkey_hash);
+
+    let script_hash = hash160(&redeem_script);
+    p2sh_address(&script_hash.0, network)
+}
+
+/// Generate a P2WSH address from a witness script.
+/// The address encodes SHA256(witness_script) as a bech32 witness v0 program.
+pub fn p2wsh_address(witness_script: &[u8], network: Network) -> String {
+    let script_hash = sha256(witness_script);
+    let hrp = bech32_hrp(network);
+    let witver = Fe32::try_from(0u8).unwrap(); // witness version 0 → bech32
+    segwit::encode(hrp, witver, &script_hash.0)
+        .expect("32-byte program with witness v0 is always valid bech32")
+}
+
+/// Generate a P2SH-wrapped P2WSH address from a witness script.
+pub fn p2sh_p2wsh_address(witness_script: &[u8], network: Network) -> String {
+    // witness program = OP_0 PUSH32 <sha256(witness_script)>  (34 bytes)
+    let script_hash = sha256(witness_script);
+    let mut witness_program = Vec::with_capacity(34);
+    witness_program.push(0x00); // OP_0
+    witness_program.push(0x20); // push 32 bytes
+    witness_program.extend_from_slice(&script_hash.0);
+
+    let program_hash = hash160(&witness_program);
+    p2sh_address(&program_hash.0, network)
+}
 
 /// Construct a P2PKH address from a compressed/uncompressed public key.
 pub fn p2pkh_address(pubkey: &PublicKey, network: Network) -> String {
@@ -140,6 +189,39 @@ pub fn p2wpkh_script(pubkey: &PublicKey) -> Script {
     Script::from_bytes(v)
 }
 
+/// Build the P2SH scriptPubKey for a P2SH-P2WPKH output.
+///
+/// The redeemScript is `OP_0 <20-byte-pubkey-hash>` (a P2WPKH witness program).
+/// The scriptPubKey is `OP_HASH160 <HASH160(redeemScript)> OP_EQUAL`.
+pub fn p2sh_p2wpkh_script(pubkey: &PublicKey) -> Script {
+    let pubkey_hash = hash160(&pubkey.serialize());
+
+    // redeemScript = OP_0 PUSH20 <pubkey_hash>  (22 bytes)
+    let mut redeem_script = Vec::with_capacity(22);
+    redeem_script.push(0x00); // OP_0
+    redeem_script.push(0x14); // push 20 bytes
+    redeem_script.extend_from_slice(&pubkey_hash.0);
+
+    let script_hash = hash160(&redeem_script);
+
+    // scriptPubKey = OP_HASH160 PUSH20 <script_hash> OP_EQUAL  (23 bytes)
+    let mut v = Vec::with_capacity(23);
+    v.push(0xa9); // OP_HASH160
+    v.push(0x14); // push 20 bytes
+    v.extend_from_slice(&script_hash.0);
+    v.push(0x87); // OP_EQUAL
+    Script::from_bytes(v)
+}
+
+/// Construct a P2SH-P2WPKH address from a compressed public key.
+pub fn p2sh_p2wpkh_address_from_pubkey(
+    pubkey: &PublicKey,
+    network: Network,
+) -> String {
+    let pubkey_hash = hash160(&pubkey.serialize());
+    p2sh_p2wpkh_address(&pubkey_hash.0, network)
+}
+
 /// Build the scriptPubKey for a P2TR output given the *output* x-only key.
 pub fn p2tr_script(output_key: &XOnlyPublicKey) -> Script {
     let key_bytes = output_key.serialize();
@@ -147,6 +229,16 @@ pub fn p2tr_script(output_key: &XOnlyPublicKey) -> Script {
     v.push(0x51); // OP_1
     v.push(0x20); // push 32 bytes
     v.extend_from_slice(&key_bytes);
+    Script::from_bytes(v)
+}
+
+/// Build the scriptPubKey for a P2WSH output from a witness script.
+pub fn p2wsh_script(witness_script: &[u8]) -> Script {
+    let script_hash = sha256(witness_script);
+    let mut v = Vec::with_capacity(34);
+    v.push(0x00); // OP_0
+    v.push(0x20); // push 32 bytes
+    v.extend_from_slice(&script_hash.0);
     Script::from_bytes(v)
 }
 
@@ -291,5 +383,137 @@ mod tests {
         let addr = p2tr_address(&kp, Network::Mainnet).unwrap();
         let spk = address_to_script(&addr).unwrap();
         assert!(spk.is_p2tr());
+    }
+
+    #[test]
+    fn p2sh_address_mainnet_prefix() {
+        let script_hash = [0xabu8; 20];
+        let addr = p2sh_address(&script_hash, Network::Mainnet);
+        assert!(
+            addr.starts_with('3'),
+            "mainnet P2SH should start with '3', got {addr}"
+        );
+    }
+
+    #[test]
+    fn p2sh_address_testnet_prefix() {
+        let script_hash = [0xabu8; 20];
+        let addr = p2sh_address(&script_hash, Network::Testnet4);
+        assert!(
+            addr.starts_with('2'),
+            "testnet P2SH should start with '2', got {addr}"
+        );
+    }
+
+    #[test]
+    fn p2sh_address_roundtrip_via_address_to_script() {
+        let script_hash = [0x42u8; 20];
+        let addr = p2sh_address(&script_hash, Network::Mainnet);
+        let spk = address_to_script(&addr).unwrap();
+        assert!(spk.is_p2sh(), "decoded script should be P2SH");
+    }
+
+    #[test]
+    fn p2sh_p2wpkh_address_mainnet() {
+        let (pk, _) = test_key();
+        let h160 = hash160(&pk.serialize());
+        let addr = p2sh_p2wpkh_address(&h160.0, Network::Mainnet);
+        assert!(
+            addr.starts_with('3'),
+            "mainnet P2SH-P2WPKH should start with '3', got {addr}"
+        );
+        // Verify it decodes as P2SH
+        let spk = address_to_script(&addr).unwrap();
+        assert!(spk.is_p2sh());
+    }
+
+    #[test]
+    fn p2sh_p2wpkh_address_testnet() {
+        let (pk, _) = test_key();
+        let h160 = hash160(&pk.serialize());
+        let addr = p2sh_p2wpkh_address(&h160.0, Network::Testnet4);
+        assert!(
+            addr.starts_with('2'),
+            "testnet P2SH-P2WPKH should start with '2', got {addr}"
+        );
+    }
+
+    // ── P2WSH tests ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn p2wsh_address_mainnet_prefix() {
+        // A simple witness script (OP_1 = 0x51)
+        let witness_script = vec![0x51];
+        let addr = p2wsh_address(&witness_script, Network::Mainnet);
+        // P2WSH bech32 addresses start with bc1q and are longer than P2WPKH
+        // (32-byte program vs 20-byte)
+        assert!(
+            addr.starts_with("bc1q"),
+            "mainnet P2WSH should start with 'bc1q', got {addr}"
+        );
+        // P2WSH addresses are longer than P2WPKH (62 chars for mainnet vs 42)
+        assert!(
+            addr.len() > 50,
+            "P2WSH address should be longer than P2WPKH, got len={}",
+            addr.len()
+        );
+    }
+
+    #[test]
+    fn p2wsh_address_testnet_prefix() {
+        let witness_script = vec![0x51];
+        let addr = p2wsh_address(&witness_script, Network::Testnet4);
+        assert!(
+            addr.starts_with("tb1q"),
+            "testnet P2WSH should start with 'tb1q', got {addr}"
+        );
+    }
+
+    #[test]
+    fn p2sh_p2wsh_address_mainnet_prefix() {
+        let witness_script = vec![0x51];
+        let addr = p2sh_p2wsh_address(&witness_script, Network::Mainnet);
+        assert!(
+            addr.starts_with('3'),
+            "mainnet P2SH-P2WSH should start with '3', got {addr}"
+        );
+        // Verify it decodes as P2SH
+        let spk = address_to_script(&addr).unwrap();
+        assert!(spk.is_p2sh());
+    }
+
+    #[test]
+    fn p2sh_p2wsh_address_testnet_prefix() {
+        let witness_script = vec![0x51];
+        let addr = p2sh_p2wsh_address(&witness_script, Network::Testnet4);
+        assert!(
+            addr.starts_with('2'),
+            "testnet P2SH-P2WSH should start with '2', got {addr}"
+        );
+    }
+
+    #[test]
+    fn p2wsh_roundtrip_script_hash() {
+        use rbtc_crypto::sha256 as crypto_sha256;
+
+        // Create a witness script, generate address, decode back, verify hash
+        let witness_script = vec![0x52, 0x21]; // some arbitrary script bytes
+        let addr = p2wsh_address(&witness_script, Network::Mainnet);
+        let spk = address_to_script(&addr).unwrap();
+
+        // scriptPubKey should be OP_0 PUSH32 <sha256(witness_script)>
+        assert!(spk.is_p2wsh(), "decoded script should be P2WSH");
+
+        let spk_bytes = spk.as_bytes();
+        let expected_hash = crypto_sha256(&witness_script);
+        // spk_bytes[0] = 0x00 (OP_0), spk_bytes[1] = 0x20, spk_bytes[2..34] = hash
+        assert_eq!(&spk_bytes[2..34], &expected_hash.0);
+    }
+
+    #[test]
+    fn p2wsh_script_correct() {
+        let witness_script = vec![0x51, 0xae]; // OP_1 OP_CHECKMULTISIG
+        let spk = p2wsh_script(&witness_script);
+        assert!(spk.is_p2wsh());
     }
 }

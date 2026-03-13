@@ -225,12 +225,16 @@ curl -s -d '{"method":"sendtoaddress","params":["bc1q...","0.001"]}' http://127.
 
 ### Mempool (`rbtc-mempool`)
 
-- `accept_tx()`: full consensus validation + fee-rate gate (min 1 sat/vbyte)
+- `accept_tx()`: full consensus validation + fee-rate gate (min 1 sat/vbyte) + BIP68 `CheckSequenceLocks` enforcement
 - Chained transactions: a mempool UTXO view merges chain outputs + in-mempool outputs
 - `remove_confirmed()`: prunes confirmed transactions when a block is connected
-- **BIP125 RBF**: conflict detection, fee-rate sufficiency check, ≤ 100 replacement limit
+- **BIP125 RBF**: conflict detection, fee-rate sufficiency, Rules 1 (no new unconfirmed inputs) & 4 (≤ 100 eviction candidates), descendant eviction
 - **CPFP**: `ancestor_fee_rate` field + `ancestor_package()` recursive computation; `txids_by_fee_rate()` sorts by ancestor fee rate
 - **Size cap eviction**: `with_max_vsize()` / `evict_below_fee_rate()`; controlled by `--mempool-size`
+- **Rolling minimum fee rate**: exponential decay (halving every 10 s) prevents re-admission of recently evicted low-fee transactions
+- **wtxid tracking**: each `MempoolEntry` stores both txid and wtxid; `wtxid_index` provides O(1) witness-aware lookup
+- **IsWitnessStandard**: P2WSH stack limits (100 items, 80 bytes each, 3600-byte script), P2WPKH witness count, taproot annex rejection
+- **Fee estimation**: `CBlockPolicyEstimator`-style bucket-based estimator tracking confirmation targets
 
 ### P2P Layer (`rbtc-net`)
 
@@ -262,7 +266,9 @@ curl -s -d '{"method":"sendtoaddress","params":["bc1q...","0.001"]}' http://127.
 - **Creator**: `Psbt::create(tx)` strips all scriptSig/witness fields, producing a fully unsigned PSBT global map
 - **Signer**: BIP143 P2WPKH sighash (hashPrevouts + hashSequence + hashOutputs) computed locally; legacy P2PKH sighash using a cloned unsigned transaction; ECDSA signatures DER-encoded with sighash-type byte appended
 - **Combiner**: `combine()` merges partial signatures, UTXOs, and unknown fields using `or_insert` semantics — no duplicates, no overwrite
-- **Finalizer**: single-sig P2WPKH → `final_script_witness = [sig, pubkey]`; single-sig P2PKH → `final_script_sig = <sig><pk>`
+- **Finalizer**: P2WPKH → `final_script_witness = [sig, pubkey]`; P2PKH → `final_script_sig = <sig><pk>`; P2TR key-path → `final_script_witness = [schnorr_sig]`; P2TR script-path → `final_script_witness = [sig, script, control_block]`; P2WSH/P2SH multisig → ordered M-of-N signatures with `OP_0` dummy
+- **BIP370 (PSBT v2)**: global fields `tx_version`, `fallback_locktime`, `input_count`, `output_count`, `tx_modifiable`; per-input `previous_txid`, `output_index`, `sequence`; per-output `amount`, `script`
+- **BIP371 (Taproot)**: `TAP_KEY_SIG`, `TAP_SCRIPT_SIG`, `TAP_LEAF_SCRIPT`, `TAP_BIP32_DERIVATION`, `TAP_INTERNAL_KEY`, `TAP_MERKLE_ROOT` for inputs; `TAP_INTERNAL_KEY`, `TAP_TREE`, `TAP_BIP32_DERIVATION` for outputs
 - **Extractor**: `extract_tx()` fails if any input lacks `final_script_sig` or `final_script_witness`
 - **Wallet integration**: `walletprocesspsbt` uses `Wallet::key_for_script()` to look up the private key by scriptPubKey for each input
 
@@ -270,7 +276,7 @@ curl -s -d '{"method":"sendtoaddress","params":["bc1q...","0.001"]}' http://127.
 
 - **Block template**: `BlockTemplate::new()` receives chain tip info + mempool-selected transactions. `build_block(extra_nonce, time, nonce)` rebuilds the coinbase, computes TXIDs, constructs the Merkle tree, and returns a full `Block` candidate
 - **Coinbase construction**: `build_coinbase()` encodes block height via BIP34 CScriptNum push (1–4 bytes, little-endian with sign extension), appends a 4-byte `extra_nonce` push and a 5-byte `"rbtc\0"` coinbase tag; total scriptSig is always 2–100 bytes
-- **Transaction selection**: `TxSelector::select()` iterates `mempool.txids_by_fee_rate()` (descending fee-rate) and greedily includes transactions up to 3,996,000 WU, leaving headroom for the coinbase
+- **Transaction selection**: `TxSelector::select()` uses CPFP-aware ancestor-package scoring with a max-heap; enforces block weight limit (3,996,000 WU), sigop budget (80,000 - 400 reserved for coinbase), and `IsFinalTx()` locktime checks
 - **PoW loop**: `mine_block()` pre-computes the Merkle root once per `extra_nonce` value. The inner loop iterates nonce ∈ `[0, 2³²)`, serialises only the 80-byte header, runs `double_sha256`, and calls `BlockHeader::meets_target()`. Timestamp is refreshed every 1,000,000 iterations. On nonce exhaustion, `extra_nonce` increments and the Merkle root is recomputed
 - **Node integration**: `generatetoaddress` / `submitblock` send completed blocks via an `mpsc::UnboundedSender<Block>` channel; the node's event loop drains this channel alongside peer events and feeds blocks into the existing `handle_block()` path (validation → UTXO connect → persistence → mempool prune → wallet scan)
 
@@ -327,21 +333,21 @@ When a competing chain with more cumulative work is detected, `reorganize_to(new
 cargo test --workspace
 ```
 
-288 tests across all crates — all pass.
+569 tests across all crates — all pass.
 
 | Crate | Tests |
 |-------|-------|
-| `rbtc-primitives` | 60 |
-| `rbtc-crypto` | 33 |
-| `rbtc-consensus` | 27 |
-| `rbtc-script` | 25 |
-| `rbtc-storage` | 35 |
-| `rbtc-mempool` | 4 |
-| `rbtc-net` | 14 |
-| `rbtc-psbt` | 6 |
-| `rbtc-wallet` | 35 |
-| `rbtc-miner` | 14 |
-| `rbtc-node` | 9 |
+| `rbtc-primitives` | 50 |
+| `rbtc-crypto` | 17 |
+| `rbtc-consensus` | 102 |
+| `rbtc-script` | 27 |
+| `rbtc-storage` | 39 |
+| `rbtc-mempool` | 48 |
+| `rbtc-net` | 15 |
+| `rbtc-psbt` | 19 |
+| `rbtc-wallet` | 72 |
+| `rbtc-miner` | 2 |
+| `rbtc-node` | 41 |
 
 ### Integration Tests Against Bitcoin Core
 
@@ -395,11 +401,78 @@ cargo llvm-cov --workspace --all-features --tests --lcov --output-path lcov.info
 
 ## Known Limitations
 
+### Consensus / Validation
+
+- **No automatic best-chain reorg**: the node follows the longest chain it receives sequentially but does not automatically switch to a higher-work alternative branch discovered later; reorgs only trigger via `invalidateblock`/`reconsiderblock` RPC
+- **Block failure flags**: once a block is marked invalid it cannot be automatically reconsidered; no fine-grained `BLOCK_FAILED_VALID` / `BLOCK_FAILED_CHILD` tracking
+- **BIP9 deployment not wired into validation**: `script_flags_for_block()` uses hardcoded activation heights rather than querying the BIP9 state machine at runtime
+- **Pre-BIP141 block size limit**: only block weight is checked (post-SegWit); no explicit 1 MB serialized-size limit for legacy blocks
+- **TestBlockValidity**: miner does not call a validation pass on the assembled template before returning it
+
+### Networking
+
+- **No address manager (addrman)**: peer addresses stored in a simple queue; no new/tried table bucketing or Sybil-resistance heuristics
+- **No headers-first sync state machine**: IBD downloads headers then blocks linearly; no PRESYNC/SYNCING/DONE phases, no stall detection or peer reassignment
+- **No block download stall detection**: no `mapBlocksInFlight` tracking; if a peer stops sending blocks the node waits indefinitely
+- **BIP152 compact blocks**: only high-bandwidth mode 1; no low-bandwidth mode 2 announcement support
+- **BIP324 v2 encrypted transport**: not implemented; all connections are plaintext v1
+- **No connection type distinction**: no block-relay-only, feeler, or addr-fetch connection categories
+- **Orphan DoS protections**: orphan pool exists but lacks per-peer scoring and ancestor limits
+
+### Mempool
+
+- **Ancestor/descendant vsize limits**: enforces count limits (25) but not cumulative vsize limits (101,025 vB)
+- **Bare multisig policy**: `NonStandardReason::BareMultisig` enum defined but the check is never executed
+- **PrioritiseTransaction / mapDeltas**: no RPC to override fee-rate priority for specific transactions
+- **Coinbase maturity in mempool**: `spends_coinbase` flag is tracked but immature coinbase spends are not rejected at the mempool layer (relies on consensus)
+- **nLockTime absolute check**: mempool validates BIP68 relative locks but does not check absolute `nLockTime` finality
+- **Package vsize limits**: `accept_package()` has no per-package size cap (BIP331)
+
+### Mining
+
+- **GBT fields**: `getblocktemplate` is missing `default_witness_commitment`, `depends`, `vbrequired`, `vbavailable` fields (partial BIP22 compliance)
+- **ComputeBlockVersion**: block version hardcoded to `0x20000000`; no softfork signaling via versionbits
+- **Testnet4 20-min exception**: no minimum-difficulty fallback block after 20 minutes of inactivity
+- **BIP94 timewarp check**: `GetMinimumTime` not enforced at difficulty adjustment boundaries
+- **Long-poll**: GBT returns `longpollid` but does not implement server-side waiting
+- CPU miner is single-threaded — suitable for regtest only
+
+### Wallet
+
+- **Watch-only mode**: no xpub-only wallet creation (needed for hardware wallet integration)
+- **Unconfirmed UTXO spending**: coin selection only picks confirmed UTXOs; cannot spend own change in consecutive transactions
+- **BIP49 (P2SH-P2WPKH)**: purpose-49 derivation path not supported
+- **RBF / fee bumping**: no `bumpfee` RPC or replacement tracking
+- **BIP44 accounts**: hardcoded to account index 0; no multi-account segregation
+- **Coin selection**: BnB + greedy only; no Knapsack or Single Random Draw algorithms
+- **Transaction rescan**: no `rescanblockchain` equivalent for imported keys
+- **Multi-SIGHASH**: signing always uses `SIGHASH_ALL`
+
+### PSBT
+
+- **Taproot script-path signing**: signer handles P2TR key-path only; script-path signing must be done externally
+- **Global XPUB field** (0x01): BIP174 recommended field not stored
+- **Preimage fields**: RIPEMD160/SHA256/HASH160/HASH256 (0x0A–0x0D) not implemented
+- **Duplicate key detection**: silently overwrites during deserialization
+- **Combiner consistency**: checks input/output counts but not transaction hash match
+
+### Storage
+
+- **No flat-file block storage**: all block data in RocksDB (deliberate architectural choice); incompatible with Bitcoin Core's `blk*.dat` / `rev*.dat` format
+- **Block status enum**: single `u8` status field; no `BLOCK_VALID_*` / `BLOCK_HAVE_*` flag decomposition
+- **UTXO compression**: amounts and scripts stored uncompressed; no `CompressAmount` / `TxOutCompression`
+- **Undo data checksums**: no framing or corruption detection on undo records
+- **Reindex**: no mechanism to rebuild the block index from stored blocks
+- **Process lock file**: multiple node instances can open the same datadir concurrently
+
+### Crypto
+
+- **Batch signature verification**: signatures verified one at a time; no libsecp256k1 batch API
+- **Message signing (BIP191)**: no `SignMessage` / `VerifyMessage` support
+- **Signature recovery / compact format**: no `SignCompact` / `RecoverCompact`
+
+### Other
+
 - No BIP37 bloom filtering
-- Compact Blocks (BIP152) implemented but only tested on regtest; mainnet relay may have edge-case short-ID collisions
-- Mempool eviction policy not yet implemented (no size cap)
-- `sendrawtransaction` relay requires script-valid inputs (P2PKH etc.); bare scripts that rely on policy flags may differ from Bitcoin Core behavior
-- Wallet imported keys (via `importprivkey`) are cached only for the current session; WIF keys are not re-derived from the master xprv
-- `fundrawtransaction` uses a greedy (largest-first) coin selector; Branch-and-Bound selection is a future improvement
-- CPU miner is single-threaded; no multi-core parallelism — suitable for regtest only; mainnet would require ASIC hardware
-- `generatetoaddress` waits 50 ms between blocks so the node event loop can process the previous block before the next template is built; rapid generation of many blocks may leave some unprocessed
+- Compact Blocks (BIP152) only tested on regtest; mainnet relay may have edge-case short-ID collisions
+- `generatetoaddress` waits 50 ms between blocks so the node event loop can process each block before the next template is built

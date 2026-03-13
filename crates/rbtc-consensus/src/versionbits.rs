@@ -154,12 +154,14 @@ fn count_signaling(
 ) -> u32 {
     let mask = 1i32 << deployment.bit;
     let mut count = 0u32;
-    // BIP9: version bits are in bits 0–28, with the top 3 bits = 001
-    let version_top_mask = 0x20000000i32; // bit 29 must be set for BIP9 signaling
+    // BIP9: version bits are in bits 0–28, top 3 bits must be exactly 001.
+    // Bit 29 = 0x20000000 must be set; bits 30-31 = 0x60000000 complement must be clear.
+    let version_top_bits = 0xe0000000u32 as i32; // mask for bits 29-31
+    let version_top_expected = 0x20000000i32; // exactly 001 in top 3 bits
 
     for h in period_start..period_start + interval {
         let version = chain.block_version(h);
-        if (version & version_top_mask) != 0 && (version & mask) != 0 {
+        if (version & version_top_bits) == version_top_expected && (version & mask) != 0 {
             count += 1;
         }
     }
@@ -205,7 +207,7 @@ pub fn deployments(network: Network) -> Vec<Bip9Deployment> {
                 min_activation_height: 709_632,
             },
         ],
-        Network::Signet | Network::Regtest => {
+        Network::Testnet3 | Network::Signet | Network::Regtest => {
             // On signet and regtest, all deployments are "always active"
             // (start_time=0 sentinel).
             vec![

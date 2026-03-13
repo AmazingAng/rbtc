@@ -7,3 +7,5 @@ license.workspace = true
 [dependencies]
 hex       = { workspace = true }
 thiserror = { workspace = true }
+sha2      = { workspace = true }
+smallvec  = "1"

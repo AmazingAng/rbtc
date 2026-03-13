@@ -4,7 +4,7 @@ use std::{
 };
 
 use crate::{
-    db::{Database, CF_PEER_ADDRS, CF_PEER_BANS},
+    db::{Database, CF_ADDRMAN_META, CF_PEER_ADDRS, CF_PEER_BANS},
     error::Result,
 };
 
@@ -81,16 +81,125 @@ impl<'a> PeerStore<'a> {
     pub fn load_addrs(&self) -> Result<Vec<(SocketAddr, u64, u64)>> {
         let mut result = Vec::new();
         for (key, val) in self.db.iter_cf(CF_PEER_ADDRS)? {
-            if key.len() == 18 && val.len() == 16 {
+            if key.len() == 18 && val.len() >= 16 {
                 if let Some(addr) = decode_addr_key(&key) {
                     let last_seen = u64::from_le_bytes(val[..8].try_into().unwrap());
-                    let services = u64::from_le_bytes(val[8..].try_into().unwrap());
+                    let services = u64::from_le_bytes(val[8..16].try_into().unwrap());
                     result.push((addr, last_seen, services));
                 }
             }
         }
         Ok(result)
     }
+
+    // ── AddrMan persistence ──────────────────────────────────────────────────
+
+    /// Save the addrman secret key.
+    pub fn save_addrman_key(&self, key: &[u8; 32]) -> Result<()> {
+        self.db.put_cf(CF_ADDRMAN_META, b"secret_key", key)
+    }
+
+    /// Load the addrman secret key (None if not yet created).
+    pub fn load_addrman_key(&self) -> Result<Option<[u8; 32]>> {
+        match self.db.get_cf(CF_ADDRMAN_META, b"secret_key")? {
+            Some(bytes) if bytes.len() == 32 => {
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&bytes);
+                Ok(Some(key))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Save addrman entries in extended format.
+    /// Value: last_seen(8) + services(8) + last_try(8) + last_success(8) + n_attempts(4) +
+    ///        in_tried(1) + source_ip_port(18) = 55 bytes
+    pub fn save_addrman_entries(&self, entries: &[AddrEntry]) -> Result<()> {
+        // Clear existing entries first
+        let existing: Vec<Vec<u8>> = self
+            .db
+            .iter_cf(CF_PEER_ADDRS)?
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        let mut batch = self.db.new_batch();
+        for key in &existing {
+            self.db.batch_delete_cf(&mut batch, CF_PEER_ADDRS, key)?;
+        }
+        for entry in entries {
+            let key = addr_key(entry.addr);
+            let mut val = vec![0u8; 55];
+            val[0..8].copy_from_slice(&entry.last_seen.to_le_bytes());
+            val[8..16].copy_from_slice(&entry.services.to_le_bytes());
+            val[16..24].copy_from_slice(&entry.last_try.to_le_bytes());
+            val[24..32].copy_from_slice(&entry.last_success.to_le_bytes());
+            val[32..36].copy_from_slice(&entry.n_attempts.to_le_bytes());
+            val[36] = if entry.in_tried { 1 } else { 0 };
+            let source_key = addr_key(entry.source);
+            val[37..55].copy_from_slice(&source_key);
+            self.db
+                .batch_put_cf(&mut batch, CF_PEER_ADDRS, &key, &val)?;
+        }
+        self.db.write_batch(batch)
+    }
+
+    /// Load addrman entries in extended format.
+    pub fn load_addrman_entries(&self) -> Result<Vec<AddrEntry>> {
+        let mut result = Vec::new();
+        for (key, val) in self.db.iter_cf(CF_PEER_ADDRS)? {
+            if key.len() == 18 && val.len() >= 55 {
+                if let Some(addr) = decode_addr_key(&key) {
+                    let last_seen = u64::from_le_bytes(val[0..8].try_into().unwrap());
+                    let services = u64::from_le_bytes(val[8..16].try_into().unwrap());
+                    let last_try = u64::from_le_bytes(val[16..24].try_into().unwrap());
+                    let last_success = u64::from_le_bytes(val[24..32].try_into().unwrap());
+                    let n_attempts = u32::from_le_bytes(val[32..36].try_into().unwrap());
+                    let in_tried = val[36] != 0;
+                    let source = decode_addr_key(&val[37..55])
+                        .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0));
+                    result.push(AddrEntry {
+                        addr,
+                        services,
+                        last_seen,
+                        last_try,
+                        last_success,
+                        n_attempts,
+                        in_tried,
+                        source,
+                    });
+                }
+            } else if key.len() == 18 && val.len() == 16 {
+                // Legacy format: just last_seen + services
+                if let Some(addr) = decode_addr_key(&key) {
+                    let last_seen = u64::from_le_bytes(val[..8].try_into().unwrap());
+                    let services = u64::from_le_bytes(val[8..16].try_into().unwrap());
+                    result.push(AddrEntry {
+                        addr,
+                        services,
+                        last_seen,
+                        last_try: 0,
+                        last_success: 0,
+                        n_attempts: 0,
+                        in_tried: false,
+                        source: SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0),
+                    });
+                }
+            }
+        }
+        Ok(result)
+    }
+}
+
+/// Extended address entry for addrman persistence.
+pub struct AddrEntry {
+    pub addr: SocketAddr,
+    pub services: u64,
+    pub last_seen: u64,
+    pub last_try: u64,
+    pub last_success: u64,
+    pub n_attempts: u32,
+    pub in_tried: bool,
+    pub source: SocketAddr,
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────

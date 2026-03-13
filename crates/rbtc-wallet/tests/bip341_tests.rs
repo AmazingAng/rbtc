@@ -199,7 +199,7 @@ fn bip341_key_path_sighash_vectors() {
             .unwrap()
             .iter()
             .map(|u| TxOut {
-                value: u["amountSats"].as_u64().unwrap(),
+                value: u["amountSats"].as_u64().unwrap() as i64,
                 script_pubkey: Script::from_bytes(decode_hex(u["scriptPubKey"].as_str().unwrap())),
             })
             .collect();

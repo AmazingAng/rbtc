@@ -1,10 +1,9 @@
+use crate::sigcache::global_sig_cache;
 use secp256k1::{
-    ecdsa::Signature as EcdsaSig, schnorr::Signature as SchnorrSig, Message, PublicKey, Secp256k1,
-    XOnlyPublicKey,
+    ecdsa::{RecoverableSignature, RecoveryId, Signature as EcdsaSig},
+    schnorr::Signature as SchnorrSig,
+    Message, PublicKey, Secp256k1, SecretKey, XOnlyPublicKey,
 };
-use std::collections::{HashSet, VecDeque};
-use std::hash::{Hash, Hasher};
-use std::sync::{Mutex, OnceLock};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -21,74 +20,10 @@ pub enum CryptoError {
     Secp256k1(#[from] secp256k1::Error),
 }
 
-const DEFAULT_SIG_CACHE_CAPACITY: usize = 100_000;
-
-struct SigCache {
-    entries: HashSet<u64>,
-    order: VecDeque<u64>,
-    capacity: usize,
-}
-
-impl SigCache {
-    fn new(capacity: usize) -> Self {
-        Self {
-            entries: HashSet::with_capacity(capacity),
-            order: VecDeque::with_capacity(capacity),
-            capacity,
-        }
-    }
-
-    fn contains(&self, key: u64) -> bool {
-        self.entries.contains(&key)
-    }
-
-    fn insert(&mut self, key: u64) {
-        if !self.entries.insert(key) {
-            return;
-        }
-        self.order.push_back(key);
-        if self.order.len() > self.capacity {
-            if let Some(old) = self.order.pop_front() {
-                self.entries.remove(&old);
-            }
-        }
-    }
-}
-
-static SIG_CACHE: OnceLock<Mutex<SigCache>> = OnceLock::new();
-
-fn sig_cache() -> &'static Mutex<SigCache> {
-    SIG_CACHE.get_or_init(|| Mutex::new(SigCache::new(DEFAULT_SIG_CACHE_CAPACITY)))
-}
-
-fn make_sig_cache_key(
-    algo_tag: u8,
-    strict_der: bool,
-    pubkey: &[u8],
-    sig: &[u8],
-    msg: &[u8; 32],
-) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    algo_tag.hash(&mut hasher);
-    strict_der.hash(&mut hasher);
-    pubkey.hash(&mut hasher);
-    sig.hash(&mut hasher);
-    msg.hash(&mut hasher);
-    hasher.finish()
-}
-
-fn cache_contains(key: u64) -> bool {
-    match sig_cache().lock() {
-        Ok(cache) => cache.contains(key),
-        Err(_) => false,
-    }
-}
-
-fn cache_insert(key: u64) {
-    if let Ok(mut cache) = sig_cache().lock() {
-        cache.insert(key);
-    }
-}
+/// Algo tags for distinguishing cache entries.
+const ALGO_ECDSA_STRICT: u8 = 0;
+const ALGO_ECDSA_LAX: u8 = 2;
+const ALGO_SCHNORR: u8 = 1;
 
 /// Verify an ECDSA signature.
 /// `pubkey` – 33-byte compressed or 65-byte uncompressed public key.
@@ -101,8 +36,9 @@ pub fn verify_ecdsa_with_policy(
     msg: &[u8; 32],
     strict_der: bool,
 ) -> Result<(), CryptoError> {
-    let cache_key = make_sig_cache_key(0, strict_der, pubkey, sig_der, msg);
-    if cache_contains(cache_key) {
+    let cache = global_sig_cache();
+    let algo_tag = if strict_der { ALGO_ECDSA_STRICT } else { ALGO_ECDSA_LAX };
+    if cache.contains_tagged(algo_tag, sig_der, pubkey, msg) {
         return Ok(());
     }
 
@@ -122,7 +58,7 @@ pub fn verify_ecdsa_with_policy(
 
     secp.verify_ecdsa(message, &sig, &pk)
         .map_err(|_| CryptoError::VerificationFailed)?;
-    cache_insert(cache_key);
+    cache.insert_tagged(algo_tag, sig_der, pubkey, msg);
     Ok(())
 }
 
@@ -136,8 +72,8 @@ pub fn verify_ecdsa(pubkey: &[u8], sig_der: &[u8], msg: &[u8; 32]) -> Result<(),
 /// `sig`    – 64 bytes, or 65 bytes with sighash type appended.
 /// `msg`    – 32-byte tagged sighash.
 pub fn verify_schnorr(pubkey: &[u8], sig: &[u8], msg: &[u8; 32]) -> Result<(), CryptoError> {
-    let cache_key = make_sig_cache_key(1, true, pubkey, sig, msg);
-    if cache_contains(cache_key) {
+    let cache = global_sig_cache();
+    if cache.contains_tagged(ALGO_SCHNORR, sig, pubkey, msg) {
         return Ok(());
     }
 
@@ -164,13 +100,179 @@ pub fn verify_schnorr(pubkey: &[u8], sig: &[u8], msg: &[u8; 32]) -> Result<(), C
 
     secp.verify_schnorr(&schnorr_sig, msg, &xonly)
         .map_err(|_| CryptoError::VerificationFailed)?;
-    cache_insert(cache_key);
+    cache.insert_tagged(ALGO_SCHNORR, sig, pubkey, msg);
     Ok(())
+}
+
+/// Batch-verify multiple ECDSA signatures. Returns Ok(()) if ALL signatures
+/// are valid, or Err with the index of the first invalid signature.
+///
+/// Note: true batch verification requires libsecp256k1's batch API which
+/// isn't exposed via the secp256k1 crate. This implementation validates
+/// each signature individually but presents a batch API, making it easy
+/// to swap in a true batch implementation later.
+pub fn batch_verify_ecdsa(
+    items: &[(secp256k1::ecdsa::Signature, secp256k1::Message, secp256k1::PublicKey)],
+) -> Result<(), (usize, CryptoError)> {
+    let secp = Secp256k1::verification_only();
+    for (i, (sig, msg, pk)) in items.iter().enumerate() {
+        secp.verify_ecdsa(*msg, sig, pk)
+            .map_err(|_| (i, CryptoError::VerificationFailed))?;
+    }
+    Ok(())
+}
+
+/// Batch-verify multiple Schnorr signatures. Returns Ok(()) if ALL signatures
+/// are valid, or Err with the index of the first invalid signature.
+///
+/// Note: true batch verification requires libsecp256k1's batch API which
+/// isn't exposed via the secp256k1 crate. This implementation validates
+/// each signature individually but presents a batch API, making it easy
+/// to swap in a true batch implementation later.
+pub fn batch_verify_schnorr(
+    items: &[(secp256k1::schnorr::Signature, secp256k1::Message, secp256k1::XOnlyPublicKey)],
+) -> Result<(), (usize, CryptoError)> {
+    let secp = Secp256k1::verification_only();
+    for (i, (sig, msg, pk)) in items.iter().enumerate() {
+        secp.verify_schnorr(sig, &msg[..], pk)
+            .map_err(|_| (i, CryptoError::VerificationFailed))?;
+    }
+    Ok(())
+}
+
+/// Sign a 32-byte message hash with a secret key, producing a 65-byte compact signature.
+/// Format: [recovery_flag] || r(32) || s(32)
+/// recovery_flag = 27 + recovery_id + 4 (compressed)
+pub fn sign_compact(secret_key: &[u8; 32], msg: &[u8; 32]) -> Result<[u8; 65], CryptoError> {
+    let secp = Secp256k1::new();
+    let sk = SecretKey::from_byte_array(*secret_key).map_err(|_| CryptoError::InvalidSignature)?;
+    let message = Message::from_digest(*msg);
+    let recoverable_sig = secp.sign_ecdsa_recoverable(message, &sk);
+    let (recovery_id, sig_bytes) = recoverable_sig.serialize_compact();
+    let recid_byte: u8 = match recovery_id {
+        RecoveryId::Zero => 0,
+        RecoveryId::One => 1,
+        RecoveryId::Two => 2,
+        RecoveryId::Three => 3,
+    };
+    let flag = 27 + recid_byte + 4;
+    let mut compact = [0u8; 65];
+    compact[0] = flag;
+    compact[1..65].copy_from_slice(&sig_bytes);
+    Ok(compact)
+}
+
+/// Recover a compressed public key from a 65-byte compact signature and 32-byte message hash.
+/// Returns the 33-byte compressed public key.
+pub fn recover_compact(compact_sig: &[u8; 65], msg: &[u8; 32]) -> Result<[u8; 33], CryptoError> {
+    let flag = compact_sig[0];
+    if flag < 31 || flag > 34 {
+        return Err(CryptoError::InvalidSignature);
+    }
+    let recovery_id_val = flag - 27 - 4;
+    let recovery_id = RecoveryId::from_u8_masked(recovery_id_val);
+    let sig = RecoverableSignature::from_compact(&compact_sig[1..65], recovery_id)
+        .map_err(|_| CryptoError::InvalidSignature)?;
+    let secp = Secp256k1::new();
+    let message = Message::from_digest(*msg);
+    let pubkey = secp
+        .recover_ecdsa(message, &sig)
+        .map_err(|_| CryptoError::InvalidSignature)?;
+    Ok(pubkey.serialize())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Helper: create a valid ECDSA (signature, message, pubkey) tuple from a secret key and message bytes.
+    fn make_ecdsa_item(
+        sk_bytes: &[u8; 32],
+        msg_bytes: &[u8; 32],
+    ) -> (secp256k1::ecdsa::Signature, Message, PublicKey) {
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_byte_array(*sk_bytes).unwrap();
+        let pk = PublicKey::from_secret_key(&secp, &sk);
+        let msg = Message::from_digest(*msg_bytes);
+        let sig = secp.sign_ecdsa(msg, &sk);
+        (sig, msg, pk)
+    }
+
+    /// Helper: create a valid Schnorr (signature, message, xonly_pubkey) tuple.
+    fn make_schnorr_item(
+        sk_bytes: &[u8; 32],
+        msg_bytes: &[u8; 32],
+    ) -> (SchnorrSig, Message, XOnlyPublicKey) {
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_byte_array(*sk_bytes).unwrap();
+        let keypair = secp256k1::Keypair::from_secret_key(&secp, &sk);
+        let (xonly, _parity) = keypair.x_only_public_key();
+        let msg = Message::from_digest(*msg_bytes);
+        let sig = secp.sign_schnorr_no_aux_rand(msg_bytes, &keypair);
+        (sig, msg, xonly)
+    }
+
+    #[test]
+    fn batch_ecdsa_all_valid() {
+        let items: Vec<_> = (1u8..=3)
+            .map(|i| {
+                let sk = [i; 32];
+                let msg = [i + 10; 32];
+                make_ecdsa_item(&sk, &msg)
+            })
+            .collect();
+        assert!(batch_verify_ecdsa(&items).is_ok());
+    }
+
+    #[test]
+    fn batch_ecdsa_one_invalid() {
+        let mut items: Vec<_> = (1u8..=3)
+            .map(|i| {
+                let sk = [i; 32];
+                let msg = [i + 10; 32];
+                make_ecdsa_item(&sk, &msg)
+            })
+            .collect();
+        // Corrupt the signature at index 1 by swapping in a different message
+        items[1].1 = Message::from_digest([0xff; 32]);
+        let err = batch_verify_ecdsa(&items).unwrap_err();
+        assert_eq!(err.0, 1);
+        assert!(matches!(err.1, CryptoError::VerificationFailed));
+    }
+
+    #[test]
+    fn batch_schnorr_all_valid() {
+        let items: Vec<_> = (1u8..=3)
+            .map(|i| {
+                let sk = [i; 32];
+                let msg = [i + 10; 32];
+                make_schnorr_item(&sk, &msg)
+            })
+            .collect();
+        assert!(batch_verify_schnorr(&items).is_ok());
+    }
+
+    #[test]
+    fn batch_schnorr_one_invalid() {
+        let mut items: Vec<_> = (1u8..=3)
+            .map(|i| {
+                let sk = [i; 32];
+                let msg = [i + 10; 32];
+                make_schnorr_item(&sk, &msg)
+            })
+            .collect();
+        // Corrupt at index 2
+        items[2].1 = Message::from_digest([0xff; 32]);
+        let err = batch_verify_schnorr(&items).unwrap_err();
+        assert_eq!(err.0, 2);
+        assert!(matches!(err.1, CryptoError::VerificationFailed));
+    }
+
+    #[test]
+    fn batch_empty_passes() {
+        assert!(batch_verify_ecdsa(&[]).is_ok());
+        assert!(batch_verify_schnorr(&[]).is_ok());
+    }
 
     #[test]
     fn verify_ecdsa_invalid_pubkey_empty() {
@@ -264,5 +366,83 @@ mod tests {
         sig65[64] = 0x01;
         let r = verify_schnorr(&pk, &sig65, &msg);
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn sign_compact_then_recover() {
+        // Use a known valid secret key (32 bytes, non-zero, within curve order)
+        let secret_key: [u8; 32] = [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab,
+            0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67,
+            0x89, 0xab, 0xcd, 0xef,
+        ];
+        let msg: [u8; 32] = [0xaa; 32];
+
+        // Derive the expected compressed pubkey
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&secret_key).unwrap();
+        let expected_pk = PublicKey::from_secret_key(&secp, &sk).serialize();
+
+        // Sign compact
+        let compact_sig = sign_compact(&secret_key, &msg).unwrap();
+
+        // First byte should be in range 31..=34 (27 + recid + 4)
+        assert!(compact_sig[0] >= 31 && compact_sig[0] <= 34);
+
+        // Recover and compare
+        let recovered_pk = recover_compact(&compact_sig, &msg).unwrap();
+        assert_eq!(recovered_pk, expected_pk);
+    }
+
+    #[test]
+    fn sign_compact_different_messages_differ() {
+        let secret_key: [u8; 32] = [0x42; 32];
+        let msg1: [u8; 32] = [0x01; 32];
+        let msg2: [u8; 32] = [0x02; 32];
+
+        let sig1 = sign_compact(&secret_key, &msg1).unwrap();
+        let sig2 = sign_compact(&secret_key, &msg2).unwrap();
+        assert_ne!(sig1, sig2);
+
+        // Each should recover correctly
+        let pk1 = recover_compact(&sig1, &msg1).unwrap();
+        let pk2 = recover_compact(&sig2, &msg2).unwrap();
+        assert_eq!(pk1, pk2); // same key, different messages
+    }
+
+    #[test]
+    fn recover_compact_invalid_flag_too_low() {
+        let mut bad_sig = [0u8; 65];
+        bad_sig[0] = 26; // below valid range
+        let msg = [0u8; 32];
+        let r = recover_compact(&bad_sig, &msg);
+        assert!(r.is_err());
+        assert!(matches!(r.unwrap_err(), CryptoError::InvalidSignature));
+    }
+
+    #[test]
+    fn recover_compact_invalid_flag_too_high() {
+        let mut bad_sig = [0u8; 65];
+        bad_sig[0] = 35; // above valid range
+        let msg = [0u8; 32];
+        let r = recover_compact(&bad_sig, &msg);
+        assert!(r.is_err());
+        assert!(matches!(r.unwrap_err(), CryptoError::InvalidSignature));
+    }
+
+    #[test]
+    fn recover_compact_wrong_message_gives_different_key() {
+        let secret_key: [u8; 32] = [0x77; 32];
+        let msg: [u8; 32] = [0xbb; 32];
+        let wrong_msg: [u8; 32] = [0xcc; 32];
+
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&secret_key).unwrap();
+        let expected_pk = PublicKey::from_secret_key(&secp, &sk).serialize();
+
+        let compact_sig = sign_compact(&secret_key, &msg).unwrap();
+        // Recovering with wrong message should give a different pubkey
+        let recovered_pk = recover_compact(&compact_sig, &wrong_msg).unwrap();
+        assert_ne!(recovered_pk, expected_pk);
     }
 }

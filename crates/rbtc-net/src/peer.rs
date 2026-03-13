@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::{
     io::{AsyncWriteExt, BufReader},
@@ -37,6 +37,10 @@ pub enum PeerEvent {
         wtxid_relay: bool,
         /// BIP155: peer signaled sendaddrv2 during handshake
         prefers_addrv2: bool,
+        /// Peer clock offset in seconds (peer_timestamp - local_timestamp)
+        time_offset: i64,
+        /// BIP37: peer's fRelay flag from version message (false = no tx relay)
+        relay: bool,
     },
     Message {
         peer_id: u64,
@@ -58,6 +62,104 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const PING_INTERVAL: Duration = Duration::from_secs(120);
 const PING_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Transport protocol version for this peer connection.
+///
+/// Matches Bitcoin Core's `TransportProtocolType` enum in
+/// `src/node/connection_types.h:91-95`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportVersion {
+    /// Peer could be v1 or v2 — not yet determined.
+    ///
+    /// This is the initial state for **responder** (non-initiating) connections.
+    /// The responder checks incoming bytes against the v1 prefix
+    /// (network magic + "version\x00\x00\x00\x00\x00" = 16 bytes). If the
+    /// bytes mismatch, the peer is assumed to be v2; if all 16 bytes match,
+    /// the peer is v1.
+    ///
+    /// Matches Bitcoin Core's `TransportProtocolType::DETECTING` and the
+    /// `RecvState::KEY_MAYBE_V1` / `SendState::MAYBE_V1` states in
+    /// `V2Transport`.
+    Detecting,
+    /// Classic v1 plaintext framing.
+    V1,
+    /// BIP324 v2 encrypted framing (ChaCha20-Poly1305 AEAD).
+    V2,
+}
+
+impl std::fmt::Display for TransportVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TransportVersion::Detecting => write!(f, "detecting"),
+            TransportVersion::V1 => write!(f, "v1"),
+            TransportVersion::V2 => write!(f, "v2"),
+        }
+    }
+}
+
+/// Length of the v1 prefix used for transport auto-detection.
+///
+/// The prefix is: 4-byte network magic + "version\x00\x00\x00\x00\x00" (12 bytes) = 16 bytes.
+/// This matches Bitcoin Core's `V1_PREFIX_LEN` used in
+/// `V2Transport::ProcessReceivedMaybeV1Bytes()`.
+pub const V1_PREFIX_LEN: usize = 16;
+
+/// Result of checking received bytes against the v1 prefix for transport detection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetectResult {
+    /// Incoming bytes do not match the v1 prefix — peer is using v2 transport.
+    V2,
+    /// All 16 bytes match the v1 prefix — peer is using v1 transport.
+    V1,
+    /// Not enough bytes yet to distinguish v1 from v2. Need more data.
+    NeedMoreData,
+}
+
+/// Build the 16-byte v1 prefix for a given network magic.
+///
+/// Format: `[magic_bytes(4)] + "version\x00\x00\x00\x00\x00"(12)`.
+/// This matches Bitcoin Core's v1_prefix in `ProcessReceivedMaybeV1Bytes()`.
+pub fn v1_prefix(magic: &[u8; 4]) -> [u8; V1_PREFIX_LEN] {
+    let mut prefix = [0u8; V1_PREFIX_LEN];
+    prefix[..4].copy_from_slice(magic);
+    prefix[4] = b'v';
+    prefix[5] = b'e';
+    prefix[6] = b'r';
+    prefix[7] = b's';
+    prefix[8] = b'i';
+    prefix[9] = b'o';
+    prefix[10] = b'n';
+    // bytes 11..16 are already 0
+    prefix
+}
+
+/// Detect whether incoming bytes indicate a v1 or v2 transport connection.
+///
+/// This implements Bitcoin Core's `V2Transport::ProcessReceivedMaybeV1Bytes()`
+/// logic. Called by a **responder** node that starts in `Detecting` state.
+///
+/// - If `received` diverges from the v1 prefix at any byte, returns `DetectResult::V2`.
+/// - If `received` matches all 16 bytes of the v1 prefix, returns `DetectResult::V1`.
+/// - If `received` is a prefix of (but shorter than) the v1 prefix, returns
+///   `DetectResult::NeedMoreData`.
+pub fn detect_transport(received: &[u8], magic: &[u8; 4]) -> DetectResult {
+    let prefix = v1_prefix(magic);
+    let check_len = received.len().min(V1_PREFIX_LEN);
+
+    // Compare received bytes against the v1 prefix
+    if received[..check_len] != prefix[..check_len] {
+        // Mismatch — peer is v2
+        return DetectResult::V2;
+    }
+
+    if received.len() >= V1_PREFIX_LEN {
+        // Full match — peer is v1
+        DetectResult::V1
+    } else {
+        // Partial match — need more data
+        DetectResult::NeedMoreData
+    }
+}
+
 /// A connected Bitcoin peer
 pub struct Peer {
     pub id: u64,
@@ -68,6 +170,7 @@ pub struct Peer {
     pub user_agent: String,
     pub last_ping: Option<Instant>,
     pub pending_ping_nonce: Option<u64>,
+    pub transport: TransportVersion,
 }
 
 impl Peer {
@@ -81,6 +184,7 @@ impl Peer {
             user_agent: String::new(),
             last_ping: None,
             pending_ping_nonce: None,
+            transport: TransportVersion::V1,
         }
     }
 }
@@ -139,6 +243,8 @@ async fn run_peer_inner(
     let mut peer_services = 0u64;
     let mut peer_wtxid_relay = false;
     let mut peer_sendaddrv2 = false;
+    let mut peer_time_offset: i64 = 0;
+    let mut peer_relay = true;
 
     timeout(HANDSHAKE_TIMEOUT, async {
         while !got_version || !got_verack {
@@ -149,6 +255,13 @@ async fn run_peer_inner(
                     peer_height = v.start_height;
                     peer_ua = v.user_agent.clone();
                     peer_services = v.services;
+                    // Compute time offset (peer clock - our clock)
+                    let local_time = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64;
+                    peer_time_offset = v.timestamp - local_time;
+                    peer_relay = v.relay;
                     got_version = true;
                     // Reject peers with protocol version too old to support
                     // modern features (SegWit, compact blocks, etc.)
@@ -195,6 +308,8 @@ async fn run_peer_inner(
             user_agent: peer_ua,
             wtxid_relay: peer_wtxid_relay,
             prefers_addrv2: peer_sendaddrv2,
+            time_offset: peer_time_offset,
+            relay: peer_relay,
         })
         .map_err(|_| NetError::ChannelError)?;
 
@@ -273,4 +388,126 @@ fn rand_nonce() -> u64 {
     std::time::SystemTime::now().hash(&mut h);
     std::thread::current().id().hash(&mut h);
     h.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Mainnet magic bytes.
+    const MAINNET_MAGIC: [u8; 4] = [0xf9, 0xbe, 0xb4, 0xd9];
+    /// Testnet3 magic bytes.
+    const TESTNET_MAGIC: [u8; 4] = [0x0b, 0x11, 0x09, 0x07];
+
+    #[test]
+    fn transport_version_display() {
+        assert_eq!(TransportVersion::Detecting.to_string(), "detecting");
+        assert_eq!(TransportVersion::V1.to_string(), "v1");
+        assert_eq!(TransportVersion::V2.to_string(), "v2");
+    }
+
+    #[test]
+    fn transport_version_has_detecting_variant() {
+        // Matches Bitcoin Core's TransportProtocolType::DETECTING
+        let t = TransportVersion::Detecting;
+        assert_eq!(t, TransportVersion::Detecting);
+        assert_ne!(t, TransportVersion::V1);
+        assert_ne!(t, TransportVersion::V2);
+    }
+
+    #[test]
+    fn v1_prefix_mainnet() {
+        let prefix = v1_prefix(&MAINNET_MAGIC);
+        assert_eq!(prefix.len(), V1_PREFIX_LEN);
+        assert_eq!(&prefix[..4], &MAINNET_MAGIC);
+        assert_eq!(&prefix[4..11], b"version");
+        assert_eq!(&prefix[11..16], &[0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn v1_prefix_testnet() {
+        let prefix = v1_prefix(&TESTNET_MAGIC);
+        assert_eq!(&prefix[..4], &TESTNET_MAGIC);
+        assert_eq!(&prefix[4..11], b"version");
+    }
+
+    #[test]
+    fn detect_v1_full_match() {
+        let prefix = v1_prefix(&MAINNET_MAGIC);
+        assert_eq!(detect_transport(&prefix, &MAINNET_MAGIC), DetectResult::V1);
+    }
+
+    #[test]
+    fn detect_v1_with_extra_bytes() {
+        // More than 16 bytes, first 16 match v1 prefix
+        let mut data = v1_prefix(&MAINNET_MAGIC).to_vec();
+        data.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(detect_transport(&data, &MAINNET_MAGIC), DetectResult::V1);
+    }
+
+    #[test]
+    fn detect_need_more_data_partial_match() {
+        let prefix = v1_prefix(&MAINNET_MAGIC);
+        // Feed 1..15 bytes that match the prefix — all should return NeedMoreData
+        for len in 1..V1_PREFIX_LEN {
+            assert_eq!(
+                detect_transport(&prefix[..len], &MAINNET_MAGIC),
+                DetectResult::NeedMoreData,
+                "expected NeedMoreData for {len} matching bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn detect_v2_first_byte_mismatch() {
+        // First byte doesn't match magic — immediately v2
+        let data = [0x00];
+        assert_eq!(detect_transport(&data, &MAINNET_MAGIC), DetectResult::V2);
+    }
+
+    #[test]
+    fn detect_v2_mismatch_after_magic() {
+        // Magic matches but 5th byte is not 'v' — v2
+        let mut data = [0u8; 5];
+        data[..4].copy_from_slice(&MAINNET_MAGIC);
+        data[4] = 0x03; // EllSwift pubkey byte, not 'v'
+        assert_eq!(detect_transport(&data, &MAINNET_MAGIC), DetectResult::V2);
+    }
+
+    #[test]
+    fn detect_v2_mismatch_mid_command() {
+        // First 8 bytes match ("version" starts ok) but byte 9 differs
+        let prefix = v1_prefix(&MAINNET_MAGIC);
+        let mut data = prefix[..9].to_vec();
+        data[8] = 0xFF; // corrupt 'i' in "version"
+        assert_eq!(detect_transport(&data, &MAINNET_MAGIC), DetectResult::V2);
+    }
+
+    #[test]
+    fn detect_v2_random_bytes() {
+        // Random non-v1 data should be detected as v2
+        let data = [0x02, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99];
+        assert_eq!(detect_transport(&data, &MAINNET_MAGIC), DetectResult::V2);
+    }
+
+    #[test]
+    fn detect_wrong_network_magic_is_v2() {
+        // A valid mainnet v1 prefix checked against testnet magic => v2
+        let mainnet_prefix = v1_prefix(&MAINNET_MAGIC);
+        assert_eq!(
+            detect_transport(&mainnet_prefix, &TESTNET_MAGIC),
+            DetectResult::V2
+        );
+    }
+
+    #[test]
+    fn detect_empty_input_needs_more_data() {
+        // Edge case: empty buffer
+        // Empty slice trivially matches (0 bytes compared), need more data
+        let data: &[u8] = &[];
+        assert_eq!(
+            detect_transport(data, &MAINNET_MAGIC),
+            DetectResult::NeedMoreData,
+        );
+    }
 }

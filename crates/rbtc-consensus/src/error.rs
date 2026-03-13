@@ -11,6 +11,8 @@ pub enum ConsensusError {
     TimestampTooNew,
     #[error("invalid merkle root")]
     BadMerkleRoot,
+    #[error("mutated merkle tree (CVE-2012-2459)")]
+    MutatedMerkleTree,
     #[error("block too large: weight {0} > {1}")]
     BlockTooLarge(u64, u64),
     #[error("block sigops too high: {0} > {1}")]
@@ -27,6 +29,8 @@ pub enum ConsensusError {
     BadCoinbaseAmount(u64, u64),
     #[error("bad bits: {0:#010x}")]
     BadBits(u32),
+    #[error("bad block version {0} at height {1}")]
+    BadVersion(i32, u32),
     #[error("duplicate transaction")]
     DuplicateTx,
     #[error("orphan block: unknown parent {0}")]
@@ -37,6 +41,8 @@ pub enum ConsensusError {
     NoInputs,
     #[error("transaction has no outputs")]
     NoOutputs,
+    #[error("negative output value")]
+    NegativeOutputValue,
     #[error("output value overflow")]
     OutputValueOverflow,
     #[error("input value overflow")]
@@ -55,6 +61,8 @@ pub enum ConsensusError {
     SequenceLockNotSatisfied,
     #[error("BIP30 conflict: txid {0} has unspent outputs")]
     Bip30Conflict(String),
+    #[error("duplicate input: {0}:{1}")]
+    DuplicateInput(String, u32),
     #[error("invalid transaction: {0}")]
     InvalidTx(String),
 

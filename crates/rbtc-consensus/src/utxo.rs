@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use rbtc_primitives::{
-    hash::TxId,
+    hash::Txid,
     transaction::{OutPoint, Transaction, TxOut},
 };
 
@@ -14,7 +14,7 @@ pub trait UtxoLookup: Sync {
     /// Return the UTXO for `outpoint`, or `None` if it does not exist / is spent.
     fn get_utxo(&self, outpoint: &OutPoint) -> Option<Utxo>;
     /// Return true if any unspent output exists for `txid`.
-    fn has_unspent_txid(&self, txid: &TxId) -> bool;
+    fn has_unspent_txid(&self, txid: &Txid) -> bool;
 }
 
 /// A single UTXO entry
@@ -38,7 +38,7 @@ impl UtxoLookup for UtxoSet {
         self.coins.get(outpoint).cloned()
     }
 
-    fn has_unspent_txid(&self, txid: &TxId) -> bool {
+    fn has_unspent_txid(&self, txid: &Txid) -> bool {
         self.coins.keys().any(|outpoint| &outpoint.txid == txid)
     }
 }
@@ -59,7 +59,7 @@ impl UtxoSet {
     }
 
     /// Add all outputs of a transaction
-    pub fn add_tx(&mut self, txid: TxId, tx: &Transaction, height: u32) {
+    pub fn add_tx(&mut self, txid: Txid, tx: &Transaction, height: u32) {
         let is_coinbase = tx.is_coinbase();
         for (vout, txout) in tx.outputs.iter().enumerate() {
             let outpoint = OutPoint {
@@ -93,7 +93,7 @@ impl UtxoSet {
     }
 
     /// Apply a block: spend inputs, add outputs
-    pub fn connect_block(&mut self, txids: &[TxId], txs: &[Transaction], height: u32) {
+    pub fn connect_block(&mut self, txids: &[Txid], txs: &[Transaction], height: u32) {
         for (txid, tx) in txids.iter().zip(txs.iter()) {
             if !tx.is_coinbase() {
                 self.spend_tx(tx);
@@ -105,7 +105,7 @@ impl UtxoSet {
     /// Undo a block (for reorg): remove outputs, re-add inputs
     pub fn disconnect_block(
         &mut self,
-        txids: &[TxId],
+        txids: &[Txid],
         txs: &[Transaction],
         undo: Vec<Vec<(OutPoint, Utxo)>>,
     ) {
@@ -139,7 +139,7 @@ impl UtxoSet {
     /// Index `i` of the returned Vec corresponds to tx `i`; coinbase entries are empty.
     pub fn connect_block_with_undo(
         &mut self,
-        txids: &[TxId],
+        txids: &[Txid],
         txs: &[Transaction],
         height: u32,
     ) -> Vec<Vec<(OutPoint, Utxo)>> {
@@ -168,25 +168,25 @@ impl UtxoSet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rbtc_primitives::hash::Hash256;
+    use rbtc_primitives::hash::{Hash256, Txid};
     use rbtc_primitives::script::Script;
     use rbtc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
 
     fn coinbase_tx() -> Transaction {
-        Transaction {
-            version: 1,
-            inputs: vec![TxIn {
+        Transaction::from_parts(
+            1,
+            vec![TxIn {
                 previous_output: OutPoint::null(),
                 script_sig: Script::from_bytes(vec![2, 0, 0]),
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut {
+            vec![TxOut {
                 value: 50_0000_0000,
                 script_pubkey: Script::new(),
             }],
-            lock_time: 0,
-        }
+            0,
+        )
     }
 
     #[test]
@@ -200,7 +200,7 @@ mod tests {
     fn utxo_set_add_tx_get_contains() {
         let mut set = UtxoSet::new();
         let tx = coinbase_tx();
-        let txid = Hash256([1; 32]);
+        let txid = Txid(Hash256([1; 32]));
         set.add_tx(txid, &tx, 0);
         assert_eq!(set.len(), 1);
         let op = OutPoint { txid, vout: 0 };
@@ -213,22 +213,22 @@ mod tests {
     #[test]
     fn utxo_set_spend_tx() {
         let mut set = UtxoSet::new();
-        let txid = Hash256([1; 32]);
+        let txid = Txid(Hash256([1; 32]));
         set.add_tx(txid, &coinbase_tx(), 0);
-        let spend_tx = Transaction {
-            version: 1,
-            inputs: vec![TxIn {
+        let spend_tx = Transaction::from_parts(
+            1,
+            vec![TxIn {
                 previous_output: OutPoint { txid, vout: 0 },
                 script_sig: Script::new(),
                 sequence: 0,
                 witness: vec![],
             }],
-            outputs: vec![TxOut {
+            vec![TxOut {
                 value: 1000,
                 script_pubkey: Script::new(),
             }],
-            lock_time: 0,
-        };
+            0,
+        );
         let spent = set.spend_tx(&spend_tx);
         assert_eq!(spent.len(), 1);
         assert!(set.get(&OutPoint { txid, vout: 0 }).is_none());
@@ -237,12 +237,12 @@ mod tests {
     #[test]
     fn utxo_set_spend_tx_missing_input_ignored() {
         let mut set = UtxoSet::new();
-        let txid1 = Hash256([1; 32]);
-        let txid2 = Hash256([2; 32]);
+        let txid1 = Txid(Hash256([1; 32]));
+        let txid2 = Txid(Hash256([2; 32]));
         set.add_tx(txid1, &coinbase_tx(), 0);
-        let spend_tx = Transaction {
-            version: 1,
-            inputs: vec![
+        let spend_tx = Transaction::from_parts(
+            1,
+            vec![
                 TxIn {
                     previous_output: OutPoint {
                         txid: txid1,
@@ -262,12 +262,12 @@ mod tests {
                     witness: vec![],
                 },
             ],
-            outputs: vec![TxOut {
+            vec![TxOut {
                 value: 500,
                 script_pubkey: Script::new(),
             }],
-            lock_time: 0,
-        };
+            0,
+        );
         let spent = set.spend_tx(&spend_tx);
         assert_eq!(spent.len(), 1);
         assert!(set
@@ -281,18 +281,18 @@ mod tests {
     #[test]
     fn utxo_set_connect_disconnect_block() {
         let mut set = UtxoSet::new();
-        let txid1 = Hash256([1; 32]);
-        let txid2 = Hash256([2; 32]);
+        let txid1 = Txid(Hash256([1; 32]));
+        let txid2 = Txid(Hash256([2; 32]));
         let cb = coinbase_tx();
-        let tx2 = Transaction {
-            version: 1,
-            inputs: vec![],
-            outputs: vec![TxOut {
+        let tx2 = Transaction::from_parts(
+            1,
+            vec![],
+            vec![TxOut {
                 value: 1000,
                 script_pubkey: Script::new(),
             }],
-            lock_time: 0,
-        };
+            0,
+        );
         set.connect_block(&[txid1, txid2], &[cb.clone(), tx2.clone()], 1);
         assert!(set.len() >= 2);
         set.disconnect_block(&[txid1, txid2], &[cb, tx2], vec![vec![], vec![]]);
@@ -303,7 +303,7 @@ mod tests {
     fn utxo_set_insert() {
         let mut set = UtxoSet::new();
         let op = OutPoint {
-            txid: Hash256([5; 32]),
+            txid: Txid(Hash256([5; 32])),
             vout: 1,
         };
         let utxo = Utxo {
@@ -323,12 +323,12 @@ mod tests {
     #[test]
     fn utxo_set_connect_block_with_undo() {
         let mut set = UtxoSet::new();
-        let txid1 = Hash256([1; 32]);
-        let txid2 = Hash256([2; 32]);
+        let txid1 = Txid(Hash256([1; 32]));
+        let txid2 = Txid(Hash256([2; 32]));
         let cb = coinbase_tx();
-        let tx2 = Transaction {
-            version: 1,
-            inputs: vec![TxIn {
+        let tx2 = Transaction::from_parts(
+            1,
+            vec![TxIn {
                 previous_output: OutPoint {
                     txid: txid1,
                     vout: 0,
@@ -337,12 +337,12 @@ mod tests {
                 sequence: 0,
                 witness: vec![],
             }],
-            outputs: vec![TxOut {
+            vec![TxOut {
                 value: 500,
                 script_pubkey: Script::new(),
             }],
-            lock_time: 0,
-        };
+            0,
+        );
         set.add_tx(txid1, &cb, 0);
         let undo = set.connect_block_with_undo(&[txid1, txid2], &[cb, tx2], 1);
         assert_eq!(undo.len(), 2);

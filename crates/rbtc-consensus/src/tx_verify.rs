@@ -1,10 +1,12 @@
+use std::collections::HashSet;
+
 #[cfg(feature = "experimental-input-parallel")]
 use rayon::prelude::*;
 use rbtc_crypto::sha256d;
 use rbtc_primitives::{
-    constants::{COIN, COINBASE_MATURITY, INITIAL_SUBSIDY, SUBSIDY_HALVING_INTERVAL},
+    constants::{COINBASE_MATURITY, INITIAL_SUBSIDY},
     hash::Hash256,
-    transaction::{Transaction, TxOut},
+    transaction::{Transaction, TxOut, COIN},
     Network,
 };
 use rbtc_script::{verify_input, ScriptContext, ScriptFlags};
@@ -20,17 +22,21 @@ pub trait MedianTimeProvider {
     fn median_time_past_at_height(&self, height: u32) -> u32;
 }
 
-/// Compute the block subsidy for a given height
-pub fn block_subsidy(height: u32) -> u64 {
-    let halvings = height as u64 / SUBSIDY_HALVING_INTERVAL;
+/// Compute the block subsidy for a given height and halving interval.
+///
+/// `halving_interval` is the number of blocks between halvings
+/// (210 000 for mainnet/testnet, 150 for regtest).
+/// Use `ConsensusParams::subsidy_halving_interval` from the active network.
+pub fn block_subsidy(height: u32, halving_interval: u64) -> u64 {
+    let halvings = height as u64 / halving_interval;
     if halvings >= 64 {
         return 0;
     }
-    INITIAL_SUBSIDY >> halvings
+    (INITIAL_SUBSIDY >> halvings) as u64
 }
 
 /// Maximum allowed output value
-const MAX_MONEY: u64 = 21_000_000 * COIN;
+const MAX_MONEY: i64 = 21_000_000 * COIN;
 
 /// Verify a non-coinbase transaction against the UTXO set.
 /// Returns the transaction fee (satoshis) on success.
@@ -90,9 +96,25 @@ pub fn verify_transaction_with_lock_rules_preloaded(
         return Err(ConsensusError::NoOutputs);
     }
 
-    // Check output amounts
-    let mut output_sum: u64 = 0;
+    // CVE-2018-17144: Check for duplicate inputs
+    {
+        let mut seen = HashSet::with_capacity(tx.inputs.len());
+        for input in &tx.inputs {
+            if !seen.insert(&input.previous_output) {
+                return Err(ConsensusError::DuplicateInput(
+                    input.previous_output.txid.to_hex(),
+                    input.previous_output.vout,
+                ));
+            }
+        }
+    }
+
+    // Check output amounts (matches Bitcoin Core CheckTransaction order)
+    let mut output_sum: i64 = 0;
     for out in &tx.outputs {
+        if out.value < 0 {
+            return Err(ConsensusError::NegativeOutputValue);
+        }
         if out.value > MAX_MONEY {
             return Err(ConsensusError::OutputValueOverflow);
         }
@@ -110,7 +132,7 @@ pub fn verify_transaction_with_lock_rules_preloaded(
     }
 
     // Gather inputs from UTXO set (or from preloaded entries).
-    let mut input_sum: u64 = 0;
+    let mut input_sum: i64 = 0;
     let mut prevouts = Vec::with_capacity(tx.inputs.len());
     let mut input_heights = Vec::with_capacity(tx.inputs.len());
     let loaded: Vec<Utxo> = match preloaded_utxos {
@@ -165,7 +187,7 @@ pub fn verify_transaction_with_lock_rules_preloaded(
     if input_sum < output_sum {
         return Err(ConsensusError::NegativeFee);
     }
-    let fee = input_sum - output_sum;
+    let fee = (input_sum - output_sum) as u64;
 
     // Script verification for each input
     if !skip_script_verification {
@@ -203,7 +225,7 @@ pub fn verify_transaction_scripts_with_prevouts(
             &txid.0,
             i,
             script_flags_mask(flags),
-            prevout.value,
+            prevout.value as u64,
             prevout.script_pubkey.as_bytes(),
             tx.inputs[i].script_sig.as_bytes(),
             &tx.inputs[i].witness,
@@ -299,7 +321,7 @@ pub fn verify_transaction_scripts_parallel_inputs(
     Ok(())
 }
 
-fn is_final_tx(tx: &Transaction, block_height: u32, lock_time_cutoff: u32) -> bool {
+pub fn is_final_tx(tx: &Transaction, block_height: u32, lock_time_cutoff: u32) -> bool {
     if tx.lock_time == 0 {
         return true;
     }
@@ -461,8 +483,25 @@ pub fn verify_coinbase(
         check_coinbase_height(tx, block_height)?;
     }
 
+    // Validate individual output amounts (same checks as non-coinbase)
+    let mut total_out_i64: i64 = 0;
+    for out in &tx.outputs {
+        if out.value < 0 {
+            return Err(ConsensusError::NegativeOutputValue);
+        }
+        if out.value > MAX_MONEY {
+            return Err(ConsensusError::OutputValueOverflow);
+        }
+        total_out_i64 = total_out_i64
+            .checked_add(out.value)
+            .ok_or(ConsensusError::OutputValueOverflow)?;
+        if total_out_i64 > MAX_MONEY {
+            return Err(ConsensusError::OutputValueOverflow);
+        }
+    }
+
     // Total output value ≤ subsidy + fees (checked at block level)
-    let total_out: u64 = tx.outputs.iter().map(|o| o.value).sum();
+    let total_out = total_out_i64 as u64;
     if total_out > expected_subsidy {
         return Err(ConsensusError::BadCoinbaseAmount(
             total_out,
@@ -502,7 +541,7 @@ fn check_coinbase_height(tx: &Transaction, height: u32) -> Result<(), ConsensusE
 mod tests {
     use super::*;
     use crate::utxo::UtxoSet;
-    use rbtc_primitives::hash::Hash256;
+    use rbtc_primitives::hash::{Hash256, Txid};
     use rbtc_primitives::script::Script;
     use rbtc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
     use rbtc_primitives::Network;
@@ -524,24 +563,34 @@ mod tests {
 
     #[test]
     fn block_subsidy_halvings() {
-        assert_eq!(block_subsidy(0), 50_0000_0000);
-        assert_eq!(block_subsidy(209999), 50_0000_0000);
-        assert_eq!(block_subsidy(210000), 25_0000_0000);
-        assert_eq!(block_subsidy(420000), 12_5000_0000);
-        assert_eq!(block_subsidy(64 * 210_000), 0);
+        // Mainnet halving interval
+        assert_eq!(block_subsidy(0, 210_000), 50_0000_0000);
+        assert_eq!(block_subsidy(209999, 210_000), 50_0000_0000);
+        assert_eq!(block_subsidy(210000, 210_000), 25_0000_0000);
+        assert_eq!(block_subsidy(420000, 210_000), 12_5000_0000);
+        assert_eq!(block_subsidy(64 * 210_000, 210_000), 0);
+    }
+
+    #[test]
+    fn block_subsidy_regtest_halving() {
+        // Regtest halving interval is 150
+        assert_eq!(block_subsidy(0, 150), 50_0000_0000);
+        assert_eq!(block_subsidy(149, 150), 50_0000_0000);
+        assert_eq!(block_subsidy(150, 150), 25_0000_0000);
+        assert_eq!(block_subsidy(300, 150), 12_5000_0000);
     }
 
     #[test]
     fn verify_transaction_no_inputs() {
-        let tx = Transaction {
-            version: 1,
-            inputs: vec![],
-            outputs: vec![TxOut {
+        let tx = Transaction::from_parts(
+            1,
+            vec![],
+            vec![TxOut {
                 value: 1000,
                 script_pubkey: Script::new(),
             }],
-            lock_time: 0,
-        };
+            0,
+        );
         let utxos = UtxoSet::new();
         let r = verify_transaction(&tx, &utxos, 0, ScriptFlags::default());
         assert!(r.is_err());
@@ -549,33 +598,112 @@ mod tests {
     }
 
     #[test]
+    fn verify_transaction_duplicate_inputs_rejected() {
+        // CVE-2018-17144: a transaction spending the same outpoint twice must be rejected.
+        let dup_outpoint = OutPoint {
+            txid: Txid(Hash256([0xAA; 32])),
+            vout: 0,
+        };
+        let tx = Transaction::from_parts(
+            1,
+            vec![
+                TxIn {
+                    previous_output: dup_outpoint.clone(),
+                    script_sig: Script::new(),
+                    sequence: 0xffffffff,
+                    witness: vec![],
+                },
+                TxIn {
+                    previous_output: dup_outpoint.clone(),
+                    script_sig: Script::new(),
+                    sequence: 0xffffffff,
+                    witness: vec![],
+                },
+            ],
+            vec![TxOut {
+                value: 1000,
+                script_pubkey: Script::new(),
+            }],
+            0,
+        );
+        let utxos = UtxoSet::new();
+        let r = verify_transaction(&tx, &utxos, 100, ScriptFlags::default());
+        assert!(r.is_err());
+        assert!(
+            matches!(r.unwrap_err(), ConsensusError::DuplicateInput(..)),
+            "expected DuplicateInput error"
+        );
+    }
+
+    #[test]
+    fn verify_transaction_distinct_inputs_pass_dup_check() {
+        // Two different outpoints should pass the duplicate check (may fail later on UTXO lookup).
+        let tx = Transaction::from_parts(
+            1,
+            vec![
+                TxIn {
+                    previous_output: OutPoint {
+                        txid: Txid(Hash256([0xBB; 32])),
+                        vout: 0,
+                    },
+                    script_sig: Script::new(),
+                    sequence: 0xffffffff,
+                    witness: vec![],
+                },
+                TxIn {
+                    previous_output: OutPoint {
+                        txid: Txid(Hash256([0xBB; 32])),
+                        vout: 1, // different vout
+                    },
+                    script_sig: Script::new(),
+                    sequence: 0xffffffff,
+                    witness: vec![],
+                },
+            ],
+            vec![TxOut {
+                value: 1000,
+                script_pubkey: Script::new(),
+            }],
+            0,
+        );
+        let utxos = UtxoSet::new();
+        let r = verify_transaction(&tx, &utxos, 100, ScriptFlags::default());
+        // Should NOT be DuplicateInput — will fail with MissingUtxo instead
+        assert!(r.is_err());
+        assert!(
+            matches!(r.unwrap_err(), ConsensusError::MissingUtxo(..)),
+            "expected MissingUtxo error, not DuplicateInput"
+        );
+    }
+
+    #[test]
     fn verify_transaction_no_outputs() {
-        let tx = Transaction {
-            version: 1,
-            inputs: vec![TxIn {
+        let tx = Transaction::from_parts(
+            1,
+            vec![TxIn {
                 previous_output: OutPoint {
-                    txid: Hash256::ZERO,
+                    txid: Txid::ZERO,
                     vout: 0,
                 },
                 script_sig: Script::new(),
                 sequence: 0,
                 witness: vec![],
             }],
-            outputs: vec![],
-            lock_time: 0,
-        };
+            vec![],
+            0,
+        );
         let mut utxos = UtxoSet::new();
         utxos.add_tx(
-            Hash256::ZERO,
-            &Transaction {
-                version: 1,
-                inputs: vec![],
-                outputs: vec![TxOut {
+            Txid::ZERO,
+            &Transaction::from_parts(
+                1,
+                vec![],
+                vec![TxOut {
                     value: 1000,
                     script_pubkey: Script::new(),
                 }],
-                lock_time: 0,
-            },
+                0,
+            ),
             0,
         );
         let r = verify_transaction(&tx, &utxos, 0, ScriptFlags::default());
@@ -585,23 +713,23 @@ mod tests {
 
     #[test]
     fn verify_coinbase_not_coinbase() {
-        let tx = Transaction {
-            version: 1,
-            inputs: vec![TxIn {
+        let tx = Transaction::from_parts(
+            1,
+            vec![TxIn {
                 previous_output: OutPoint {
-                    txid: Hash256([1; 32]),
+                    txid: Txid(Hash256([1; 32])),
                     vout: 0,
                 },
                 script_sig: Script::new(),
                 sequence: 0,
                 witness: vec![],
             }],
-            outputs: vec![TxOut {
+            vec![TxOut {
                 value: 50_0000_0000,
                 script_pubkey: Script::new(),
             }],
-            lock_time: 0,
-        };
+            0,
+        );
         let r = verify_coinbase(&tx, 0, 50_0000_0000, Network::Regtest);
         assert!(r.is_err());
         assert!(matches!(r.unwrap_err(), ConsensusError::FirstTxNotCoinbase));
@@ -609,62 +737,119 @@ mod tests {
 
     #[test]
     fn verify_coinbase_script_sig_too_short() {
-        let tx = Transaction {
-            version: 1,
-            inputs: vec![TxIn {
+        let tx = Transaction::from_parts(
+            1,
+            vec![TxIn {
                 previous_output: OutPoint::null(),
                 script_sig: Script::from_bytes(vec![1]),
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut {
+            vec![TxOut {
                 value: 50_0000_0000,
                 script_pubkey: Script::new(),
             }],
-            lock_time: 0,
-        };
+            0,
+        );
         let r = verify_coinbase(&tx, 0, 50_0000_0000, Network::Regtest);
         assert!(r.is_err());
     }
 
     #[test]
     fn verify_coinbase_ok() {
-        let tx = Transaction {
-            version: 1,
-            inputs: vec![TxIn {
+        let tx = Transaction::from_parts(
+            1,
+            vec![TxIn {
                 previous_output: OutPoint::null(),
                 script_sig: Script::from_bytes(vec![2, 0, 0]),
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut {
+            vec![TxOut {
                 value: 25_0000_0000,
                 script_pubkey: Script::new(),
             }],
-            lock_time: 0,
-        };
+            0,
+        );
         assert!(verify_coinbase(&tx, 0, 50_0000_0000, Network::Regtest).is_ok());
     }
 
     #[test]
-    fn verify_transaction_bip113_locktime_not_satisfied() {
-        let tx = Transaction {
-            version: 1,
-            inputs: vec![TxIn {
+    fn verify_transaction_negative_output_value_rejected() {
+        let tx = Transaction::from_parts(
+            1,
+            vec![TxIn {
                 previous_output: OutPoint {
-                    txid: Hash256([9; 32]),
+                    txid: Txid(Hash256([0xCC; 32])),
+                    vout: 0,
+                },
+                script_sig: Script::new(),
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            vec![TxOut {
+                value: -1,
+                script_pubkey: Script::new(),
+            }],
+            0,
+        );
+        let utxos = UtxoSet::new();
+        let r = verify_transaction(&tx, &utxos, 100, ScriptFlags::default());
+        assert!(r.is_err());
+        assert!(
+            matches!(r.unwrap_err(), ConsensusError::NegativeOutputValue),
+            "expected NegativeOutputValue error for negative output"
+        );
+    }
+
+    #[test]
+    fn verify_transaction_negative_output_bypasses_max_money() {
+        // Ensure a large negative value (which is < MAX_MONEY as i64) is still caught
+        let tx = Transaction::from_parts(
+            1,
+            vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid(Hash256([0xDD; 32])),
+                    vout: 0,
+                },
+                script_sig: Script::new(),
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            vec![TxOut {
+                value: i64::MIN,
+                script_pubkey: Script::new(),
+            }],
+            0,
+        );
+        let utxos = UtxoSet::new();
+        let r = verify_transaction(&tx, &utxos, 100, ScriptFlags::default());
+        assert!(r.is_err());
+        assert!(
+            matches!(r.unwrap_err(), ConsensusError::NegativeOutputValue),
+            "expected NegativeOutputValue error for i64::MIN output"
+        );
+    }
+
+    #[test]
+    fn verify_transaction_bip113_locktime_not_satisfied() {
+        let tx = Transaction::from_parts(
+            1,
+            vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid(Hash256([9; 32])),
                     vout: 0,
                 },
                 script_sig: Script::new(),
                 sequence: 0,
                 witness: vec![],
             }],
-            outputs: vec![TxOut {
+            vec![TxOut {
                 value: 1000,
                 script_pubkey: Script::new(),
             }],
-            lock_time: 100,
-        };
+            100,
+        );
         let utxos = UtxoSet::new();
         let r = verify_transaction_with_lock_rules(
             &tx,
@@ -680,7 +865,7 @@ mod tests {
 
     #[test]
     fn verify_transaction_bip68_height_lock_not_satisfied() {
-        let txid = Hash256([7; 32]);
+        let txid = Txid(Hash256([7; 32]));
         let mut utxos = UtxoSet::new();
         utxos.insert(
             OutPoint { txid, vout: 0 },
@@ -693,20 +878,20 @@ mod tests {
                 height: 100,
             },
         );
-        let tx = Transaction {
-            version: 2,
-            inputs: vec![TxIn {
+        let tx = Transaction::from_parts(
+            2,
+            vec![TxIn {
                 previous_output: OutPoint { txid, vout: 0 },
                 script_sig: Script::new(),
                 sequence: 1,
                 witness: vec![],
             }],
-            outputs: vec![TxOut {
+            vec![TxOut {
                 value: 1_000,
                 script_pubkey: Script::new(),
             }],
-            lock_time: 0,
-        };
+            0,
+        );
         let mut flags = ScriptFlags::default();
         flags.verify_checksequenceverify = true;
         let r = verify_transaction_with_lock_rules(
@@ -723,7 +908,7 @@ mod tests {
 
     #[test]
     fn verify_transaction_bip68_time_lock_not_satisfied() {
-        let txid = Hash256([8; 32]);
+        let txid = Txid(Hash256([8; 32]));
         let mut utxos = UtxoSet::new();
         utxos.insert(
             OutPoint { txid, vout: 0 },
@@ -736,20 +921,20 @@ mod tests {
                 height: 100,
             },
         );
-        let tx = Transaction {
-            version: 2,
-            inputs: vec![TxIn {
+        let tx = Transaction::from_parts(
+            2,
+            vec![TxIn {
                 previous_output: OutPoint { txid, vout: 0 },
                 script_sig: Script::new(),
                 sequence: (1 << 22) | 1,
                 witness: vec![],
             }],
-            outputs: vec![TxOut {
+            vec![TxOut {
                 value: 1_000,
                 script_pubkey: Script::new(),
             }],
-            lock_time: 0,
-        };
+            0,
+        );
         let mut flags = ScriptFlags::default();
         flags.verify_checksequenceverify = true;
         // coin height 100 -> base MTP at 99 = 99000; required min_time = 99000 + 512 - 1 = 99511

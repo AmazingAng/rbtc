@@ -5,8 +5,11 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+rand            = { workspace = true }
+rbtc-crypto     = { workspace = true }
 rbtc-primitives = { workspace = true }
 rocksdb         = { workspace = true }
+secp256k1       = { workspace = true }
 thiserror       = { workspace = true }
 
 [dev-dependencies]

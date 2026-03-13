@@ -4,6 +4,8 @@ use std::time::{Duration, Instant};
 use rbtc_primitives::hash::BlockHash;
 use tracing::{debug, info};
 
+use crate::headers_sync::HeadersSyncState;
+
 /// How long to wait without progress before declaring a stall and switching peers.
 ///
 /// Use a conservative timeout to avoid false-positive peer churn while waiting
@@ -42,6 +44,8 @@ pub struct IbdState {
     pub pending_ranges: VecDeque<(u32, u32)>,
     /// Ranges currently assigned to a peer: peer_id → (start, end) inclusive.
     pub assigned_ranges: HashMap<u64, (u32, u32)>,
+    /// Per-peer headers sync state (PRESYNC/REDOWNLOAD commitment phase).
+    pub per_peer_sync: HashMap<u64, HeadersSyncState>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +67,7 @@ impl IbdState {
             peer_downloads: HashMap::new(),
             pending_ranges: VecDeque::new(),
             assigned_ranges: HashMap::new(),
+            per_peer_sync: HashMap::new(),
         }
     }
 

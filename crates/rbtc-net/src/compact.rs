@@ -77,7 +77,7 @@ fn siphash_keys(header: &BlockHeader, nonce: u64) -> (u64, u64) {
     let mut preimage = Vec::with_capacity(88);
     // Encode the 80-byte block header
     header.version.encode(&mut preimage).ok();
-    header.prev_block.0.encode(&mut preimage).ok();
+    header.prev_block.0.0.encode(&mut preimage).ok();
     header.merkle_root.0.encode(&mut preimage).ok();
     header.time.encode(&mut preimage).ok();
     header.bits.encode(&mut preimage).ok();
@@ -96,6 +96,40 @@ pub fn short_txid(header: &BlockHeader, nonce: u64, txid: &Hash256) -> u64 {
     let mut h = SipHasher24::new_with_keys(k0, k1);
     h.write(&txid.0);
     h.finish() & 0x0000_ffff_ffff_ffff
+}
+
+// ── Construction ─────────────────────────────────────────────────────────────
+
+impl CompactBlock {
+    /// Construct a compact block from a full block.
+    /// Coinbase is always prefilled (index 0). Remaining transactions get short TxIDs.
+    /// `nonce` is the SipHash key material nonce (caller should use a random value).
+    pub fn from_block(block: &rbtc_primitives::block::Block, nonce: u64) -> Self {
+        let header = block.header.clone();
+        let mut short_ids = Vec::new();
+        let mut prefilled_txns = Vec::new();
+
+        for (i, tx) in block.transactions.iter().enumerate() {
+            if i == 0 {
+                // Coinbase is always prefilled at index 0
+                prefilled_txns.push(PrefilledTransaction {
+                    index: 0,
+                    tx: tx.clone(),
+                });
+            } else {
+                let txid_hash = tx.txid().0;
+                let sid = short_txid(&header, nonce, &txid_hash);
+                short_ids.push(sid);
+            }
+        }
+
+        CompactBlock {
+            header,
+            nonce,
+            short_ids,
+            prefilled_txns,
+        }
+    }
 }
 
 // ── Encode / Decode ───────────────────────────────────────────────────────────
@@ -273,10 +307,7 @@ pub fn reconstruct_block(
 
     if missing.is_empty() {
         let transactions: Vec<Transaction> = slots.into_iter().flatten().collect();
-        let block = rbtc_primitives::block::Block {
-            header: cmpct.header.clone(),
-            transactions,
-        };
+        let block = rbtc_primitives::block::Block::new(cmpct.header.clone(), transactions);
         (Some(block), vec![])
     } else {
         (None, missing)
@@ -287,12 +318,12 @@ pub fn reconstruct_block(
 mod tests {
     use super::*;
     use rbtc_primitives::block::BlockHeader;
-    use rbtc_primitives::hash::Hash256;
+    use rbtc_primitives::hash::{BlockHash, Hash256};
 
     fn dummy_header() -> BlockHeader {
         BlockHeader {
             version: 1,
-            prev_block: Hash256::ZERO,
+            prev_block: BlockHash(Hash256::ZERO),
             merkle_root: Hash256::ZERO,
             time: 0,
             bits: 0x207fffff,
@@ -330,5 +361,111 @@ mod tests {
         let decoded = GetBlockTxn::decode_payload(&bytes).unwrap();
         assert_eq!(decoded.block_hash.0, msg.block_hash.0);
         assert_eq!(decoded.indexes, msg.indexes);
+    }
+
+    fn dummy_coinbase() -> Transaction {
+        use rbtc_primitives::transaction::{OutPoint, TxIn, TxOut, OUTPOINT_NULL_INDEX};
+        use rbtc_primitives::hash::Txid;
+        use rbtc_primitives::script::Script;
+        Transaction::from_parts(
+            1,
+            vec![TxIn {
+                previous_output: OutPoint { txid: Txid(Hash256::ZERO), vout: OUTPOINT_NULL_INDEX },
+                script_sig: Script::from_bytes(vec![0x04, 0xff, 0xff, 0x00, 0x1d]),
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            vec![TxOut { value: 50_0000_0000, script_pubkey: Script::new() }],
+            0,
+        )
+    }
+
+    fn dummy_tx(marker: u8) -> Transaction {
+        use rbtc_primitives::transaction::{OutPoint, TxIn, TxOut};
+        use rbtc_primitives::hash::Txid;
+        use rbtc_primitives::script::Script;
+        Transaction::from_parts(
+            1,
+            vec![TxIn {
+                previous_output: OutPoint { txid: Txid(Hash256([marker; 32])), vout: 0 },
+                script_sig: Script::new(),
+                sequence: 0xffffffff,
+                witness: vec![],
+            }],
+            vec![TxOut { value: 1_0000_0000, script_pubkey: Script::new() }],
+            0,
+        )
+    }
+
+    #[test]
+    fn from_block_coinbase_only() {
+        let coinbase = dummy_coinbase();
+        let block = rbtc_primitives::block::Block::new(dummy_header(), vec![coinbase.clone()]);
+        let cmpct = CompactBlock::from_block(&block, 42);
+
+        assert_eq!(cmpct.prefilled_txns.len(), 1);
+        assert_eq!(cmpct.prefilled_txns[0].index, 0);
+        assert_eq!(cmpct.short_ids.len(), 0);
+        assert_eq!(cmpct.nonce, 42);
+    }
+
+    #[test]
+    fn from_block_includes_coinbase_prefilled() {
+        let coinbase = dummy_coinbase();
+        let tx1 = dummy_tx(1);
+        let block = rbtc_primitives::block::Block::new(
+            dummy_header(),
+            vec![coinbase.clone(), tx1.clone()],
+        );
+        let cmpct = CompactBlock::from_block(&block, 100);
+
+        assert_eq!(cmpct.prefilled_txns.len(), 1);
+        assert_eq!(cmpct.prefilled_txns[0].index, 0);
+        assert_eq!(cmpct.short_ids.len(), 1);
+    }
+
+    #[test]
+    fn from_block_short_ids_match() {
+        let coinbase = dummy_coinbase();
+        let tx1 = dummy_tx(1);
+        let tx2 = dummy_tx(2);
+        let block = rbtc_primitives::block::Block::new(
+            dummy_header(),
+            vec![coinbase, tx1.clone(), tx2.clone()],
+        );
+        let nonce = 999;
+        let cmpct = CompactBlock::from_block(&block, nonce);
+
+        // Verify short IDs match what short_txid() would compute
+        let expected_sid1 = short_txid(&dummy_header(), nonce, &tx1.txid().0);
+        let expected_sid2 = short_txid(&dummy_header(), nonce, &tx2.txid().0);
+        assert_eq!(cmpct.short_ids.len(), 2);
+        assert_eq!(cmpct.short_ids[0], expected_sid1);
+        assert_eq!(cmpct.short_ids[1], expected_sid2);
+    }
+
+    #[test]
+    fn from_block_roundtrip_with_mempool() {
+        let coinbase = dummy_coinbase();
+        let tx1 = dummy_tx(1);
+        let tx2 = dummy_tx(2);
+        let block = rbtc_primitives::block::Block::new(
+            dummy_header(),
+            vec![coinbase.clone(), tx1.clone(), tx2.clone()],
+        );
+        let nonce = 42;
+        let cmpct = CompactBlock::from_block(&block, nonce);
+
+        // Build mempool lookup from the non-coinbase txs
+        let mut mempool_lookup = std::collections::HashMap::new();
+        for tx in &[&tx1, &tx2] {
+            let sid = short_txid(&cmpct.header, cmpct.nonce, &tx.txid().0);
+            mempool_lookup.insert(sid, (*tx).clone());
+        }
+
+        let (maybe_block, missing) = reconstruct_block(&cmpct, &mempool_lookup);
+        assert!(missing.is_empty());
+        let reconstructed = maybe_block.unwrap();
+        assert_eq!(reconstructed.transactions.len(), 3);
     }
 }

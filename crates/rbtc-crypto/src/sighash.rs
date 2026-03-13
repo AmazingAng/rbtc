@@ -8,6 +8,116 @@ use sha2::{Digest, Sha256};
 
 use crate::digest::{sha256, sha256d, tagged_hash};
 
+/// Precomputed sub-hashes for BIP143 (SegWit v0) and BIP341 (Taproot) sighash
+/// computation, matching Bitcoin Core's `PrecomputedTransactionData`.
+///
+/// Computing these once and reusing them across every input of the same
+/// transaction avoids redundant hashing work.
+#[derive(Debug, Clone)]
+pub struct PrecomputedSighashData {
+    // BIP143 (double-SHA256)
+    pub hash_prevouts: Hash256,
+    pub hash_sequence: Hash256,
+    pub hash_outputs: Hash256,
+
+    // BIP341 (single-SHA256)
+    pub prevouts_single_hash: Hash256,
+    pub sequences_single_hash: Hash256,
+    pub outputs_single_hash: Hash256,
+    pub amounts_single_hash: Hash256,
+    pub scriptpubkeys_single_hash: Hash256,
+}
+
+impl PrecomputedSighashData {
+    /// Precompute all sub-hashes for the given transaction and its spent outputs.
+    ///
+    /// `prevouts` must contain the `TxOut` being spent by each input, in order.
+    /// For BIP143-only callers the slice may be empty (the BIP341 single-SHA256
+    /// fields will be zeroed in that case).
+    pub fn new(tx: &Transaction, prevouts: &[TxOut]) -> Self {
+        // --- BIP143 double-SHA256 sub-hashes ---
+        let hash_prevouts = {
+            let mut data = Vec::new();
+            for input in &tx.inputs {
+                input.previous_output.encode(&mut data).unwrap();
+            }
+            sha256d(&data)
+        };
+
+        let hash_sequence = {
+            let mut data = Vec::new();
+            for input in &tx.inputs {
+                input.sequence.encode(&mut data).unwrap();
+            }
+            sha256d(&data)
+        };
+
+        let hash_outputs = {
+            let mut data = Vec::new();
+            for output in &tx.outputs {
+                output.encode(&mut data).unwrap();
+            }
+            sha256d(&data)
+        };
+
+        // --- BIP341 single-SHA256 sub-hashes ---
+        let prevouts_single_hash = {
+            let mut data = Vec::new();
+            for input in &tx.inputs {
+                input.previous_output.encode(&mut data).unwrap();
+            }
+            sha256(&data)
+        };
+
+        let sequences_single_hash = {
+            let mut data = Vec::new();
+            for input in &tx.inputs {
+                input.sequence.encode(&mut data).unwrap();
+            }
+            sha256(&data)
+        };
+
+        let outputs_single_hash = {
+            let mut data = Vec::new();
+            for output in &tx.outputs {
+                output.encode(&mut data).unwrap();
+            }
+            sha256(&data)
+        };
+
+        let (amounts_single_hash, scriptpubkeys_single_hash) = if !prevouts.is_empty() {
+            let amounts = {
+                let mut data = Vec::new();
+                for prevout in prevouts {
+                    prevout.value.encode(&mut data).unwrap();
+                }
+                sha256(&data)
+            };
+            let scriptpubkeys = {
+                let mut data = Vec::new();
+                for prevout in prevouts {
+                    prevout.script_pubkey.encode(&mut data).unwrap();
+                }
+                sha256(&data)
+            };
+            (amounts, scriptpubkeys)
+        } else {
+            (Hash256::ZERO, Hash256::ZERO)
+        };
+
+        Self {
+            hash_prevouts,
+            hash_sequence,
+            hash_outputs,
+            prevouts_single_hash,
+            sequences_single_hash,
+            outputs_single_hash,
+            amounts_single_hash,
+            scriptpubkeys_single_hash,
+        }
+    }
+}
+
 fn strip_codeseparators(script: &Script) -> Script {
     let bytes = script.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -240,7 +350,7 @@ pub fn sighash_segwit_v0(
     tx: &Transaction,
     input_index: usize,
     script_code: &Script,
-    value: u64,
+    value: i64,
     sighash_type: SighashType,
 ) -> Hash256 {
     sighash_segwit_v0_with_u32(tx, input_index, script_code, value, sighash_type as u32)
@@ -251,7 +361,7 @@ pub fn sighash_segwit_v0_with_u32(
     tx: &Transaction,
     input_index: usize,
     script_code: &Script,
-    value: u64,
+    value: i64,
     sighash_u32: u32,
 ) -> Hash256 {
     let base = sighash_u32 & 0x1f;
@@ -443,12 +553,163 @@ pub fn sighash_taproot(
     tagged_hash(b"TapSighash", &buf)
 }
 
+/// BIP143 sighash for SegWit v0 inputs using precomputed sub-hashes.
+///
+/// This is identical to [`sighash_segwit_v0_with_u32`] but avoids recomputing
+/// the shared prevouts/sequence/outputs hashes for every input of the same
+/// transaction.
+pub fn sighash_segwit_v0_cached(
+    tx: &Transaction,
+    input_index: usize,
+    script_code: &Script,
+    value: i64,
+    sighash_u32: u32,
+    cache: &PrecomputedSighashData,
+) -> Hash256 {
+    let base = sighash_u32 & 0x1f;
+    let anyone_can_pay = sighash_u32 & 0x80 != 0;
+    let is_single = base == 3;
+    let is_none = base == 2;
+
+    let hash_prevouts = if !anyone_can_pay {
+        cache.hash_prevouts
+    } else {
+        Hash256::ZERO
+    };
+
+    let hash_sequence = if !anyone_can_pay && !is_single && !is_none {
+        cache.hash_sequence
+    } else {
+        Hash256::ZERO
+    };
+
+    let hash_outputs = if !is_single && !is_none {
+        cache.hash_outputs
+    } else if is_single && input_index < tx.outputs.len() {
+        let mut data = Vec::new();
+        tx.outputs[input_index].encode(&mut data).unwrap();
+        sha256d(&data)
+    } else {
+        Hash256::ZERO
+    };
+
+    let mut buf = Vec::new();
+    tx.version.encode(&mut buf).unwrap();
+    hash_prevouts.0.encode(&mut buf).unwrap();
+    hash_sequence.0.encode(&mut buf).unwrap();
+
+    let input = &tx.inputs[input_index];
+    input.previous_output.encode(&mut buf).unwrap();
+    script_code.encode(&mut buf).unwrap();
+    value.encode(&mut buf).unwrap();
+    input.sequence.encode(&mut buf).unwrap();
+
+    hash_outputs.0.encode(&mut buf).unwrap();
+    tx.lock_time.encode(&mut buf).unwrap();
+    sighash_u32.encode(&mut buf).unwrap();
+
+    sha256d(&buf)
+}
+
+/// BIP341 sighash for Taproot inputs using precomputed sub-hashes.
+///
+/// This is identical to [`sighash_taproot`] but avoids recomputing the shared
+/// sub-hashes for every input of the same transaction.
+#[allow(clippy::too_many_arguments)]
+pub fn sighash_taproot_cached(
+    tx: &Transaction,
+    input_index: usize,
+    prevouts: &[TxOut],
+    sighash_type: SighashType,
+    leaf_hash: Option<&[u8; 32]>,
+    annex: Option<&[u8]>,
+    key_version: u8,
+    code_separator_pos: u32,
+    cache: &PrecomputedSighashData,
+) -> Hash256 {
+    let sighash_byte = sighash_type as u8;
+    let mut base = sighash_byte & 0x1f;
+    if base == 0 {
+        base = 1;
+    }
+    let anyone_can_pay = sighash_byte & 0x80 != 0;
+
+    let mut buf = Vec::new();
+
+    // epoch
+    buf.push(0u8);
+
+    // sighash type
+    buf.push(sighash_byte);
+
+    // version + locktime
+    tx.version.encode(&mut buf).unwrap();
+    tx.lock_time.encode(&mut buf).unwrap();
+
+    if !anyone_can_pay {
+        buf.extend_from_slice(&cache.prevouts_single_hash.0);
+        buf.extend_from_slice(&cache.amounts_single_hash.0);
+        buf.extend_from_slice(&cache.scriptpubkeys_single_hash.0);
+        buf.extend_from_slice(&cache.sequences_single_hash.0);
+    }
+
+    if base == 1 {
+        buf.extend_from_slice(&cache.outputs_single_hash.0);
+    }
+
+    // spend_type
+    let have_annex = annex.is_some();
+    let ext_flag: u8 = if leaf_hash.is_some() { 1 } else { 0 };
+    let spend_type = ext_flag * 2 + if have_annex { 1 } else { 0 };
+    buf.push(spend_type);
+
+    // Input data
+    if anyone_can_pay {
+        let input = &tx.inputs[input_index];
+        input.previous_output.encode(&mut buf).unwrap();
+        prevouts[input_index].value.encode(&mut buf).unwrap();
+        prevouts[input_index]
+            .script_pubkey
+            .encode(&mut buf)
+            .unwrap();
+        input.sequence.encode(&mut buf).unwrap();
+    } else {
+        (input_index as u32).encode(&mut buf).unwrap();
+    }
+
+    if let Some(annex_data) = annex {
+        let mut annex_ser = Vec::new();
+        VarInt(annex_data.len() as u64)
+            .encode(&mut annex_ser)
+            .unwrap();
+        annex_ser.extend_from_slice(annex_data);
+        let mut h = Sha256::new();
+        h.update(&annex_ser);
+        buf.extend_from_slice(&h.finalize());
+    }
+
+    if base == 3 && input_index < tx.outputs.len() {
+        let mut data = Vec::new();
+        tx.outputs[input_index].encode(&mut data).unwrap();
+        let h = sha256(&data);
+        buf.extend_from_slice(&h.0);
+    }
+
+    if let Some(lh) = leaf_hash {
+        buf.extend_from_slice(lh);
+        buf.push(key_version);
+        buf.extend_from_slice(&code_separator_pos.to_le_bytes());
+    }
+
+    tagged_hash(b"TapSighash", &buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sig::verify_schnorr;
     use rbtc_primitives::codec::Decodable;
-    use rbtc_primitives::hash::Hash256;
+    use rbtc_primitives::hash::{Hash256, Txid};
     use rbtc_primitives::transaction::{OutPoint, TxIn, TxOut};
     use std::io::Cursor;
 
@@ -465,23 +726,23 @@ mod tests {
     }
 
     fn sample_tx() -> Transaction {
-        Transaction {
-            version: 1,
-            inputs: vec![TxIn {
+        Transaction::from_parts(
+            1,
+            vec![TxIn {
                 previous_output: OutPoint {
-                    txid: Hash256([0; 32]),
+                    txid: Txid(Hash256([0; 32])),
                     vout: 0,
                 },
                 script_sig: Script::new(),
                 sequence: 0xffffffff,
                 witness: vec![],
             }],
-            outputs: vec![TxOut {
+            vec![TxOut {
                 value: 1000,
                 script_pubkey: Script::new(),
             }],
-            lock_time: 0,
-        }
+            0,
+        )
     }
 
     #[test]
@@ -707,12 +968,12 @@ mod tests {
 
     #[test]
     fn sighash_taproot_uses_single_sha256_subhashes() {
-        let tx = Transaction {
-            version: 2,
-            inputs: vec![
+        let tx = Transaction::from_parts(
+            2,
+            vec![
                 TxIn {
                     previous_output: OutPoint {
-                        txid: Hash256([1; 32]),
+                        txid: Txid(Hash256([1; 32])),
                         vout: 1,
                     },
                     script_sig: Script::new(),
@@ -721,7 +982,7 @@ mod tests {
                 },
                 TxIn {
                     previous_output: OutPoint {
-                        txid: Hash256([2; 32]),
+                        txid: Txid(Hash256([2; 32])),
                         vout: 2,
                     },
                     script_sig: Script::new(),
@@ -729,7 +990,7 @@ mod tests {
                     witness: vec![],
                 },
             ],
-            outputs: vec![
+            vec![
                 TxOut {
                     value: 111,
                     script_pubkey: Script::from_bytes(vec![0x51]),
@@ -739,8 +1000,8 @@ mod tests {
                     script_pubkey: Script::from_bytes(vec![0x51, 0x51]),
                 },
             ],
-            lock_time: 3,
-        };
+            3,
+        );
         let prevouts = vec![
             TxOut {
                 value: 777,
@@ -799,18 +1060,18 @@ mod tests {
 
     #[test]
     fn sighash_taproot_default_commits_outputs() {
-        let tx1 = Transaction {
-            version: 2,
-            inputs: vec![TxIn {
+        let tx1 = Transaction::from_parts(
+            2,
+            vec![TxIn {
                 previous_output: OutPoint {
-                    txid: Hash256([9; 32]),
+                    txid: Txid(Hash256([9; 32])),
                     vout: 0,
                 },
                 script_sig: Script::new(),
                 sequence: 0xabcdef01,
                 witness: vec![],
             }],
-            outputs: vec![
+            vec![
                 TxOut {
                     value: 100,
                     script_pubkey: Script::from_bytes(vec![0x51]),
@@ -820,8 +1081,8 @@ mod tests {
                     script_pubkey: Script::from_bytes(vec![0x51, 0x51]),
                 },
             ],
-            lock_time: 42,
-        };
+            42,
+        );
         let mut tx2 = tx1.clone();
         tx2.outputs[1].value = 201;
         let prevouts = vec![TxOut {
@@ -900,5 +1161,345 @@ mod tests {
         let output_key =
             decode_hex("8102001190c6aad9a015dff1540dc9a7bda31613b8ab05a58268c4bff53fae82");
         assert!(verify_schnorr(&output_key, sig, &h.0).is_ok());
+    }
+
+    // ---- PrecomputedSighashData / cached function tests ----
+
+    fn multi_input_tx() -> (Transaction, Vec<TxOut>) {
+        let tx = Transaction::from_parts(
+            2,
+            vec![
+                TxIn {
+                    previous_output: OutPoint {
+                        txid: Txid(Hash256([1; 32])),
+                        vout: 0,
+                    },
+                    script_sig: Script::new(),
+                    sequence: 0xfffffffe,
+                    witness: vec![],
+                },
+                TxIn {
+                    previous_output: OutPoint {
+                        txid: Txid(Hash256([2; 32])),
+                        vout: 1,
+                    },
+                    script_sig: Script::new(),
+                    sequence: 0xffffffff,
+                    witness: vec![],
+                },
+                TxIn {
+                    previous_output: OutPoint {
+                        txid: Txid(Hash256([3; 32])),
+                        vout: 2,
+                    },
+                    script_sig: Script::new(),
+                    sequence: 0xfffffffd,
+                    witness: vec![],
+                },
+            ],
+            vec![
+                TxOut {
+                    value: 1000,
+                    script_pubkey: Script::from_bytes(vec![0x76, 0xa9]),
+                },
+                TxOut {
+                    value: 2000,
+                    script_pubkey: Script::from_bytes(vec![0x51, 0x20]),
+                },
+            ],
+            500_000,
+        );
+        let prevouts = vec![
+            TxOut {
+                value: 5000,
+                script_pubkey: Script::from_bytes(vec![0x00, 0x14, 0xaa]),
+            },
+            TxOut {
+                value: 6000,
+                script_pubkey: Script::from_bytes(vec![0x51, 0x20, 0xbb]),
+            },
+            TxOut {
+                value: 7000,
+                script_pubkey: Script::from_bytes(vec![0x51, 0x20, 0xcc]),
+            },
+        ];
+        (tx, prevouts)
+    }
+
+    #[test]
+    fn cached_segwit_v0_matches_uncached_all() {
+        let (tx, prevouts) = multi_input_tx();
+        let cache = PrecomputedSighashData::new(&tx, &prevouts);
+        let script_code = Script::from_bytes(vec![0x76, 0xa9]);
+        for idx in 0..tx.inputs.len() {
+            let uncached = sighash_segwit_v0_with_u32(&tx, idx, &script_code, 5000, 1);
+            let cached = sighash_segwit_v0_cached(&tx, idx, &script_code, 5000, 1, &cache);
+            assert_eq!(uncached, cached, "mismatch at input {idx} for SIGHASH_ALL");
+        }
+    }
+
+    #[test]
+    fn cached_segwit_v0_matches_uncached_none() {
+        let (tx, prevouts) = multi_input_tx();
+        let cache = PrecomputedSighashData::new(&tx, &prevouts);
+        let script_code = Script::from_bytes(vec![0x76, 0xa9]);
+        for idx in 0..tx.inputs.len() {
+            let uncached = sighash_segwit_v0_with_u32(&tx, idx, &script_code, 6000, 2);
+            let cached = sighash_segwit_v0_cached(&tx, idx, &script_code, 6000, 2, &cache);
+            assert_eq!(uncached, cached, "mismatch at input {idx} for SIGHASH_NONE");
+        }
+    }
+
+    #[test]
+    fn cached_segwit_v0_matches_uncached_single() {
+        let (tx, prevouts) = multi_input_tx();
+        let cache = PrecomputedSighashData::new(&tx, &prevouts);
+        let script_code = Script::from_bytes(vec![0x76, 0xa9]);
+        for idx in 0..tx.inputs.len() {
+            let uncached = sighash_segwit_v0_with_u32(&tx, idx, &script_code, 7000, 3);
+            let cached = sighash_segwit_v0_cached(&tx, idx, &script_code, 7000, 3, &cache);
+            assert_eq!(
+                uncached, cached,
+                "mismatch at input {idx} for SIGHASH_SINGLE"
+            );
+        }
+    }
+
+    #[test]
+    fn cached_segwit_v0_matches_uncached_anyonecanpay() {
+        let (tx, prevouts) = multi_input_tx();
+        let cache = PrecomputedSighashData::new(&tx, &prevouts);
+        let script_code = Script::from_bytes(vec![0x76, 0xa9]);
+        for idx in 0..tx.inputs.len() {
+            let uncached = sighash_segwit_v0_with_u32(&tx, idx, &script_code, 5000, 0x81);
+            let cached = sighash_segwit_v0_cached(&tx, idx, &script_code, 5000, 0x81, &cache);
+            assert_eq!(
+                uncached, cached,
+                "mismatch at input {idx} for SIGHASH_ALL|ANYONECANPAY"
+            );
+        }
+    }
+
+    #[test]
+    fn cached_taproot_matches_uncached_default() {
+        let (tx, prevouts) = multi_input_tx();
+        let cache = PrecomputedSighashData::new(&tx, &prevouts);
+        for idx in 0..tx.inputs.len() {
+            let uncached = sighash_taproot(
+                &tx,
+                idx,
+                &prevouts,
+                SighashType::TaprootDefault,
+                None,
+                None,
+                0,
+                u32::MAX,
+            );
+            let cached = sighash_taproot_cached(
+                &tx,
+                idx,
+                &prevouts,
+                SighashType::TaprootDefault,
+                None,
+                None,
+                0,
+                u32::MAX,
+                &cache,
+            );
+            assert_eq!(
+                uncached, cached,
+                "mismatch at input {idx} for taproot default"
+            );
+        }
+    }
+
+    #[test]
+    fn cached_taproot_matches_uncached_all() {
+        let (tx, prevouts) = multi_input_tx();
+        let cache = PrecomputedSighashData::new(&tx, &prevouts);
+        for idx in 0..tx.inputs.len() {
+            let uncached = sighash_taproot(
+                &tx,
+                idx,
+                &prevouts,
+                SighashType::All,
+                None,
+                None,
+                0,
+                u32::MAX,
+            );
+            let cached = sighash_taproot_cached(
+                &tx,
+                idx,
+                &prevouts,
+                SighashType::All,
+                None,
+                None,
+                0,
+                u32::MAX,
+                &cache,
+            );
+            assert_eq!(uncached, cached, "mismatch at input {idx} for taproot ALL");
+        }
+    }
+
+    #[test]
+    fn cached_taproot_matches_uncached_single() {
+        let (tx, prevouts) = multi_input_tx();
+        let cache = PrecomputedSighashData::new(&tx, &prevouts);
+        for idx in 0..tx.inputs.len() {
+            let uncached = sighash_taproot(
+                &tx,
+                idx,
+                &prevouts,
+                SighashType::Single,
+                None,
+                None,
+                0,
+                u32::MAX,
+            );
+            let cached = sighash_taproot_cached(
+                &tx,
+                idx,
+                &prevouts,
+                SighashType::Single,
+                None,
+                None,
+                0,
+                u32::MAX,
+                &cache,
+            );
+            assert_eq!(
+                uncached, cached,
+                "mismatch at input {idx} for taproot SINGLE"
+            );
+        }
+    }
+
+    #[test]
+    fn cached_taproot_matches_uncached_anyonecanpay() {
+        let (tx, prevouts) = multi_input_tx();
+        let cache = PrecomputedSighashData::new(&tx, &prevouts);
+        for idx in 0..tx.inputs.len() {
+            let uncached = sighash_taproot(
+                &tx,
+                idx,
+                &prevouts,
+                SighashType::AllAnyoneCanPay,
+                None,
+                None,
+                0,
+                u32::MAX,
+            );
+            let cached = sighash_taproot_cached(
+                &tx,
+                idx,
+                &prevouts,
+                SighashType::AllAnyoneCanPay,
+                None,
+                None,
+                0,
+                u32::MAX,
+                &cache,
+            );
+            assert_eq!(
+                uncached, cached,
+                "mismatch at input {idx} for taproot ALL|ANYONECANPAY"
+            );
+        }
+    }
+
+    #[test]
+    fn cached_taproot_matches_uncached_with_leaf_and_annex() {
+        let (tx, prevouts) = multi_input_tx();
+        let cache = PrecomputedSighashData::new(&tx, &prevouts);
+        let leaf = [42u8; 32];
+        let annex = vec![0x50, 0x01, 0x02];
+        for idx in 0..tx.inputs.len() {
+            let uncached = sighash_taproot(
+                &tx,
+                idx,
+                &prevouts,
+                SighashType::All,
+                Some(&leaf),
+                Some(&annex),
+                0,
+                99,
+            );
+            let cached = sighash_taproot_cached(
+                &tx,
+                idx,
+                &prevouts,
+                SighashType::All,
+                Some(&leaf),
+                Some(&annex),
+                0,
+                99,
+                &cache,
+            );
+            assert_eq!(
+                uncached, cached,
+                "mismatch at input {idx} for taproot ALL with leaf+annex"
+            );
+        }
+    }
+
+    #[test]
+    fn cached_taproot_mainnet_776550_vin1() {
+        // Same real mainnet tx used in the non-cached test above.
+        let tx_hex = "020000000001033521f3540acb413a3bb15e0e49749b31376f242a5c2cc653d5f5f0e51378269e0000000000ffffffff4b7f67adceab9bdc83fe639d2c96c6d43c483590789644f951d3fb4ee563ad190000000000ffffffff3521f3540acb413a3bb15e0e49749b31376f242a5c2cc653d5f5f0e51378269e0100000000ffffffff031027000000000000225120bb7e66771403f65424a570b6a4cdb3528f964204a2b72744d82f1002bfb1598b10270000000000002251208102001190c6aad9a015dff1540dc9a7bda31613b8ab05a58268c4bff53fae821027000000000000225120bb7e66771403f65424a570b6a4cdb3528f964204a2b72744d82f1002bfb1598b01408b516fc211670bc9ce5ecd128bc7b96974a4b88f7f035977edfade3f6ea2fef7aabfbe7a9022f9a2d0de6203edccfb414b457f4b7275cd9b242f72c8d95ef4c201410d41273b5b93ee77aaf41b3b558924e4cc545c81894cbf81684a89f09c1355f78de33d254d93d6109c9c8bb52f76521a702ea34d9802ed4e9944ee11395b69c7830140a1358aac56f96b1846b81de498e92128f1302bc5a7d9e486a71e3fd6792ad671dd22abd14421a738f631882f3491c2f66b5bd27495413e87df9e0f5bcdcf31cd00000000";
+        let tx = Transaction::decode(&mut Cursor::new(decode_hex(tx_hex))).unwrap();
+        let prevouts = vec![
+            TxOut {
+                value: 20_000,
+                script_pubkey: Script::from_bytes(decode_hex(
+                    "5120bb7e66771403f65424a570b6a4cdb3528f964204a2b72744d82f1002bfb1598b",
+                )),
+            },
+            TxOut {
+                value: 10_000,
+                script_pubkey: Script::from_bytes(decode_hex(
+                    "51208102001190c6aad9a015dff1540dc9a7bda31613b8ab05a58268c4bff53fae82",
+                )),
+            },
+            TxOut {
+                value: 5_928,
+                script_pubkey: Script::from_bytes(decode_hex(
+                    "5120bb7e66771403f65424a570b6a4cdb3528f964204a2b72744d82f1002bfb1598b",
+                )),
+            },
+        ];
+
+        let cache = PrecomputedSighashData::new(&tx, &prevouts);
+
+        let h_uncached = sighash_taproot(
+            &tx,
+            1,
+            &prevouts,
+            SighashType::SingleAnyoneCanPay,
+            None,
+            None,
+            0,
+            u32::MAX,
+        );
+        let h_cached = sighash_taproot_cached(
+            &tx,
+            1,
+            &prevouts,
+            SighashType::SingleAnyoneCanPay,
+            None,
+            None,
+            0,
+            u32::MAX,
+            &cache,
+        );
+        assert_eq!(h_uncached, h_cached);
+
+        // Also verify the cached result against the real signature.
+        let sig_with_hashtype = &tx.inputs[1].witness[0];
+        let sig = &sig_with_hashtype[..64];
+        let output_key =
+            decode_hex("8102001190c6aad9a015dff1540dc9a7bda31613b8ab05a58268c4bff53fae82");
+        assert!(verify_schnorr(&output_key, sig, &h_cached.0).is_ok());
     }
 }

@@ -28,4 +28,7 @@ pub mod signer;
 pub mod types;
 
 pub use error::{PsbtError, Result};
-pub use types::{Psbt, PsbtGlobal, PsbtInput, PsbtOutput};
+pub use types::{
+    Psbt, PsbtGlobal, PsbtInput, PsbtOutput, TapTreeLeaf,
+    PSBT_TXMOD_INPUTS, PSBT_TXMOD_OUTPUTS, PSBT_TXMOD_HAS_SIGHASH_SINGLE,
+};

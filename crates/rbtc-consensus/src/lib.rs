@@ -9,11 +9,12 @@ pub mod tx_verify;
 pub mod utxo;
 pub mod versionbits;
 
-pub use block_verify::{verify_block, verify_signet_block_solution};
+pub use block_verify::{check_block, connect_block, connect_block_with_options, verify_block, verify_signet_block_solution};
 pub use blockfilter::{build_basic_filter, compute_filter_header, BASIC_FILTER_TYPE};
 pub use chain::{BlockIndex, ChainState};
+pub use difficulty::{check_timewarp, get_minimum_time, testnet_min_difficulty_bits};
 pub use error::ConsensusError;
-pub use script_flags::script_flags_for_block;
-pub use tx_verify::verify_transaction;
+pub use script_flags::{script_flags_for_block, script_flags_for_block_with_versionbits};
+pub use tx_verify::{is_final_tx, verify_transaction};
 pub use utxo::{Utxo, UtxoLookup, UtxoSet};
 pub use versionbits::{deployment_state, deployments, Bip9Deployment, ThresholdState};

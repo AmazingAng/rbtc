@@ -19,7 +19,7 @@ use tokio::{
 use rbtc_net::message::{
     GetBlocksMessage, InvType, Inventory, Message, NetworkMessage, VersionMessage,
 };
-use rbtc_primitives::{hash::Hash256, network::Network};
+use rbtc_primitives::{hash::{BlockHash, Hash256}, network::Network};
 
 const REGTEST_ADDR: &str = "127.0.0.1:18444";
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -281,7 +281,7 @@ async fn test_getheaders_from_genesis() {
     let genesis =
         Hash256::from_hex("0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206")
             .unwrap();
-    let get_headers = GetBlocksMessage::new(vec![genesis]);
+    let get_headers = GetBlocksMessage::new(vec![BlockHash(genesis)]);
 
     writer
         .write_all(&Message::new(magic, NetworkMessage::GetHeaders(get_headers)).encode_to_bytes())
@@ -412,7 +412,7 @@ async fn test_sync_first_10_blocks() {
         .write_all(
             &Message::new(
                 magic,
-                NetworkMessage::GetHeaders(GetBlocksMessage::new(vec![genesis])),
+                NetworkMessage::GetHeaders(GetBlocksMessage::new(vec![BlockHash(genesis)])),
             )
             .encode_to_bytes(),
         )
@@ -440,7 +440,7 @@ async fn test_sync_first_10_blocks() {
             use rbtc_primitives::codec::Encodable;
             let mut buf = Vec::with_capacity(80);
             h.version.encode(&mut buf).ok();
-            h.prev_block.0.encode(&mut buf).ok();
+            h.prev_block.0.0.encode(&mut buf).ok();
             h.merkle_root.0.encode(&mut buf).ok();
             h.time.encode(&mut buf).ok();
             h.bits.encode(&mut buf).ok();
@@ -483,7 +483,7 @@ async fn test_sync_first_10_blocks() {
                         .outputs
                         .iter()
                         .map(|o| o.value)
-                        .sum::<u64>()
+                        .sum::<i64>()
                 );
             }
         }
@@ -527,7 +527,7 @@ async fn test_merkle_root_matches_header() {
         .write_all(
             &Message::new(
                 magic,
-                NetworkMessage::GetHeaders(GetBlocksMessage::new(vec![genesis])),
+                NetworkMessage::GetHeaders(GetBlocksMessage::new(vec![BlockHash(genesis)])),
             )
             .encode_to_bytes(),
         )
@@ -555,7 +555,7 @@ async fn test_merkle_root_matches_header() {
             use rbtc_primitives::codec::Encodable;
             let mut buf = Vec::with_capacity(80);
             h.version.encode(&mut buf).ok();
-            h.prev_block.0.encode(&mut buf).ok();
+            h.prev_block.0.0.encode(&mut buf).ok();
             h.merkle_root.0.encode(&mut buf).ok();
             h.time.encode(&mut buf).ok();
             h.bits.encode(&mut buf).ok();
@@ -593,7 +593,7 @@ async fn test_merkle_root_matches_header() {
                     })
                     .collect();
 
-                let computed_root = rbtc_crypto::merkle_root(&txids).unwrap_or(Hash256::ZERO);
+                let computed_root = rbtc_crypto::merkle_root(&txids).0.unwrap_or(Hash256::ZERO);
                 assert_eq!(
                     computed_root, block.header.merkle_root,
                     "merkle root mismatch at block #{verified}"
@@ -651,7 +651,7 @@ async fn test_block_version_bits() {
         .write_all(
             &Message::new(
                 magic,
-                NetworkMessage::GetHeaders(GetBlocksMessage::new(vec![genesis])),
+                NetworkMessage::GetHeaders(GetBlocksMessage::new(vec![BlockHash(genesis)])),
             )
             .encode_to_bytes(),
         )
@@ -1199,18 +1199,18 @@ async fn test_dust_limit_enforcement() {
 #[tokio::test]
 async fn test_mempool_standardness() {
     // Version > 2 is non-standard
-    let tx_v3 = rbtc_primitives::transaction::Transaction {
-        version: 3,
-        inputs: vec![rbtc_primitives::transaction::TxIn {
+    let tx_v3 = rbtc_primitives::transaction::Transaction::from_parts(
+        3,
+        vec![rbtc_primitives::transaction::TxIn {
             previous_output: rbtc_primitives::transaction::OutPoint {
-                txid: rbtc_primitives::hash::Hash256([1; 32]),
+                txid: rbtc_primitives::Txid(rbtc_primitives::hash::Hash256([1; 32])),
                 vout: 0,
             },
             script_sig: rbtc_primitives::script::Script::new(),
             sequence: 0xffffffff,
             witness: vec![],
         }],
-        outputs: vec![rbtc_primitives::transaction::TxOut {
+        vec![rbtc_primitives::transaction::TxOut {
             value: 1_000_000,
             script_pubkey: rbtc_primitives::script::Script::from_bytes({
                 let mut s = vec![0x00u8, 0x14];
@@ -1218,24 +1218,25 @@ async fn test_mempool_standardness() {
                 s
             }),
         }],
-        lock_time: 0,
-    };
-    assert!(rbtc_mempool::is_standard_tx(&tx_v3).is_err());
-    println!("[standard] version > 2 correctly rejected ✓");
+        0,
+    );
+    // BIP431: version 3 (TRUC) is now standard
+    assert!(rbtc_mempool::is_standard_tx(&tx_v3).is_ok());
+    println!("[standard] version 3 (TRUC/BIP431) correctly accepted ✓");
 
     // Multiple OP_RETURN outputs are non-standard
-    let tx_multi_opreturn = rbtc_primitives::transaction::Transaction {
-        version: 2,
-        inputs: vec![rbtc_primitives::transaction::TxIn {
+    let tx_multi_opreturn = rbtc_primitives::transaction::Transaction::from_parts(
+        2,
+        vec![rbtc_primitives::transaction::TxIn {
             previous_output: rbtc_primitives::transaction::OutPoint {
-                txid: rbtc_primitives::hash::Hash256([1; 32]),
+                txid: rbtc_primitives::Txid(rbtc_primitives::hash::Hash256([1; 32])),
                 vout: 0,
             },
             script_sig: rbtc_primitives::script::Script::new(),
             sequence: 0xffffffff,
             witness: vec![],
         }],
-        outputs: vec![
+        vec![
             rbtc_primitives::transaction::TxOut {
                 value: 1_000_000,
                 script_pubkey: rbtc_primitives::script::Script::from_bytes({
@@ -1257,33 +1258,62 @@ async fn test_mempool_standardness() {
                 ]),
             },
         ],
-        lock_time: 0,
-    };
-    assert!(rbtc_mempool::is_standard_tx(&tx_multi_opreturn).is_err());
-    println!("[standard] multiple OP_RETURN correctly rejected ✓");
+        0,
+    );
+    // Bitcoin Core v28+ allows multiple OP_RETURN outputs (aggregate datacarrier limit)
+    assert!(rbtc_mempool::is_standard_tx(&tx_multi_opreturn).is_ok());
+    println!("[standard] multiple OP_RETURN within aggregate limit accepted ✓");
 
-    // Dust output is non-standard
-    let tx_dust = rbtc_primitives::transaction::Transaction {
-        version: 2,
-        inputs: vec![rbtc_primitives::transaction::TxIn {
+    // Bitcoin Core v28+: one dust output is allowed (ephemeral dust, MAX_DUST_OUTPUTS_PER_TX=1).
+    // Two dust outputs should be rejected.
+    let dust_spk = rbtc_primitives::script::Script::from_bytes({
+        let mut s = vec![0x00u8, 0x14];
+        s.extend_from_slice(&[0u8; 20]);
+        s
+    });
+    let tx_one_dust = rbtc_primitives::transaction::Transaction::from_parts(
+        2,
+        vec![rbtc_primitives::transaction::TxIn {
             previous_output: rbtc_primitives::transaction::OutPoint {
-                txid: rbtc_primitives::hash::Hash256([1; 32]),
+                txid: rbtc_primitives::Txid(rbtc_primitives::hash::Hash256([1; 32])),
                 vout: 0,
             },
             script_sig: rbtc_primitives::script::Script::new(),
             sequence: 0xffffffff,
             witness: vec![],
         }],
-        outputs: vec![rbtc_primitives::transaction::TxOut {
+        vec![rbtc_primitives::transaction::TxOut {
             value: 100, // Below 294 P2WPKH dust
-            script_pubkey: rbtc_primitives::script::Script::from_bytes({
-                let mut s = vec![0x00u8, 0x14];
-                s.extend_from_slice(&[0u8; 20]);
-                s
-            }),
+            script_pubkey: dust_spk.clone(),
         }],
-        lock_time: 0,
-    };
-    assert!(rbtc_mempool::is_standard_tx(&tx_dust).is_err());
-    println!("[standard] dust output correctly rejected ✓");
+        0,
+    );
+    assert!(rbtc_mempool::is_standard_tx(&tx_one_dust).is_ok());
+    println!("[standard] single dust output allowed (ephemeral dust) ✓");
+
+    let tx_two_dust = rbtc_primitives::transaction::Transaction::from_parts(
+        2,
+        vec![rbtc_primitives::transaction::TxIn {
+            previous_output: rbtc_primitives::transaction::OutPoint {
+                txid: rbtc_primitives::Txid(rbtc_primitives::hash::Hash256([1; 32])),
+                vout: 0,
+            },
+            script_sig: rbtc_primitives::script::Script::new(),
+            sequence: 0xffffffff,
+            witness: vec![],
+        }],
+        vec![
+            rbtc_primitives::transaction::TxOut {
+                value: 100,
+                script_pubkey: dust_spk.clone(),
+            },
+            rbtc_primitives::transaction::TxOut {
+                value: 50,
+                script_pubkey: dust_spk,
+            },
+        ],
+        0,
+    );
+    assert!(rbtc_mempool::is_standard_tx(&tx_two_dust).is_err());
+    println!("[standard] two dust outputs correctly rejected ✓");
 }
